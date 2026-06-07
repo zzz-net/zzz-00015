@@ -158,7 +158,7 @@ python test_all.py
 
 ## 数据持久化
 
-所有数据保存在 `data/` 目录下，JSON 格式，跨重启可恢复：
+所有数据保存在 `data/` 目录下，JSON 格式，跨重启可恢复。**重构后数据文件格式 100% 向后兼容**，旧版本生成的改约申请、确认日志、到场记录均可正常读取。
 
 ```
 data/
@@ -170,13 +170,13 @@ data/
 ├── spare_parts.json                   # 备件档案
 ├── spare_part_requests.json           # 备件领用申请
 ├── spare_part_audit_logs.json         # 备件操作日志
-├── reschedule_requests.json           # 改约申请（新增）
-├── reschedule_confirm_logs.json       # 改约确认日志（新增）
-├── arrival_confirmations.json         # 到场确认记录（新增）
+├── reschedule_requests.json           # 改约申请
+├── reschedule_confirm_logs.json       # 改约确认日志
+├── arrival_confirmations.json         # 到场确认记录
 └── config.json                        # 导出目录配置
 ```
 
-导出文件默认保存在 `./exports/`，可在「导入导出」Tab 修改。
+导出文件默认保存在 `./exports/`，可在「导入导出」Tab 修改。CSV/JSON 导入导出字段与重构后的数据模型完全一致，非法行会被跳过并在结果中记录行号和原因。
 
 ---
 

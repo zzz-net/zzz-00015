@@ -1,44 +1,44 @@
 [
   {
-    "arrival_id": "ARR2026060719120719209021BF",
-    "order_id": "WO202606071912072FA8",
+    "arrival_id": "ARR202606071922563175567D60",
+    "order_id": "WO20260607192256B592",
     "order_title": "正常链路测试工单",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
     "scheduled_start": "2026-06-11 14:00",
     "scheduled_end": "2026-06-11 16:00",
-    "actual_arrival_time": "2026-06-07 19:12:07",
+    "actual_arrival_time": "2026-06-07 19:22:56",
     "note": "已到达客户现场",
     "status": "confirmed",
-    "timestamp": "2026-06-07 19:12:07.192090"
+    "timestamp": "2026-06-07 19:22:56.317556"
   },
   {
-    "arrival_id": "ARR20260607191207336507504A",
-    "order_id": "WO202606071912070D6B",
+    "arrival_id": "ARR20260607192256458647D1DD",
+    "order_id": "WO202606071922564808",
     "order_title": "持久化测试工单A",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
     "scheduled_start": "2026-07-01 09:00",
     "scheduled_end": "2026-07-01 11:00",
-    "actual_arrival_time": "2026-06-07 19:12:07",
+    "actual_arrival_time": "2026-06-07 19:22:56",
     "note": "A到场",
     "status": "confirmed",
-    "timestamp": "2026-06-07 19:12:07.336644"
+    "timestamp": "2026-06-07 19:22:56.458647"
   },
   {
-    "arrival_id": "ARR20260607191207526789C8C1",
-    "order_id": "WO20260607191207BFF8",
+    "arrival_id": "ARR202606071922566544795BFB",
+    "order_id": "WO20260607192256D491",
     "order_title": "可见性测试工单",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
     "scheduled_start": "2026-10-02 14:00",
     "scheduled_end": "2026-10-02 16:00",
-    "actual_arrival_time": "2026-06-07 19:12:07",
+    "actual_arrival_time": "2026-06-07 19:22:56",
     "note": "到达现场",
     "status": "confirmed",
-    "timestamp": "2026-06-07 19:12:07.526789"
+    "timestamp": "2026-06-07 19:22:56.654479"
   }
 ]
