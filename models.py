@@ -1308,6 +1308,52 @@ class RescheduleStatus(str, Enum):
     EXPIRED = "已过期"
 
 
+RESCHEDULE_STATUS_FLOW = {
+    RescheduleStatus.PENDING: [RescheduleStatus.CONFIRMED, RescheduleStatus.REJECTED, RescheduleStatus.CANCELLED, RescheduleStatus.EXPIRED],
+    RescheduleStatus.CONFIRMED: [],
+    RescheduleStatus.REJECTED: [],
+    RescheduleStatus.CANCELLED: [],
+    RescheduleStatus.EXPIRED: [],
+}
+
+RESCHEDULE_DECISIONS = ("confirm", "reject")
+
+RESCHEDULEABLE_ORDER_STATUSES = {
+    Status.PENDING_DISPATCH,
+    Status.DISPATCHED,
+    Status.IN_PROGRESS,
+    Status.PENDING_INSPECTION,
+}
+
+ARRIVAL_CONFIRMABLE_STATUSES = {
+    Status.DISPATCHED,
+    Status.IN_PROGRESS,
+    Status.PENDING_INSPECTION,
+}
+
+
+class RescheduleRuleViolation:
+    NO_PERMISSION = "权限不足"
+    ORDER_NOT_FOUND = "工单不存在"
+    ORDER_COMPLETED = "已完成工单禁止操作"
+    ORDER_NOT_DISPATCHED = "未派单的工单不能操作"
+    ORDER_STATUS_NOT_ALLOWED = "工单当前状态不支持此操作"
+    PENDING_EXISTS = "该工单已有待确认的改约申请，请先处理"
+    NOT_PENDING = "只能处理待确认状态的改约申请"
+    NOT_CREATOR = "只有发起人可以撤销此改约申请"
+    NOT_ASSIGNED_OR_DISPATCHER = "只有工单指定维修员或调度员可以操作"
+    INVALID_SLOT = "非法时间窗"
+    EMPTY_SLOTS = "至少需要提供一个候选时间窗"
+    EMPTY_REASON = "原因不能为空"
+    EMPTY_REJECT_REASON = "拒绝改约必须填写原因"
+    SLOT_NOT_IN_CANDIDATES = "选择的时间窗不在候选列表中"
+    NO_SELECTED_SLOT = "确认改约必须选择一个时间窗"
+    INVALID_DECISION = "非法决策值"
+    ALREADY_PROCESSED = "改约申请已被处理，重复确认不覆盖原有结果"
+    SCHEDULE_CONFLICT = "时间窗冲突"
+    REQUEST_NOT_FOUND = "改约申请不存在"
+
+
 class RescheduleCandidateSlot:
     def __init__(self, start_time: str, end_time: str):
         self.start_time = start_time
@@ -1433,6 +1479,36 @@ class RescheduleRequest:
         self.version += 1
         return self.version
 
+    def can_transition_to(self, new_status: RescheduleStatus) -> bool:
+        return new_status in RESCHEDULE_STATUS_FLOW.get(self.status, [])
+
+    def has_candidate_slot(self, slot: RescheduleCandidateSlot) -> bool:
+        return any(
+            s.start_time == slot.start_time and s.end_time == slot.end_time
+            for s in self.candidate_slots
+        )
+
+    def candidate_slots_text(self) -> str:
+        return "; ".join(str(s) for s in self.candidate_slots)
+
+    def summary_text(self) -> str:
+        lines = [
+            f"改约编号: {self.reschedule_id}",
+            f"工单: {self.order_id}  {self.order_title}",
+            f"创建人: {self.dispatcher_name}    创建时间: {self.created_at}",
+            f"原因: {self.reason}",
+        ]
+        if self.note:
+            lines.append(f"备注: {self.note}")
+        lines.append(
+            f"原排程: {self.original_scheduled_start or '(无)'} ~ {self.original_scheduled_end or '(无)'}"
+        )
+        lines.append(f"当前状态: {self.status.value}    版本: v{self.version}")
+        lines.append("候选时间窗:")
+        for i, slot in enumerate(self.candidate_slots):
+            lines.append(f"  [{i+1}] {slot.start_time} ~ {slot.end_time}")
+        return "\n".join(lines)
+
 
 class RescheduleConfirmLog:
     def __init__(
@@ -1504,6 +1580,26 @@ class RescheduleConfirmLog:
         }
         return labels.get(self.decision, self.decision)
 
+    @property
+    def confirmed_at(self) -> str:
+        return self.timestamp
+
+    @property
+    def selected_slot_text(self) -> str:
+        if self.selected_slot_start and self.selected_slot_end:
+            return f"{self.selected_slot_start} ~ {self.selected_slot_end}"
+        return ""
+
+    def row_values(self) -> Tuple:
+        return (
+            self.log_id,
+            self.confirmer_name,
+            self.decision_label,
+            self.selected_slot_text,
+            self.reject_reason or "",
+            self.confirmed_at,
+        )
+
 
 class ArrivalConfirmation:
     def __init__(
@@ -1574,3 +1670,16 @@ class ArrivalConfirmation:
             "cancelled": "已取消",
         }
         return labels.get(self.status, self.status)
+
+    @property
+    def confirmed_at(self) -> str:
+        return self.actual_arrival_time or self.timestamp
+
+    def row_values(self) -> Tuple:
+        return (
+            self.arrival_id,
+            self.order_id,
+            self.confirmer_name,
+            self.note or "",
+            self.confirmed_at,
+        )

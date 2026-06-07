@@ -11,6 +11,7 @@ from models import (
     SparePart, SparePartRequest, SparePartRequestStatus, SparePartAuditLog,
     RescheduleStatus, RescheduleCandidateSlot, RescheduleRequest,
     RescheduleConfirmLog, ArrivalConfirmation,
+    RESCHEDULEABLE_ORDER_STATUSES, ARRIVAL_CONFIRMABLE_STATUSES,
 )
 from datastore import (
     DataStore,
@@ -1475,13 +1476,21 @@ class MaintenanceApp:
         if self.current_user.role == Role.DISPATCHER:
             tk.Button(btn_frame, text="改派", font=("Microsoft YaHei", 10), bg="#e67e22", fg="white",
                       width=12, command=self._on_reassign).pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="发起改约", font=("Microsoft YaHei", 10), bg="#16a085", fg="white",
-                      width=12, command=self._on_create_reschedule).pack(side=tk.LEFT, padx=5)
+            self.btn_create_reschedule = tk.Button(
+                btn_frame, text="发起改约", font=("Microsoft YaHei", 10), bg="#16a085", fg="white",
+                width=12, command=self._on_create_reschedule, state=tk.DISABLED,
+            )
+            self.btn_create_reschedule.pack(side=tk.LEFT, padx=5)
         if self.current_user.role in (Role.DISPATCHER, Role.TECHNICIAN):
-            tk.Button(btn_frame, text="到场确认", font=("Microsoft YaHei", 10), bg="#27ae60", fg="white",
-                      width=12, command=self._on_confirm_arrival).pack(side=tk.LEFT, padx=5)
+            self.btn_confirm_arrival = tk.Button(
+                btn_frame, text="到场确认", font=("Microsoft YaHei", 10), bg="#27ae60", fg="white",
+                width=12, command=self._on_confirm_arrival, state=tk.DISABLED,
+            )
+            self.btn_confirm_arrival.pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="刷新", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
                   width=12, command=self._refresh_orders).pack(side=tk.LEFT, padx=5)
+
+        self.orders_tree.bind("<<TreeviewSelect>>", lambda e: self._update_orders_buttons())
 
         self._refresh_orders()
 
@@ -1529,6 +1538,23 @@ class MaintenanceApp:
                 o.order_id, o.title, o.location, o.category, o.priority,
                 o.status.value, o.assignee_name or "未指派", scheduled, o.creator_name, o.created_at,
             ), tags=(tag,))
+        self._update_orders_buttons()
+
+    def _update_orders_buttons(self):
+        sel = self.orders_tree.selection()
+        has_sel = bool(sel)
+        if hasattr(self, "btn_create_reschedule"):
+            state = tk.DISABLED
+            if has_sel:
+                ok, _ = self.store.can_create_reschedule(sel[0], self.current_user)
+                state = tk.NORMAL if ok else tk.DISABLED
+            self.btn_create_reschedule.configure(state=state)
+        if hasattr(self, "btn_confirm_arrival"):
+            state = tk.DISABLED
+            if has_sel:
+                ok, _ = self.store.can_confirm_arrival(sel[0], self.current_user)
+                state = tk.NORMAL if ok else tk.DISABLED
+            self.btn_confirm_arrival.configure(state=state)
 
     def _on_reassign(self):
         sel = self.orders_tree.selection()
@@ -1655,13 +1681,21 @@ class MaintenanceApp:
         btn_frame = tk.Frame(frame, bg="#f5f6fa")
         btn_frame.pack(fill=tk.X, padx=10, pady=8)
         if self.current_user.role == Role.DISPATCHER:
-            tk.Button(btn_frame, text="撤销改约", bg="#e67e22", fg="white", width=12,
-                      font=("Microsoft YaHei", 10), command=self._on_cancel_reschedule).pack(side=tk.LEFT, padx=5)
+            self.btn_cancel_reschedule = tk.Button(
+                btn_frame, text="撤销改约", bg="#e67e22", fg="white", width=12,
+                font=("Microsoft YaHei", 10), command=self._on_cancel_reschedule, state=tk.DISABLED,
+            )
+            self.btn_cancel_reschedule.pack(side=tk.LEFT, padx=5)
         if self.current_user.role in (Role.DISPATCHER, Role.TECHNICIAN):
-            tk.Button(btn_frame, text="确认/拒绝", bg="#16a085", fg="white", width=12,
-                      font=("Microsoft YaHei", 10), command=self._on_confirm_reschedule).pack(side=tk.LEFT, padx=5)
+            self.btn_process_reschedule = tk.Button(
+                btn_frame, text="确认/拒绝", bg="#16a085", fg="white", width=12,
+                font=("Microsoft YaHei", 10), command=self._on_confirm_reschedule, state=tk.DISABLED,
+            )
+            self.btn_process_reschedule.pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="刷新", bg="#3498db", fg="white", width=10,
                   font=("Microsoft YaHei", 10), command=self._refresh_reschedules).pack(side=tk.LEFT, padx=5)
+
+        self.reschedule_tree.bind("<<TreeviewSelect>>", lambda e: self._update_reschedule_buttons())
 
         sep = tk.Frame(frame, height=2, bg="#bdc3c7")
         sep.pack(fill=tk.X, padx=10, pady=5)
@@ -1687,27 +1721,51 @@ class MaintenanceApp:
         self.filter_rs_status.set("全部")
         self._refresh_reschedules()
 
+    def _parse_reschedule_filter_status(self) -> Optional[RescheduleStatus]:
+        status_val = self.filter_rs_status.get()
+        if not status_val or status_val == "全部":
+            return None
+        for s in RescheduleStatus:
+            if s.value == status_val:
+                return s
+        return None
+
+    def _update_reschedule_buttons(self):
+        sel = self.reschedule_tree.selection()
+        has_sel = bool(sel)
+        if hasattr(self, "btn_cancel_reschedule"):
+            state = tk.DISABLED
+            if has_sel:
+                ok, _ = self.store.can_cancel_reschedule(sel[0], self.current_user)
+                state = tk.NORMAL if ok else tk.DISABLED
+            self.btn_cancel_reschedule.configure(state=state)
+        if hasattr(self, "btn_process_reschedule"):
+            state = tk.DISABLED
+            if has_sel:
+                ok, _ = self.store.can_confirm_reschedule(sel[0], self.current_user)
+                state = tk.NORMAL if ok else tk.DISABLED
+            self.btn_process_reschedule.configure(state=state)
+        self._on_reschedule_select()
+
     def _refresh_reschedules(self):
         for i in self.reschedule_tree.get_children():
             self.reschedule_tree.delete(i)
         order_id = self.filter_rs_order.get().strip() or None
-        status_val = self.filter_rs_status.get()
-        status = None
-        if status_val and status_val != "全部":
-            for s in RescheduleStatus:
-                if s.value == status_val:
-                    status = s
-                    break
+        status = self._parse_reschedule_filter_status()
         try:
-            reqs = self.store.get_reschedule_requests(order_id=order_id, status=status, viewer=self.current_user)
+            reqs = self.store.get_reschedule_requests(
+                order_id=order_id, status=status, viewer=self.current_user
+            )
         except (WorkOrderError, PermissionError) as e:
             messagebox.showerror("错误", str(e))
             return
         for r in reqs:
-            self.reschedule_tree.insert("", tk.END, iid=r.reschedule_id, values=(
-                r.reschedule_id, r.order_id, r.order_title, r.reason, r.status.value,
-                r.dispatcher_name, r.created_at,
-            ), tags=(f"status{r.status.value}",))
+            self.reschedule_tree.insert(
+                "", tk.END, iid=r.reschedule_id,
+                values=self.store.build_reschedule_row(r),
+                tags=(f"status{r.status.value}",),
+            )
+        self._update_reschedule_buttons()
 
     def _on_reschedule_select(self):
         sel = self.reschedule_tree.selection()
@@ -1728,17 +1786,7 @@ class MaintenanceApp:
         if not req:
             self.rs_detail.configure(state=tk.DISABLED)
             return
-        info = f"改约编号: {req.reschedule_id}\n工单: {req.order_id}  {req.order_title}\n"
-        info += f"创建人: {req.dispatcher_name}    创建时间: {req.created_at}\n"
-        info += f"原因: {req.reason}\n"
-        if req.note:
-            info += f"备注: {req.note}\n"
-        info += f"原排程: {req.original_scheduled_start or '(无)'} ~ {req.original_scheduled_end or '(无)'}\n"
-        info += f"当前状态: {req.status.value}    版本: v{req.version}\n"
-        info += "候选时间窗:\n"
-        for i, slot in enumerate(req.candidate_slots):
-            info += f"  [{i+1}] {slot.start_time} ~ {slot.end_time}\n"
-        self.rs_detail.insert("1.0", info)
+        self.rs_detail.insert("1.0", req.summary_text())
         self.rs_detail.configure(state=tk.DISABLED)
         try:
             logs = self.store.get_reschedule_confirm_logs(reschedule_id=req.reschedule_id)
@@ -1746,11 +1794,7 @@ class MaintenanceApp:
             messagebox.showerror("错误", str(e))
             return
         for log in logs:
-            self.confirm_log_tree.insert("", tk.END, values=(
-                log.log_id, log.confirmer_name, log.decision,
-                f"{log.selected_slot_start or ''} ~ {log.selected_slot_end or ''}".strip(" ~"),
-                log.reject_reason or "", log.confirmed_at,
-            ))
+            self.confirm_log_tree.insert("", tk.END, values=log.row_values())
 
     def _on_cancel_reschedule(self):
         sel = self.reschedule_tree.selection()
@@ -1758,6 +1802,10 @@ class MaintenanceApp:
             messagebox.showwarning("提示", "请选择要撤销的改约申请")
             return
         reschedule_id = sel[0]
+        ok, msg = self.store.can_cancel_reschedule(reschedule_id, self.current_user)
+        if not ok:
+            messagebox.showwarning("无法撤销", msg)
+            return
         if not messagebox.askyesno("确认撤销", f"确认要撤销改约申请 {reschedule_id}?"):
             return
         try:
@@ -1773,6 +1821,10 @@ class MaintenanceApp:
             messagebox.showwarning("提示", "请选择要处理的改约申请")
             return
         reschedule_id = sel[0]
+        ok, msg = self.store.can_confirm_reschedule(reschedule_id, self.current_user)
+        if not ok:
+            messagebox.showwarning("无法处理", msg)
+            return
         try:
             req = self.store.get_reschedule_request(reschedule_id)
             if not req:
@@ -1798,9 +1850,7 @@ class MaintenanceApp:
             messagebox.showerror("错误", str(e))
             return
         for a in items:
-            self.arrival_tree.insert("", tk.END, values=(
-                a.arrival_id, a.order_id, a.confirmer_name, a.note or "", a.confirmed_at,
-            ))
+            self.arrival_tree.insert("", tk.END, values=a.row_values())
 
     # ==================== 历史记录 Tab ====================
     def _build_history_tab(self):

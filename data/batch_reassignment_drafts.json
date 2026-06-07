@@ -1,11 +1,11 @@
 [
   {
-    "draft_id": "BRD20260607183310E130",
+    "draft_id": "BRD202606071912050859",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO202606071833102A29",
+        "order_id": "WO202606071912057B14",
         "target_technician_id": "u003",
         "reason": "已派单但未接单可改派",
         "order_version": 0,
@@ -31,7 +31,7 @@
         "tech_max_parallel_snapshot": 1
       },
       {
-        "order_id": "WO202606071833106AD0",
+        "order_id": "WO202606071912054D20",
         "target_technician_id": "u002",
         "reason": "待派单可直接改派",
         "order_version": 0,
@@ -62,16 +62,16 @@
         "tech_max_parallel_snapshot": 5
       }
     ],
-    "created_at": "2026-06-07 18:33:10",
-    "updated_at": "2026-06-07 18:33:10"
+    "created_at": "2026-06-07 19:12:05",
+    "updated_at": "2026-06-07 19:12:05"
   },
   {
-    "draft_id": "BRD20260607183310FD8D",
+    "draft_id": "BRD20260607191206E15A",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO202606071833108095",
+        "order_id": "WO2026060719120512EC",
         "target_technician_id": "u002",
         "reason": "技能将被删除测试",
         "order_version": 0,
@@ -101,7 +101,7 @@
         "tech_max_parallel_snapshot": 5
       },
       {
-        "order_id": "WO202606071833101F16",
+        "order_id": "WO202606071912059C56",
         "target_technician_id": "u003",
         "reason": "容量将满测试",
         "order_version": 0,
@@ -126,16 +126,16 @@
         "tech_max_parallel_snapshot": 50
       }
     ],
-    "created_at": "2026-06-07 18:33:10",
-    "updated_at": "2026-06-07 18:33:10"
+    "created_at": "2026-06-07 19:12:06",
+    "updated_at": "2026-06-07 19:12:06"
   },
   {
-    "draft_id": "BRD20260607183311D43E",
+    "draft_id": "BRD20260607191206B6E1",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO20260607183311025E",
+        "order_id": "WO202606071912069133",
         "target_technician_id": "u003",
         "reason": "测试结果持久化-B",
         "order_version": 0,
@@ -160,7 +160,7 @@
         "tech_max_parallel_snapshot": 13
       },
       {
-        "order_id": "WO202606071833119843",
+        "order_id": "WO202606071912060E87",
         "target_technician_id": "u003",
         "reason": "测试结果持久化-C(待派)",
         "order_version": 0,
@@ -185,16 +185,16 @@
         "tech_max_parallel_snapshot": 13
       }
     ],
-    "created_at": "2026-06-07 18:33:11",
-    "updated_at": "2026-06-07 18:33:11"
+    "created_at": "2026-06-07 19:12:06",
+    "updated_at": "2026-06-07 19:12:06"
   },
   {
-    "draft_id": "BRD2026060718331167A9",
+    "draft_id": "BRD202606071912062268",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO202606071833115488",
+        "order_id": "WO202606071912067725",
         "target_technician_id": "u003",
         "reason": "第二次提交",
         "order_version": 0,
@@ -220,18 +220,18 @@
         "tech_max_parallel_snapshot": 13
       }
     ],
-    "created_at": "2026-06-07 18:33:11",
-    "updated_at": "2026-06-07 18:33:11"
+    "created_at": "2026-06-07 19:12:06",
+    "updated_at": "2026-06-07 19:12:06"
   },
   {
-    "draft_id": "BRD202606071833114E47",
+    "draft_id": "BRD20260607191206B24A",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO20260607183311CB14",
+        "order_id": "WO20260607191206E6DA",
         "target_technician_id": "u003",
-        "reason": "导出一致性测试原因-CB14",
+        "reason": "导出一致性测试原因-E6DA",
         "order_version": 0,
         "order_status": "已派单",
         "original_assignee_id": "u002",
@@ -255,9 +255,9 @@
         "tech_max_parallel_snapshot": 13
       },
       {
-        "order_id": "WO202606071833116D04",
+        "order_id": "WO202606071912069A2E",
         "target_technician_id": "u003",
-        "reason": "导出一致性测试原因-6D04",
+        "reason": "导出一致性测试原因-9A2E",
         "order_version": 0,
         "order_status": "已派单",
         "original_assignee_id": "u002",
@@ -281,16 +281,16 @@
         "tech_max_parallel_snapshot": 13
       }
     ],
-    "created_at": "2026-06-07 18:33:11",
-    "updated_at": "2026-06-07 18:33:11"
+    "created_at": "2026-06-07 19:12:06",
+    "updated_at": "2026-06-07 19:12:06"
   },
   {
-    "draft_id": "BRD20260607183311E68B",
+    "draft_id": "BRD202606071912065181",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO20260607183311F5CE",
+        "order_id": "WO202606071912064FA3",
         "target_technician_id": "u003",
         "reason": "过滤测试",
         "order_version": 0,
@@ -316,7 +316,7 @@
         "tech_max_parallel_snapshot": 13
       },
       {
-        "order_id": "WO202606071833118E71",
+        "order_id": "WO20260607191206477E",
         "target_technician_id": "u003",
         "reason": "过滤测试",
         "order_version": 0,
@@ -342,7 +342,7 @@
         "tech_max_parallel_snapshot": 13
       },
       {
-        "order_id": "WO20260607183311C21C",
+        "order_id": "WO20260607191206087D",
         "target_technician_id": "u003",
         "reason": "过滤测试",
         "order_version": 0,
@@ -368,16 +368,16 @@
         "tech_max_parallel_snapshot": 13
       }
     ],
-    "created_at": "2026-06-07 18:33:11",
-    "updated_at": "2026-06-07 18:33:11"
+    "created_at": "2026-06-07 19:12:06",
+    "updated_at": "2026-06-07 19:12:06"
   },
   {
-    "draft_id": "BRD20260607183311A610",
+    "draft_id": "BRD20260607191206E84A",
     "dispatcher_id": "u001",
     "dispatcher_name": "张调度",
     "items": [
       {
-        "order_id": "WO20260607183311B411",
+        "order_id": "WO2026060719120628E9",
         "target_technician_id": "u003",
         "reason": "日志失败追踪原因",
         "order_version": 0,
@@ -403,7 +403,7 @@
         "tech_max_parallel_snapshot": 13
       }
     ],
-    "created_at": "2026-06-07 18:33:11",
-    "updated_at": "2026-06-07 18:33:11"
+    "created_at": "2026-06-07 19:12:06",
+    "updated_at": "2026-06-07 19:12:06"
   }
 ]

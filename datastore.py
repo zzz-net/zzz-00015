@@ -38,6 +38,11 @@ from models import (
     RescheduleRequest,
     RescheduleConfirmLog,
     ArrivalConfirmation,
+    RESCHEDULE_STATUS_FLOW,
+    RESCHEDULE_DECISIONS,
+    RESCHEDULEABLE_ORDER_STATUSES,
+    ARRIVAL_CONFIRMABLE_STATUSES,
+    RescheduleRuleViolation,
 )
 
 
@@ -573,6 +578,87 @@ class DataStore:
                 note,
             )
         )
+
+    def _is_assigned_technician_or_dispatcher(self, order: WorkOrder, user: User) -> bool:
+        is_assigned_tech = (
+            user.role == Role.TECHNICIAN and
+            order.assignee_id == user.user_id
+        )
+        is_dispatcher = user.role == Role.DISPATCHER
+        return is_assigned_tech or is_dispatcher
+
+    def _has_pending_reschedule(self, order_id: str) -> bool:
+        return any(
+            r.order_id == order_id and r.status == RescheduleStatus.PENDING
+            for r in self._reschedule_requests.values()
+        )
+
+    # ----- Unified Permission Pre-checks (can_xxx) -----
+
+    def can_create_reschedule(self, order_id: str, user: User) -> Tuple[bool, str]:
+        try:
+            self._check_permission(user, "create_reschedule")
+        except PermissionError as e:
+            return False, str(e)
+        order = self._orders.get(order_id)
+        if not order:
+            return False, f"工单不存在: {order_id}"
+        if order.status == Status.COMPLETED:
+            return False, RescheduleRuleViolation.ORDER_COMPLETED
+        if order.status not in RESCHEDULEABLE_ORDER_STATUSES:
+            return False, f"工单当前状态【{order.status.value}】不支持改约"
+        if not order.assignee_id:
+            return False, RescheduleRuleViolation.ORDER_NOT_DISPATCHED
+        if self._has_pending_reschedule(order_id):
+            return False, RescheduleRuleViolation.PENDING_EXISTS
+        return True, ""
+
+    def can_cancel_reschedule(self, reschedule_id: str, user: User) -> Tuple[bool, str]:
+        try:
+            self._check_permission(user, "cancel_reschedule")
+        except PermissionError as e:
+            return False, str(e)
+        request = self._reschedule_requests.get(reschedule_id)
+        if not request:
+            return False, f"改约申请不存在: {reschedule_id}"
+        if request.status != RescheduleStatus.PENDING:
+            return False, f"只能撤销待确认状态的改约申请，当前状态: {request.status_label}"
+        if request.dispatcher_id != user.user_id:
+            return False, f"只有发起人【{request.dispatcher_name}】可以撤销此改约申请"
+        return True, ""
+
+    def can_confirm_reschedule(self, reschedule_id: str, user: User) -> Tuple[bool, str]:
+        request = self._reschedule_requests.get(reschedule_id)
+        if not request:
+            return False, f"改约申请不存在: {reschedule_id}"
+        if request.status != RescheduleStatus.PENDING:
+            return False, f"改约申请已被处理，当前状态: {request.status_label}"
+        order = self._orders.get(request.order_id)
+        if not order:
+            return False, f"关联工单不存在: {request.order_id}"
+        if not self._is_assigned_technician_or_dispatcher(order, user):
+            return False, f"只有工单指定维修员或调度员可以确认此改约申请，您【{user.name}】无权操作"
+        try:
+            self._check_permission(user, "confirm_reschedule")
+        except PermissionError as e:
+            return False, str(e)
+        return True, ""
+
+    def can_confirm_arrival(self, order_id: str, user: User) -> Tuple[bool, str]:
+        try:
+            self._check_permission(user, "confirm_arrival")
+        except PermissionError as e:
+            return False, str(e)
+        order = self._orders.get(order_id)
+        if not order:
+            return False, f"工单不存在: {order_id}"
+        if order.status == Status.COMPLETED:
+            return False, "工单已完成，无需到场确认"
+        if order.status not in ARRIVAL_CONFIRMABLE_STATUSES:
+            return False, f"工单当前状态【{order.status.value}】不支持到场确认"
+        if not self._is_assigned_technician_or_dispatcher(order, user):
+            return False, f"只有工单指定维修员或调度员可以到场确认，您【{user.name}】无权操作"
+        return True, ""
 
     def get_user(self, user_id: str) -> Optional[User]:
         return self._users.get(user_id)
@@ -2532,6 +2618,60 @@ class DataStore:
                 return order
         return None
 
+    def _validate_candidate_slots(self, candidate_slots: List[RescheduleCandidateSlot]) -> None:
+        if not candidate_slots:
+            raise WorkOrderError(RescheduleRuleViolation.EMPTY_SLOTS)
+        for slot in candidate_slots:
+            if not slot.is_valid():
+                raise WorkOrderError(f"{RescheduleRuleViolation.INVALID_SLOT}: {slot}")
+
+    def _check_all_slots_no_conflict(
+        self,
+        technician_id: str,
+        candidate_slots: List[RescheduleCandidateSlot],
+        exclude_order_id: str,
+    ) -> None:
+        for slot in candidate_slots:
+            conflict_order = self._check_technician_schedule_conflict(
+                technician_id, slot, exclude_order_id=exclude_order_id
+            )
+            if conflict_order:
+                raise WorkOrderError(
+                    f"{RescheduleRuleViolation.SCHEDULE_CONFLICT}：候选时间 {slot} 与工单 "
+                    f"{conflict_order.order_id} ({conflict_order.title}) 的已排程时间重叠"
+                )
+
+    def _create_reschedule_confirm_log(
+        self,
+        reschedule_id: str,
+        order_id: str,
+        confirmer: User,
+        decision: str,
+        selected_slot: Optional[RescheduleCandidateSlot],
+        reject_reason: str,
+        note: str,
+    ) -> RescheduleConfirmLog:
+        log_id = "RCL" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+        return RescheduleConfirmLog(
+            log_id=log_id,
+            reschedule_id=reschedule_id,
+            order_id=order_id,
+            confirmer_id=confirmer.user_id,
+            confirmer_name=confirmer.name,
+            confirmer_role=confirmer.role.value,
+            decision=decision,
+            selected_slot_start=selected_slot.start_time if (decision == "confirm" and selected_slot) else None,
+            selected_slot_end=selected_slot.end_time if (decision == "confirm" and selected_slot) else None,
+            reject_reason=reject_reason.strip() if decision == "reject" else "",
+            note=note,
+        )
+
+    def _raise_from_check(self, ok: bool, msg: str):
+        if not ok:
+            if "无权" in msg or "权限" in msg:
+                raise PermissionError(msg)
+            raise WorkOrderError(msg)
+
     def create_reschedule_request(
         self,
         order_id: str,
@@ -2540,37 +2680,16 @@ class DataStore:
         candidate_slots: List[RescheduleCandidateSlot],
         note: str = "",
     ) -> RescheduleRequest:
-        self._check_permission(dispatcher, "create_reschedule")
         if not reason or not reason.strip():
-            raise WorkOrderError("改约原因不能为空")
-        if not candidate_slots:
-            raise WorkOrderError("至少需要提供一个候选时间窗")
-        for slot in candidate_slots:
-            if not slot.is_valid():
-                raise WorkOrderError(f"非法时间窗: {slot}")
+            raise WorkOrderError(RescheduleRuleViolation.EMPTY_REASON)
+        self._validate_candidate_slots(candidate_slots)
+
+        ok, msg = self.can_create_reschedule(order_id, dispatcher)
+        self._raise_from_check(ok, msg)
 
         with self._lock:
             order = self._orders.get(order_id)
-            if not order:
-                raise WorkOrderError(f"工单不存在: {order_id}")
-            if order.status == Status.COMPLETED:
-                raise WorkOrderError("已完成工单禁止改约")
-            if not order.assignee_id:
-                raise WorkOrderError("未派单的工单不能发起改约")
-
-            for pending in self._reschedule_requests.values():
-                if pending.order_id == order_id and pending.status == RescheduleStatus.PENDING:
-                    raise WorkOrderError("该工单已有待确认的改约申请，请先处理")
-
-            for slot in candidate_slots:
-                conflict_order = self._check_technician_schedule_conflict(
-                    order.assignee_id, slot, exclude_order_id=order_id
-                )
-                if conflict_order:
-                    raise WorkOrderError(
-                        f"时间窗冲突：候选时间 {slot} 与工单 {conflict_order.order_id} "
-                        f"({conflict_order.title}) 的已排程时间重叠"
-                    )
+            self._check_all_slots_no_conflict(order.assignee_id, candidate_slots, order_id)
 
             reschedule_id = "RS" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
             request = RescheduleRequest(
@@ -2591,7 +2710,7 @@ class DataStore:
             self._add_history(
                 order, order.status, dispatcher,
                 f"发起改约申请[{reschedule_id}]，原因: {reason.strip()}，候选时间: "
-                + "; ".join(str(s) for s in candidate_slots)
+                + request.candidate_slots_text()
             )
             order.bump_version()
             self._save_orders()
@@ -2602,15 +2721,13 @@ class DataStore:
         reschedule_id: str,
         dispatcher: User,
     ) -> RescheduleRequest:
-        self._check_permission(dispatcher, "cancel_reschedule")
+        ok, msg = self.can_cancel_reschedule(reschedule_id, dispatcher)
+        self._raise_from_check(ok, msg)
+
         with self._lock:
             request = self._reschedule_requests.get(reschedule_id)
-            if not request:
-                raise WorkOrderError(f"改约申请不存在: {reschedule_id}")
-            if request.status != RescheduleStatus.PENDING:
-                raise WorkOrderError(f"只能撤销待确认状态的改约申请，当前状态: {request.status_label}")
-            if request.dispatcher_id != dispatcher.user_id:
-                raise PermissionError(f"只有发起人【{request.dispatcher_name}】可以撤销此改约申请")
+            if not request.can_transition_to(RescheduleStatus.CANCELLED):
+                raise WorkOrderError(f"状态流转不允许从【{request.status_label}】到【{RescheduleStatus.CANCELLED.value}】")
 
             request.status = RescheduleStatus.CANCELLED
             request.bump_version()
@@ -2635,58 +2752,35 @@ class DataStore:
         reject_reason: str = "",
         note: str = "",
     ) -> Tuple[RescheduleRequest, RescheduleConfirmLog]:
-        if decision not in ("confirm", "reject"):
-            raise WorkOrderError(f"非法决策值: {decision}")
+        if decision not in RESCHEDULE_DECISIONS:
+            raise WorkOrderError(f"{RescheduleRuleViolation.INVALID_DECISION}: {decision}")
+
+        ok, msg = self.can_confirm_reschedule(reschedule_id, confirmer)
+        self._raise_from_check(ok, msg)
 
         with self._lock:
             request = self._reschedule_requests.get(reschedule_id)
-            if not request:
-                raise WorkOrderError(f"改约申请不存在: {reschedule_id}")
-            if request.status != RescheduleStatus.PENDING:
-                raise WorkOrderError(
-                    f"改约申请已被处理，当前状态: {request.status_label}，重复确认不覆盖原有结果"
-                )
-
             order = self._orders.get(request.order_id)
-            if not order:
-                raise WorkOrderError(f"关联工单不存在: {request.order_id}")
-
-            is_assigned_tech = (
-                confirmer.role == Role.TECHNICIAN and
-                order.assignee_id == confirmer.user_id
-            )
-            is_dispatcher = confirmer.role == Role.DISPATCHER
-            if not (is_assigned_tech or is_dispatcher):
-                raise PermissionError(
-                    f"只有工单指定维修员或调度员可以确认此改约申请，"
-                    f"您【{confirmer.name}】无权操作"
-                )
-
-            self._check_permission(confirmer, "confirm_reschedule")
 
             if decision == "confirm":
                 if not selected_slot:
-                    raise WorkOrderError("确认改约必须选择一个时间窗")
-                slot_valid = any(
-                    s.start_time == selected_slot.start_time and s.end_time == selected_slot.end_time
-                    for s in request.candidate_slots
-                )
-                if not slot_valid:
-                    raise WorkOrderError("选择的时间窗不在候选列表中")
-
+                    raise WorkOrderError(RescheduleRuleViolation.NO_SELECTED_SLOT)
+                if not request.has_candidate_slot(selected_slot):
+                    raise WorkOrderError(RescheduleRuleViolation.SLOT_NOT_IN_CANDIDATES)
                 if order.status == Status.COMPLETED:
-                    raise WorkOrderError("工单已完成，无法确认改约")
-
+                    raise WorkOrderError(RescheduleRuleViolation.ORDER_COMPLETED)
                 if order.assignee_id:
                     conflict_order = self._check_technician_schedule_conflict(
                         order.assignee_id, selected_slot, exclude_order_id=order.order_id
                     )
                     if conflict_order:
                         raise WorkOrderError(
-                            f"时间窗冲突：选中时间 {selected_slot} 与工单 "
+                            f"{RescheduleRuleViolation.SCHEDULE_CONFLICT}：选中时间 {selected_slot} 与工单 "
                             f"{conflict_order.order_id} ({conflict_order.title}) 的已排程重叠"
                         )
 
+                if not request.can_transition_to(RescheduleStatus.CONFIRMED):
+                    raise WorkOrderError(f"状态流转不允许从【{request.status_label}】到【{RescheduleStatus.CONFIRMED.value}】")
                 order.scheduled_start = selected_slot.start_time
                 order.scheduled_end = selected_slot.end_time
                 request.status = RescheduleStatus.CONFIRMED
@@ -2697,7 +2791,9 @@ class DataStore:
                 )
             else:
                 if not reject_reason or not reject_reason.strip():
-                    raise WorkOrderError("拒绝改约必须填写原因")
+                    raise WorkOrderError(RescheduleRuleViolation.EMPTY_REJECT_REASON)
+                if not request.can_transition_to(RescheduleStatus.REJECTED):
+                    raise WorkOrderError(f"状态流转不允许从【{request.status_label}】到【{RescheduleStatus.REJECTED.value}】")
                 request.status = RescheduleStatus.REJECTED
                 self._add_history(
                     order, order.status, confirmer,
@@ -2707,21 +2803,11 @@ class DataStore:
             request.bump_version()
             order.bump_version()
 
-            log_id = "RCL" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
-            log = RescheduleConfirmLog(
-                log_id=log_id,
-                reschedule_id=reschedule_id,
-                order_id=request.order_id,
-                confirmer_id=confirmer.user_id,
-                confirmer_name=confirmer.name,
-                confirmer_role=confirmer.role.value,
-                decision=decision,
-                selected_slot_start=selected_slot.start_time if (decision == "confirm" and selected_slot) else None,
-                selected_slot_end=selected_slot.end_time if (decision == "confirm" and selected_slot) else None,
-                reject_reason=reject_reason.strip() if decision == "reject" else "",
-                note=note,
+            log = self._create_reschedule_confirm_log(
+                reschedule_id, request.order_id, confirmer, decision,
+                selected_slot, reject_reason, note
             )
-            self._reschedule_confirm_logs[log_id] = log
+            self._reschedule_confirm_logs[log.log_id] = log
             self._save_reschedule_requests()
             self._save_reschedule_confirm_logs()
             self._save_orders()
@@ -2772,51 +2858,49 @@ class DataStore:
 
     # ----- Arrival Confirmation -----
 
+    def _create_arrival_confirmation(
+        self,
+        order_id: str,
+        order_title: str,
+        confirmer: User,
+        scheduled_start: Optional[str],
+        scheduled_end: Optional[str],
+        note: str,
+    ) -> ArrivalConfirmation:
+        arrival_id = "ARR" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+        return ArrivalConfirmation(
+            arrival_id=arrival_id,
+            order_id=order_id,
+            order_title=order_title,
+            confirmer_id=confirmer.user_id,
+            confirmer_name=confirmer.name,
+            confirmer_role=confirmer.role.value,
+            scheduled_start=scheduled_start,
+            scheduled_end=scheduled_end,
+            note=note,
+        )
+
     def confirm_arrival(
         self,
         order_id: str,
         confirmer: User,
         note: str = "",
     ) -> ArrivalConfirmation:
-        self._check_permission(confirmer, "confirm_arrival")
+        ok, msg = self.can_confirm_arrival(order_id, confirmer)
+        self._raise_from_check(ok, msg)
+
         with self._lock:
             order = self._orders.get(order_id)
-            if not order:
-                raise WorkOrderError(f"工单不存在: {order_id}")
-            if order.status == Status.COMPLETED:
-                raise WorkOrderError("工单已完成，无需到场确认")
-            if order.status not in (Status.DISPATCHED, Status.IN_PROGRESS, Status.PENDING_INSPECTION):
-                raise WorkOrderError(f"工单当前状态【{order.status.value}】不支持到场确认")
-
-            is_assigned_tech = (
-                confirmer.role == Role.TECHNICIAN and
-                order.assignee_id == confirmer.user_id
+            arrival = self._create_arrival_confirmation(
+                order_id, order.title, confirmer,
+                order.scheduled_start, order.scheduled_end, note
             )
-            is_dispatcher = confirmer.role == Role.DISPATCHER
-            if not (is_assigned_tech or is_dispatcher):
-                raise PermissionError(
-                    f"只有工单指定维修员或调度员可以到场确认，"
-                    f"您【{confirmer.name}】无权操作"
-                )
-
-            arrival_id = "ARR" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
-            arrival = ArrivalConfirmation(
-                arrival_id=arrival_id,
-                order_id=order_id,
-                order_title=order.title,
-                confirmer_id=confirmer.user_id,
-                confirmer_name=confirmer.name,
-                confirmer_role=confirmer.role.value,
-                scheduled_start=order.scheduled_start,
-                scheduled_end=order.scheduled_end,
-                note=note,
-            )
-            self._arrival_confirmations[arrival_id] = arrival
+            self._arrival_confirmations[arrival.arrival_id] = arrival
             self._save_arrival_confirmations()
 
             self._add_history(
                 order, order.status, confirmer,
-                f"到场确认[{arrival_id}]，备注: {note or '无'}"
+                f"到场确认[{arrival.arrival_id}]，备注: {note or '无'}"
             )
             order.bump_version()
             self._save_orders()
@@ -2843,6 +2927,25 @@ class DataStore:
         result.sort(key=lambda a: a.timestamp, reverse=True)
         return result
 
+    # ----- View Data Builders (for GUI) -----
+
+    def build_reschedule_row(self, r: RescheduleRequest) -> Tuple:
+        return (
+            r.reschedule_id, r.order_id, r.order_title, r.reason,
+            r.status.value, r.dispatcher_name, r.created_at,
+        )
+
+    def get_reschedule_requests_for_view(
+        self,
+        order_id: Optional[str] = None,
+        status: Optional[RescheduleStatus] = None,
+        viewer: Optional[User] = None,
+    ) -> List[Tuple]:
+        reqs = self.get_reschedule_requests(
+            order_id=order_id, status=status, viewer=viewer
+        )
+        return [self.build_reschedule_row(r) for r in reqs]
+
     def get_order_visible_status(self, order_id: str, viewer: User) -> Dict:
         order = self._orders.get(order_id)
         if not order:
@@ -2860,6 +2963,9 @@ class DataStore:
         )
         latest_arrival = arrivals[0] if arrivals else None
 
+        can_create_rs, _ = self.can_create_reschedule(order_id, viewer)
+        can_confirm_arrival, _ = self.can_confirm_arrival(order_id, viewer)
+
         return {
             "order_id": order.order_id,
             "title": order.title,
@@ -2871,6 +2977,8 @@ class DataStore:
             "latest_arrival": latest_arrival.to_dict() if latest_arrival else None,
             "reschedule_count": len(reschedules),
             "arrival_count": len(arrivals),
+            "can_create_reschedule": can_create_rs,
+            "can_confirm_arrival": can_confirm_arrival,
         }
 
     # ----- Reschedule: Import/Export -----
@@ -2907,7 +3015,7 @@ class DataStore:
                         r.reschedule_id, r.order_id, r.order_title,
                         r.dispatcher_id, r.dispatcher_name,
                         r.reason,
-                        "; ".join(str(s) for s in r.candidate_slots),
+                        r.candidate_slots_text(),
                         r.note, r.status_label, r.created_at, r.version,
                         r.original_scheduled_start or "", r.original_scheduled_end or "",
                     ])
