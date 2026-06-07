@@ -38,8 +38,8 @@ REASSIGNABLE_STATUSES = {
 
 
 ROLE_PERMISSIONS = {
-    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule"],
-    Role.TECHNICIAN: ["accept", "complete", "view_history"],
+    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule", "manage_spare_parts", "review_spare_part_requests", "import_spare_parts", "export_spare_parts"],
+    Role.TECHNICIAN: ["accept", "complete", "view_history", "request_spare_parts", "view_own_spare_part_requests", "view_spare_parts_stock"],
     Role.INSPECTOR: ["approve", "reject", "view_history", "export"],
 }
 
@@ -1052,3 +1052,241 @@ class AppConfig:
     @classmethod
     def from_dict(cls, data: Dict) -> "AppConfig":
         return cls(data.get("export_dir", ""))
+
+
+class SparePartRequestStatus(str, Enum):
+    PENDING = "待审核"
+    APPROVED = "已审核"
+    REJECTED = "已拒绝"
+    RETURNED = "已退回"
+
+
+class SparePart:
+    def __init__(
+        self,
+        part_id: str,
+        name: str,
+        category: str,
+        stock: int,
+        low_stock_threshold: int,
+        applicable_categories: Optional[List[str]] = None,
+        unit: str = "个",
+        description: str = "",
+        created_at: Optional[str] = None,
+        updated_at: Optional[str] = None,
+        version: int = 0,
+    ):
+        self.part_id = part_id
+        self.name = name
+        self.category = category
+        self.stock = stock
+        self.low_stock_threshold = low_stock_threshold
+        self.applicable_categories = applicable_categories or []
+        self.unit = unit
+        self.description = description
+        self.created_at = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.updated_at = updated_at or self.created_at
+        self.version = version
+        self._lock = threading.Lock()
+
+    def to_dict(self) -> Dict:
+        return {
+            "part_id": self.part_id,
+            "name": self.name,
+            "category": self.category,
+            "stock": self.stock,
+            "low_stock_threshold": self.low_stock_threshold,
+            "applicable_categories": self.applicable_categories,
+            "unit": self.unit,
+            "description": self.description,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "version": self.version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SparePart":
+        part = cls.__new__(cls)
+        part.part_id = data["part_id"]
+        part.name = data["name"]
+        part.category = data["category"]
+        part.stock = data["stock"]
+        part.low_stock_threshold = data["low_stock_threshold"]
+        part.applicable_categories = data.get("applicable_categories", [])
+        part.unit = data.get("unit", "个")
+        part.description = data.get("description", "")
+        part.created_at = data.get("created_at")
+        part.updated_at = data.get("updated_at")
+        part.version = data.get("version", 0)
+        part._lock = threading.Lock()
+        return part
+
+    def bump_version(self) -> int:
+        self.version += 1
+        self.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return self.version
+
+    @property
+    def is_low_stock(self) -> bool:
+        return self.stock <= self.low_stock_threshold
+
+    def is_applicable_for_order_category(self, order_category: str) -> bool:
+        if not self.applicable_categories:
+            return True
+        return order_category in self.applicable_categories
+
+
+class SparePartRequest:
+    def __init__(
+        self,
+        request_id: str,
+        order_id: str,
+        part_id: str,
+        part_name: str,
+        quantity: int,
+        applicant_id: str,
+        applicant_name: str,
+        reason: str = "",
+        status: SparePartRequestStatus = SparePartRequestStatus.PENDING,
+        reviewer_id: Optional[str] = None,
+        reviewer_name: Optional[str] = None,
+        review_note: str = "",
+        created_at: Optional[str] = None,
+        reviewed_at: Optional[str] = None,
+        returned_at: Optional[str] = None,
+        return_note: str = "",
+        version: int = 0,
+    ):
+        self.request_id = request_id
+        self.order_id = order_id
+        self.part_id = part_id
+        self.part_name = part_name
+        self.quantity = quantity
+        self.applicant_id = applicant_id
+        self.applicant_name = applicant_name
+        self.reason = reason
+        self.status = status
+        self.reviewer_id = reviewer_id
+        self.reviewer_name = reviewer_name
+        self.review_note = review_note
+        self.created_at = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.reviewed_at = reviewed_at
+        self.returned_at = returned_at
+        self.return_note = return_note
+        self.version = version
+        self._lock = threading.Lock()
+
+    def to_dict(self) -> Dict:
+        return {
+            "request_id": self.request_id,
+            "order_id": self.order_id,
+            "part_id": self.part_id,
+            "part_name": self.part_name,
+            "quantity": self.quantity,
+            "applicant_id": self.applicant_id,
+            "applicant_name": self.applicant_name,
+            "reason": self.reason,
+            "status": self.status.value,
+            "reviewer_id": self.reviewer_id,
+            "reviewer_name": self.reviewer_name,
+            "review_note": self.review_note,
+            "created_at": self.created_at,
+            "reviewed_at": self.reviewed_at,
+            "returned_at": self.returned_at,
+            "return_note": self.return_note,
+            "version": self.version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SparePartRequest":
+        req = cls.__new__(cls)
+        req.request_id = data["request_id"]
+        req.order_id = data["order_id"]
+        req.part_id = data["part_id"]
+        req.part_name = data["part_name"]
+        req.quantity = data["quantity"]
+        req.applicant_id = data["applicant_id"]
+        req.applicant_name = data["applicant_name"]
+        req.reason = data.get("reason", "")
+        req.status = SparePartRequestStatus(data["status"])
+        req.reviewer_id = data.get("reviewer_id")
+        req.reviewer_name = data.get("reviewer_name")
+        req.review_note = data.get("review_note", "")
+        req.created_at = data.get("created_at")
+        req.reviewed_at = data.get("reviewed_at")
+        req.returned_at = data.get("returned_at")
+        req.return_note = data.get("return_note", "")
+        req.version = data.get("version", 0)
+        req._lock = threading.Lock()
+        return req
+
+    def bump_version(self) -> int:
+        self.version += 1
+        return self.version
+
+
+class SparePartAuditLog:
+    def __init__(
+        self,
+        log_id: str,
+        part_id: str,
+        part_name: str,
+        action: str,
+        quantity: int,
+        operator_id: str,
+        operator_name: str,
+        order_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        note: str = "",
+        timestamp: Optional[str] = None,
+        stock_before: int = 0,
+        stock_after: int = 0,
+    ):
+        self.log_id = log_id
+        self.part_id = part_id
+        self.part_name = part_name
+        self.action = action
+        self.quantity = quantity
+        self.operator_id = operator_id
+        self.operator_name = operator_name
+        self.order_id = order_id
+        self.request_id = request_id
+        self.note = note
+        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        self.stock_before = stock_before
+        self.stock_after = stock_after
+
+    def to_dict(self) -> Dict:
+        return {
+            "log_id": self.log_id,
+            "part_id": self.part_id,
+            "part_name": self.part_name,
+            "action": self.action,
+            "quantity": self.quantity,
+            "operator_id": self.operator_id,
+            "operator_name": self.operator_name,
+            "order_id": self.order_id,
+            "request_id": self.request_id,
+            "note": self.note,
+            "timestamp": self.timestamp,
+            "stock_before": self.stock_before,
+            "stock_after": self.stock_after,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SparePartAuditLog":
+        return cls(
+            log_id=data["log_id"],
+            part_id=data["part_id"],
+            part_name=data["part_name"],
+            action=data["action"],
+            quantity=data["quantity"],
+            operator_id=data["operator_id"],
+            operator_name=data["operator_name"],
+            order_id=data.get("order_id"),
+            request_id=data.get("request_id"),
+            note=data.get("note", ""),
+            timestamp=data.get("timestamp"),
+            stock_before=data.get("stock_before", 0),
+            stock_after=data.get("stock_after", 0),
+        )

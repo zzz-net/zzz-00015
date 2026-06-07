@@ -29,6 +29,10 @@ from models import (
     RevocationRecord,
     RevocationStatus,
     RevocationConflictType,
+    SparePart,
+    SparePartRequest,
+    SparePartRequestStatus,
+    SparePartAuditLog,
 )
 
 
@@ -62,6 +66,9 @@ class DataStore:
         self.batch_drafts_file = os.path.join(data_dir, "batch_reassignment_drafts.json")
         self.batch_results_file = os.path.join(data_dir, "batch_reassignment_results.json")
         self.revocation_records_file = os.path.join(data_dir, "revocation_records.json")
+        self.spare_parts_file = os.path.join(data_dir, "spare_parts.json")
+        self.spare_part_requests_file = os.path.join(data_dir, "spare_part_requests.json")
+        self.spare_part_audit_logs_file = os.path.join(data_dir, "spare_part_audit_logs.json")
         self._lock = threading.RLock()
         self._orders: Dict[str, WorkOrder] = {}
         self._users: Dict[str, User] = {}
@@ -70,6 +77,9 @@ class DataStore:
         self._batch_reassignment_drafts: Dict[str, BatchReassignmentDraft] = {}
         self._batch_reassignment_results: Dict[str, BatchReassignmentResult] = {}
         self._revocation_records: Dict[str, RevocationRecord] = {}
+        self._spare_parts: Dict[str, SparePart] = {}
+        self._spare_part_requests: Dict[str, SparePartRequest] = {}
+        self._spare_part_audit_logs: Dict[str, SparePartAuditLog] = {}
         self._ensure_data_dir()
         self._load_all()
 
@@ -85,6 +95,9 @@ class DataStore:
         self._load_batch_reassignment_drafts()
         self._load_batch_reassignment_results()
         self._load_revocation_records()
+        self._load_spare_parts()
+        self._load_spare_part_requests()
+        self._load_spare_part_audit_logs()
         self._sync_revocation_statuses()
         if not self._users:
             self._init_default_users()
@@ -1784,3 +1797,645 @@ class DataStore:
         except OSError as e:
             raise ExportError(f"写入CSV文件失败: {str(e)}")
         return filepath
+
+    # ----- Spare Parts Persistence -----
+
+    def _load_spare_parts(self):
+        if os.path.exists(self.spare_parts_file):
+            try:
+                with open(self.spare_parts_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._spare_parts = {
+                        p["part_id"]: SparePart.from_dict(p) for p in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._spare_parts = {}
+
+    def _save_spare_parts(self):
+        with open(self.spare_parts_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [p.to_dict() for p in self._spare_parts.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def _load_spare_part_requests(self):
+        if os.path.exists(self.spare_part_requests_file):
+            try:
+                with open(self.spare_part_requests_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._spare_part_requests = {
+                        r["request_id"]: SparePartRequest.from_dict(r) for r in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._spare_part_requests = {}
+
+    def _save_spare_part_requests(self):
+        with open(self.spare_part_requests_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [r.to_dict() for r in self._spare_part_requests.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def _load_spare_part_audit_logs(self):
+        if os.path.exists(self.spare_part_audit_logs_file):
+            try:
+                with open(self.spare_part_audit_logs_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._spare_part_audit_logs = {
+                        l["log_id"]: SparePartAuditLog.from_dict(l) for l in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._spare_part_audit_logs = {}
+
+    def _save_spare_part_audit_logs(self):
+        with open(self.spare_part_audit_logs_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [l.to_dict() for l in self._spare_part_audit_logs.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def _add_spare_part_audit_log(
+        self,
+        part: SparePart,
+        action: str,
+        quantity: int,
+        operator: User,
+        stock_before: int,
+        stock_after: int,
+        order_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        note: str = "",
+    ):
+        log_id = "SPL" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+        log = SparePartAuditLog(
+            log_id=log_id,
+            part_id=part.part_id,
+            part_name=part.name,
+            action=action,
+            quantity=quantity,
+            operator_id=operator.user_id,
+            operator_name=operator.name,
+            order_id=order_id,
+            request_id=request_id,
+            note=note,
+            stock_before=stock_before,
+            stock_after=stock_after,
+        )
+        self._spare_part_audit_logs[log_id] = log
+        self._save_spare_part_audit_logs()
+        return log
+
+    # ----- Spare Parts CRUD -----
+
+    def create_spare_part(
+        self,
+        name: str,
+        category: str,
+        stock: int,
+        low_stock_threshold: int,
+        applicable_categories: Optional[List[str]] = None,
+        unit: str = "个",
+        description: str = "",
+        dispatcher: Optional[User] = None,
+    ) -> SparePart:
+        if dispatcher is not None:
+            self._check_permission(dispatcher, "manage_spare_parts")
+        if not name or not name.strip():
+            raise WorkOrderError("备件名称不能为空")
+        if not category or not category.strip():
+            raise WorkOrderError("备件类别不能为空")
+        if not isinstance(stock, int) or stock < 0:
+            raise WorkOrderError("库存数量必须是非负整数")
+        if not isinstance(low_stock_threshold, int) or low_stock_threshold < 0:
+            raise WorkOrderError("低库存阈值必须是非负整数")
+        with self._lock:
+            part_id = "SP" + datetime.now().strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:4].upper()
+            part = SparePart(
+                part_id=part_id,
+                name=name.strip(),
+                category=category.strip(),
+                stock=stock,
+                low_stock_threshold=low_stock_threshold,
+                applicable_categories=applicable_categories or [],
+                unit=unit or "个",
+                description=description,
+            )
+            self._spare_parts[part_id] = part
+            self._save_spare_parts()
+            if dispatcher is not None:
+                self._add_spare_part_audit_log(
+                    part, "创建", stock, dispatcher, 0, stock, note=f"创建备件档案，阈值={low_stock_threshold}"
+                )
+            return part
+
+    def update_spare_part(
+        self,
+        part_id: str,
+        dispatcher: User,
+        name: Optional[str] = None,
+        category: Optional[str] = None,
+        stock: Optional[int] = None,
+        low_stock_threshold: Optional[int] = None,
+        applicable_categories: Optional[List[str]] = None,
+        unit: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> SparePart:
+        self._check_permission(dispatcher, "manage_spare_parts")
+        with self._lock:
+            part = self._spare_parts.get(part_id)
+            if not part:
+                raise WorkOrderError(f"备件不存在: {part_id}")
+            stock_before = part.stock
+            if name is not None:
+                if not name.strip():
+                    raise WorkOrderError("备件名称不能为空")
+                part.name = name.strip()
+            if category is not None:
+                if not category.strip():
+                    raise WorkOrderError("备件类别不能为空")
+                part.category = category.strip()
+            if stock is not None:
+                if not isinstance(stock, int) or stock < 0:
+                    raise WorkOrderError("库存数量必须是非负整数")
+                part.stock = stock
+            if low_stock_threshold is not None:
+                if not isinstance(low_stock_threshold, int) or low_stock_threshold < 0:
+                    raise WorkOrderError("低库存阈值必须是非负整数")
+                part.low_stock_threshold = low_stock_threshold
+            if applicable_categories is not None:
+                part.applicable_categories = list(applicable_categories)
+            if unit is not None:
+                part.unit = unit or "个"
+            if description is not None:
+                part.description = description
+            part.bump_version()
+            self._save_spare_parts()
+            if stock is not None and stock != stock_before:
+                diff = stock - stock_before
+                action = "库存调整" if diff >= 0 else "库存扣减"
+                self._add_spare_part_audit_log(
+                    part, action, abs(diff), dispatcher, stock_before, stock, note=f"手动调整库存: {stock_before} -> {stock}"
+                )
+            return part
+
+    def delete_spare_part(self, part_id: str, dispatcher: User) -> bool:
+        self._check_permission(dispatcher, "manage_spare_parts")
+        with self._lock:
+            part = self._spare_parts.get(part_id)
+            if not part:
+                return False
+            pending_requests = [
+                r for r in self._spare_part_requests.values()
+                if r.part_id == part_id and r.status == SparePartRequestStatus.PENDING
+            ]
+            if pending_requests:
+                raise WorkOrderError(f"该备件存在 {len(pending_requests)} 条待审核申请，无法删除")
+            del self._spare_parts[part_id]
+            self._save_spare_parts()
+            return True
+
+    def get_spare_part(self, part_id: str) -> Optional[SparePart]:
+        return self._spare_parts.get(part_id)
+
+    def get_all_spare_parts(self) -> List[SparePart]:
+        return list(self._spare_parts.values())
+
+    def get_spare_parts_by_filter(
+        self,
+        category: Optional[str] = None,
+        low_stock_only: bool = False,
+        order_category: Optional[str] = None,
+    ) -> List[SparePart]:
+        result = list(self._spare_parts.values())
+        if category:
+            result = [p for p in result if category in p.category]
+        if low_stock_only:
+            result = [p for p in result if p.is_low_stock]
+        if order_category:
+            result = [p for p in result if p.is_applicable_for_order_category(order_category)]
+        result.sort(key=lambda p: p.updated_at, reverse=True)
+        return result
+
+    # ----- Spare Part Requests -----
+
+    def create_spare_part_request(
+        self,
+        order_id: str,
+        part_id: str,
+        quantity: int,
+        technician: User,
+        reason: str = "",
+    ) -> SparePartRequest:
+        self._check_permission(technician, "request_spare_parts")
+        if not isinstance(quantity, int) or quantity < 1:
+            raise WorkOrderError("领用数量必须是大于0的正整数")
+        with self._lock:
+            order = self._orders.get(order_id)
+            if not order:
+                raise WorkOrderError(f"工单不存在: {order_id}")
+            if order.status == Status.COMPLETED:
+                raise WorkOrderError(f"工单【{order_id}】已完成，不能申请领用备件")
+            if order.assignee_id != technician.user_id:
+                raise PermissionError(
+                    f"您【{technician.name}】不是工单【{order_id}】的指定维修员，无法申请备件"
+                )
+            part = self._spare_parts.get(part_id)
+            if not part:
+                raise WorkOrderError(f"备件不存在: {part_id}")
+            if not part.is_applicable_for_order_category(order.category):
+                applicable = ", ".join(part.applicable_categories) if part.applicable_categories else "无限制"
+                raise WorkOrderError(
+                    f"备件【{part.name}】不适用于工单类别【{order.category}】，"
+                    f"该备件适用类别: {applicable}"
+                )
+            request_id = "SPR" + datetime.now().strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:4].upper()
+            request = SparePartRequest(
+                request_id=request_id,
+                order_id=order_id,
+                part_id=part_id,
+                part_name=part.name,
+                quantity=quantity,
+                applicant_id=technician.user_id,
+                applicant_name=technician.name,
+                reason=reason,
+            )
+            self._spare_part_requests[request_id] = request
+            self._save_spare_part_requests()
+            return request
+
+    def get_spare_part_request(self, request_id: str) -> Optional[SparePartRequest]:
+        return self._spare_part_requests.get(request_id)
+
+    def get_spare_part_requests_by_filter(
+        self,
+        user: Optional[User] = None,
+        order_id: Optional[str] = None,
+        part_id: Optional[str] = None,
+        status: Optional[SparePartRequestStatus] = None,
+    ) -> List[SparePartRequest]:
+        result = list(self._spare_part_requests.values())
+        if user is not None and user.role == Role.TECHNICIAN:
+            result = [r for r in result if r.applicant_id == user.user_id]
+        if order_id:
+            result = [r for r in result if r.order_id == order_id]
+        if part_id:
+            result = [r for r in result if r.part_id == part_id]
+        if status:
+            result = [r for r in result if r.status == status]
+        result.sort(key=lambda r: r.created_at, reverse=True)
+        return result
+
+    def approve_spare_part_request(
+        self,
+        request_id: str,
+        dispatcher: User,
+        note: str = "",
+    ) -> SparePartRequest:
+        self._check_permission(dispatcher, "review_spare_part_requests")
+        with self._lock:
+            request = self._spare_part_requests.get(request_id)
+            if not request:
+                raise WorkOrderError(f"申请不存在: {request_id}")
+            if request.status != SparePartRequestStatus.PENDING:
+                raise WorkOrderError(
+                    f"申请【{request_id}】当前状态为【{request.status.value}】，"
+                    f"只有【待审核】状态可以审核"
+                )
+            order = self._orders.get(request.order_id)
+            if not order:
+                raise WorkOrderError(f"工单不存在: {request.order_id}")
+            if order.status == Status.COMPLETED:
+                raise WorkOrderError(
+                    f"关联工单【{request.order_id}】已完成，审核被拦截"
+                )
+            part = self._spare_parts.get(request.part_id)
+            if not part:
+                raise WorkOrderError(f"备件不存在: {request.part_id}")
+            if not part.is_applicable_for_order_category(order.category):
+                applicable = ", ".join(part.applicable_categories) if part.applicable_categories else "无限制"
+                raise WorkOrderError(
+                    f"备件类别不匹配：备件【{part.name}】适用类别({applicable})"
+                    f"不包含工单类别【{order.category}】，审核被拦截"
+                )
+            if part.stock < request.quantity:
+                raise WorkOrderError(
+                    f"库存不足：备件【{part.name}】当前库存{part.stock}{part.unit}，"
+                    f"申请{request.quantity}{part.unit}，审核被拦截"
+                )
+            stock_before = part.stock
+            part.stock -= request.quantity
+            part.bump_version()
+            request.status = SparePartRequestStatus.APPROVED
+            request.reviewer_id = dispatcher.user_id
+            request.reviewer_name = dispatcher.name
+            request.review_note = note
+            request.reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            request.bump_version()
+            self._add_history(
+                order, order.status, dispatcher,
+                f"备件领用审核通过: {part.name} x{request.quantity}{part.unit}，"
+                f"申请人: {request.applicant_name}，备注: {note or '无'}"
+            )
+            order.bump_version()
+            self._save_spare_parts()
+            self._save_spare_part_requests()
+            self._save_orders()
+            self._add_spare_part_audit_log(
+                part, "审核领用", request.quantity, dispatcher,
+                stock_before, part.stock,
+                order_id=order.order_id, request_id=request.request_id,
+                note=note or f"工单{order.order_id}领用审核通过"
+            )
+            return request
+
+    def reject_spare_part_request(
+        self,
+        request_id: str,
+        dispatcher: User,
+        note: str = "",
+    ) -> SparePartRequest:
+        self._check_permission(dispatcher, "review_spare_part_requests")
+        if not note or not note.strip():
+            raise WorkOrderError("拒绝申请必须填写原因")
+        with self._lock:
+            request = self._spare_part_requests.get(request_id)
+            if not request:
+                raise WorkOrderError(f"申请不存在: {request_id}")
+            if request.status != SparePartRequestStatus.PENDING:
+                raise WorkOrderError(
+                    f"申请【{request_id}】当前状态为【{request.status.value}】，"
+                    f"只有【待审核】状态可以拒绝"
+                )
+            request.status = SparePartRequestStatus.REJECTED
+            request.reviewer_id = dispatcher.user_id
+            request.reviewer_name = dispatcher.name
+            request.review_note = note.strip()
+            request.reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            request.bump_version()
+            self._save_spare_part_requests()
+            return request
+
+    def return_spare_part(
+        self,
+        request_id: str,
+        user: User,
+        note: str = "",
+    ) -> SparePartRequest:
+        with self._lock:
+            request = self._spare_part_requests.get(request_id)
+            if not request:
+                raise WorkOrderError(f"申请不存在: {request_id}")
+            if request.status != SparePartRequestStatus.APPROVED:
+                raise WorkOrderError(
+                    f"申请【{request_id}】当前状态为【{request.status.value}】，"
+                    f"只有【已审核】状态可以退回"
+                )
+            if request.applicant_id != user.user_id and user.role != Role.DISPATCHER:
+                raise PermissionError(
+                    f"只有申请人【{request.applicant_name}】或调度员可以执行退回操作"
+                )
+            part = self._spare_parts.get(request.part_id)
+            if not part:
+                raise WorkOrderError(f"备件不存在: {request.part_id}")
+            stock_before = part.stock
+            part.stock += request.quantity
+            part.bump_version()
+            request.status = SparePartRequestStatus.RETURNED
+            request.returned_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            request.return_note = note
+            request.bump_version()
+            self._save_spare_parts()
+            self._save_spare_part_requests()
+            self._add_spare_part_audit_log(
+                part, "退回", request.quantity, user,
+                stock_before, part.stock,
+                order_id=request.order_id, request_id=request.request_id,
+                note=note or f"退回备件: {part.name} x{request.quantity}{part.unit}"
+            )
+            return request
+
+    # ----- Spare Parts Import/Export -----
+
+    def import_spare_parts_csv(
+        self,
+        filepath: str,
+        dispatcher: User,
+    ) -> Tuple[int, List[str]]:
+        self._check_permission(dispatcher, "import_spare_parts")
+        if not os.path.exists(filepath):
+            raise WorkOrderError(f"文件不存在: {filepath}")
+        imported = 0
+        errors = []
+        temp_parts: List[Dict] = []
+
+        def parse_row(row, i):
+            name = (row.get("name") or row.get("名称") or "").strip()
+            category = (row.get("category") or row.get("类别") or "").strip()
+            stock_raw = (row.get("stock") or row.get("库存") or "0").strip()
+            threshold_raw = (row.get("low_stock_threshold") or row.get("低库存阈值") or "0").strip()
+            applicable_raw = (row.get("applicable_categories") or row.get("适用类别") or "").strip()
+            unit = (row.get("unit") or row.get("单位") or "个").strip()
+            description = (row.get("description") or row.get("描述") or "").strip()
+            part_id = (row.get("part_id") or row.get("备件编号") or "").strip()
+
+            if not name:
+                errors.append(f"第{i}行: 名称不能为空")
+                return None
+            if not category:
+                errors.append(f"第{i}行: 类别不能为空")
+                return None
+            try:
+                stock = int(stock_raw)
+                if stock < 0:
+                    raise ValueError()
+            except ValueError:
+                errors.append(f"第{i}行: 库存必须是非负整数: {stock_raw}")
+                return None
+            try:
+                threshold = int(threshold_raw)
+                if threshold < 0:
+                    raise ValueError()
+            except ValueError:
+                errors.append(f"第{i}行: 低库存阈值必须是非负整数: {threshold_raw}")
+                return None
+            applicable: List[str] = []
+            if applicable_raw:
+                applicable = [c.strip() for c in applicable_raw.split("|") if c.strip()]
+            return {
+                "part_id": part_id or None,
+                "name": name,
+                "category": category,
+                "stock": stock,
+                "low_stock_threshold": threshold,
+                "applicable_categories": applicable,
+                "unit": unit or "个",
+                "description": description,
+            }
+
+        with self._lock:
+            try:
+                with open(filepath, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for i, row in enumerate(reader, start=2):
+                        parsed = parse_row(row, i)
+                        if parsed:
+                            temp_parts.append(parsed)
+            except UnicodeDecodeError:
+                with open(filepath, "r", encoding="gbk") as f:
+                    reader = csv.DictReader(f)
+                    for i, row in enumerate(reader, start=2):
+                        parsed = parse_row(row, i)
+                        if parsed:
+                            temp_parts.append(parsed)
+            if errors:
+                return 0, errors
+
+            for pd in temp_parts:
+                try:
+                    if pd["part_id"] and pd["part_id"] in self._spare_parts:
+                        self.update_spare_part(
+                            part_id=pd["part_id"],
+                            dispatcher=dispatcher,
+                            name=pd["name"],
+                            category=pd["category"],
+                            stock=pd["stock"],
+                            low_stock_threshold=pd["low_stock_threshold"],
+                            applicable_categories=pd["applicable_categories"],
+                            unit=pd["unit"],
+                            description=pd["description"],
+                        )
+                    else:
+                        self.create_spare_part(
+                            name=pd["name"],
+                            category=pd["category"],
+                            stock=pd["stock"],
+                            low_stock_threshold=pd["low_stock_threshold"],
+                            applicable_categories=pd["applicable_categories"],
+                            unit=pd["unit"],
+                            description=pd["description"],
+                            dispatcher=dispatcher,
+                        )
+                    imported += 1
+                except Exception as e:
+                    errors.append(f"处理数据时出错: {str(e)}")
+                    return 0, errors
+
+        return imported, errors
+
+    def export_spare_parts_json(self) -> str:
+        filepath = self._get_export_path(f"spare_parts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(
+                    [p.to_dict() for p in self._spare_parts.values()],
+                    f, ensure_ascii=False, indent=2,
+                )
+        except OSError as e:
+            raise ExportError(f"写入JSON文件失败: {str(e)}")
+        return filepath
+
+    def export_spare_parts_csv(self) -> str:
+        filepath = self._get_export_path(f"spare_parts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        try:
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "备件编号", "名称", "类别", "当前库存", "单位",
+                    "低库存阈值", "库存状态", "适用维修类别", "描述",
+                    "创建时间", "更新时间", "版本",
+                ])
+                for p in self._spare_parts.values():
+                    writer.writerow([
+                        p.part_id, p.name, p.category, p.stock, p.unit,
+                        p.low_stock_threshold,
+                        "低库存" if p.is_low_stock else "正常",
+                        "|".join(p.applicable_categories) if p.applicable_categories else "全部",
+                        p.description,
+                        p.created_at, p.updated_at, p.version,
+                    ])
+        except OSError as e:
+            raise ExportError(f"写入CSV文件失败: {str(e)}")
+        return filepath
+
+    def export_spare_part_requests_json(self) -> str:
+        filepath = self._get_export_path(f"spare_part_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(
+                    [r.to_dict() for r in self._spare_part_requests.values()],
+                    f, ensure_ascii=False, indent=2,
+                )
+        except OSError as e:
+            raise ExportError(f"写入JSON文件失败: {str(e)}")
+        return filepath
+
+    def export_spare_part_requests_csv(self) -> str:
+        filepath = self._get_export_path(f"spare_part_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        try:
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "申请编号", "工单编号", "备件编号", "备件名称",
+                    "申请数量", "申请人ID", "申请人姓名", "申请原因",
+                    "状态", "审核人ID", "审核人姓名", "审核备注",
+                    "申请时间", "审核时间", "退回时间", "退回备注", "版本",
+                ])
+                for r in self._spare_part_requests.values():
+                    writer.writerow([
+                        r.request_id, r.order_id, r.part_id, r.part_name,
+                        r.quantity, r.applicant_id, r.applicant_name, r.reason,
+                        r.status.value,
+                        r.reviewer_id or "", r.reviewer_name or "", r.review_note,
+                        r.created_at, r.reviewed_at or "",
+                        r.returned_at or "", r.return_note, r.version,
+                    ])
+        except OSError as e:
+            raise ExportError(f"写入CSV文件失败: {str(e)}")
+        return filepath
+
+    def export_spare_part_audit_logs_json(self) -> str:
+        filepath = self._get_export_path(f"spare_part_audit_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(
+                    [l.to_dict() for l in self._spare_part_audit_logs.values()],
+                    f, ensure_ascii=False, indent=2,
+                )
+        except OSError as e:
+            raise ExportError(f"写入JSON文件失败: {str(e)}")
+        return filepath
+
+    def export_spare_part_audit_logs_csv(self) -> str:
+        filepath = self._get_export_path(f"spare_part_audit_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        try:
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "日志编号", "备件编号", "备件名称", "操作类型",
+                    "操作数量", "操作人ID", "操作人姓名",
+                    "关联工单", "关联申请", "备注",
+                    "操作前库存", "操作后库存", "操作时间",
+                ])
+                for l in self._spare_part_audit_logs.values():
+                    writer.writerow([
+                        l.log_id, l.part_id, l.part_name, l.action,
+                        l.quantity, l.operator_id, l.operator_name,
+                        l.order_id or "", l.request_id or "", l.note,
+                        l.stock_before, l.stock_after, l.timestamp,
+                    ])
+        except OSError as e:
+            raise ExportError(f"写入CSV文件失败: {str(e)}")
+        return filepath
+
+    def get_spare_part_audit_logs(
+        self,
+        order_id: Optional[str] = None,
+        part_id: Optional[str] = None,
+    ) -> List[SparePartAuditLog]:
+        result = list(self._spare_part_audit_logs.values())
+        if order_id:
+            result = [l for l in result if l.order_id == order_id]
+        if part_id:
+            result = [l for l in result if l.part_id == part_id]
+        result.sort(key=lambda l: l.timestamp, reverse=True)
+        return result

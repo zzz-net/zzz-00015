@@ -1,0 +1,139 @@
+[
+  {
+    "part_id": "SP202606071640219E45",
+    "name": "空调压缩机",
+    "category": "空调配件",
+    "stock": 8,
+    "low_stock_threshold": 3,
+    "applicable_categories": [
+      "空调维修"
+    ],
+    "unit": "台",
+    "description": "原装进口压缩机",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 1
+  },
+  {
+    "part_id": "SP20260607164021CF66",
+    "name": "权限测试滤芯",
+    "category": "空调配件",
+    "stock": 5,
+    "low_stock_threshold": 2,
+    "applicable_categories": [
+      "空调维修"
+    ],
+    "unit": "个",
+    "description": "",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 0
+  },
+  {
+    "part_id": "SP2026060716402154B1",
+    "name": "并发测试保险丝",
+    "category": "电路配件",
+    "stock": 0,
+    "low_stock_threshold": 0,
+    "applicable_categories": [
+      "电路维修"
+    ],
+    "unit": "个",
+    "description": "",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 1
+  },
+  {
+    "part_id": "SP20260607164021B3FA",
+    "name": "有效过滤芯",
+    "category": "空调配件",
+    "stock": 20,
+    "low_stock_threshold": 5,
+    "applicable_categories": [
+      "空调维修",
+      "电路维修"
+    ],
+    "unit": "个",
+    "description": "",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 0
+  },
+  {
+    "part_id": "SP202606071640212536",
+    "name": "有效开关",
+    "category": "电路配件",
+    "stock": 50,
+    "low_stock_threshold": 10,
+    "applicable_categories": [
+      "电路维修"
+    ],
+    "unit": "只",
+    "description": "",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 0
+  },
+  {
+    "part_id": "SP2026060716402125E9",
+    "name": "导出测试滤芯",
+    "category": "空调配件",
+    "stock": 15,
+    "low_stock_threshold": 5,
+    "applicable_categories": [
+      "空调维修",
+      "电路维修"
+    ],
+    "unit": "个",
+    "description": "HEPA高效滤芯",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 2
+  },
+  {
+    "part_id": "SP202606071640215338",
+    "name": "导出测试开关",
+    "category": "电路配件",
+    "stock": 3,
+    "low_stock_threshold": 10,
+    "applicable_categories": [
+      "电路维修"
+    ],
+    "unit": "只",
+    "description": "16A空气开关",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 0
+  },
+  {
+    "part_id": "SP2026060716402194BC",
+    "name": "可见性测试轴承",
+    "category": "电梯配件",
+    "stock": 17,
+    "low_stock_threshold": 5,
+    "applicable_categories": [
+      "电梯维修"
+    ],
+    "unit": "个",
+    "description": "",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 1
+  },
+  {
+    "part_id": "SP20260607164021302E",
+    "name": "空调专用制冷剂",
+    "category": "空调配件",
+    "stock": 5,
+    "low_stock_threshold": 2,
+    "applicable_categories": [
+      "空调维修"
+    ],
+    "unit": "瓶",
+    "description": "",
+    "created_at": "2026-06-07 16:40:21",
+    "updated_at": "2026-06-07 16:40:21",
+    "version": 0
+  }
+]

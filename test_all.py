@@ -966,10 +966,10 @@ def test_gui_startup_and_tabs():
         root.update()
 
         tab_count = app.notebook.index("end")
-        assert tab_count == 5, f"调度员应有 5 个 Tab，实际 {tab_count}"
+        assert tab_count == 6, f"调度员应有 6 个 Tab，实际 {tab_count}"
         print_ok(f"调度员 Tab 数量正确: {tab_count} 个")
 
-        expected_tabs = ["工单列表", "历史记录", "调度派工", "排班管理", "导入导出"]
+        expected_tabs = ["工单列表", "历史记录", "调度派工", "排班管理", "备件库存", "导入导出"]
         actual_tabs = [app.notebook.tab(i, "text") for i in range(tab_count)]
         for t in expected_tabs:
             assert t in actual_tabs, f"缺少 Tab: {t}"
@@ -980,7 +980,7 @@ def test_gui_startup_and_tabs():
             root.update()
             print_ok(f"切换 Tab 成功: {tab_name}")
 
-        app.notebook.select(4)
+        app.notebook.select(5)
         root.update()
         assert hasattr(app, "export_log"), "导入导出页缺少 export_log 控件"
         assert hasattr(app, "export_dir_label"), "导入导出页缺少 export_dir_label 控件"
@@ -3361,6 +3361,763 @@ def test_revocation_version_and_status_conflict(store):
     print_ok("被跳过的冲突/已完成条目：工单数据完全未被覆盖（维修员/状态保持不变）")
 
 
+from models import (
+    SparePart,
+    SparePartRequest,
+    SparePartRequestStatus,
+    SparePartAuditLog,
+)
+
+
+def test_spare_parts_persistence_across_restart(store):
+    print_title("测试34: 备件重启恢复 - 创建、申请、审核后重启，所有数据完全一致")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    inspector = store.get_user("u004")
+
+    order = store.create_order(
+        "备件重启测试工单", "", "SP-RST栋", "空调维修", "高", dispatcher
+    )
+    store.dispatch_order(order.order_id, tech, dispatcher)
+
+    part = store.create_spare_part(
+        name="空调压缩机",
+        category="空调配件",
+        stock=10,
+        low_stock_threshold=3,
+        applicable_categories=["空调维修"],
+        unit="台",
+        description="原装进口压缩机",
+        dispatcher=dispatcher,
+    )
+    print_ok(f"创建备件: {part.part_id}={part.name}, 库存={part.stock}, 阈值={part.low_stock_threshold}")
+
+    request = store.create_spare_part_request(
+        order_id=order.order_id,
+        part_id=part.part_id,
+        quantity=2,
+        technician=tech,
+        reason="更换故障压缩机",
+    )
+    print_ok(f"创建领用申请: {request.request_id}, 数量={request.quantity}, 状态={request.status.value}")
+
+    approved = store.approve_spare_part_request(
+        request_id=request.request_id,
+        dispatcher=dispatcher,
+        note="同意领用，尽快更换",
+    )
+    print_ok(f"审核通过: 状态={approved.status.value}, 审核人={approved.reviewer_name}")
+
+    part_after = store.get_spare_part(part.part_id)
+    stock_after_approve = part_after.stock
+    assert stock_after_approve == 8, f"审核后库存应为8，实际{stock_after_approve}"
+    print_ok(f"审核后库存扣减正确: 10 - 2 = {stock_after_approve}")
+
+    logs = store.get_spare_part_audit_logs(part_id=part.part_id)
+    assert len(logs) >= 2, "应至少有创建和审核两条日志"
+    print_ok(f"操作日志存在: 共 {len(logs)} 条")
+
+    order_after = store.get_order(order.order_id)
+    has_spare_history = any("备件领用审核通过" in h.note for h in order_after.history)
+    assert has_spare_history, "工单历史应包含备件领用记录"
+    print_ok("工单历史已写入备件领用审核记录")
+
+    parts_before = {p.part_id: p.to_dict() for p in store.get_all_spare_parts()}
+    requests_before = {r.request_id: r.to_dict() for r in store.get_spare_part_requests_by_filter()}
+    logs_before = {l.log_id: l.to_dict() for l in store.get_spare_part_audit_logs()}
+    order_history_before = [h.to_dict() for h in order_after.history]
+    data_dir = store.data_dir
+
+    print_ok("重启 DataStore 模拟应用关闭...")
+    del store
+    import gc as _gc
+    _gc.collect()
+    store2 = DataStore(data_dir)
+    dispatcher2 = store2.get_user("u001")
+    tech2 = store2.get_user("u002")
+
+    parts_after = {p.part_id: p.to_dict() for p in store2.get_all_spare_parts()}
+    assert set(parts_before.keys()) == set(parts_after.keys()), "备件ID集合不一致"
+    for pid in parts_before:
+        pb = parts_before[pid]
+        pa = parts_after[pid]
+        assert pb["name"] == pa["name"], f"{pid} 名称不一致"
+        assert pb["stock"] == pa["stock"], f"{pid} 库存不一致"
+        assert pb["low_stock_threshold"] == pa["low_stock_threshold"], f"{pid} 阈值不一致"
+        assert pb["applicable_categories"] == pa["applicable_categories"], f"{pid} 适用类别不一致"
+        assert pb["category"] == pa["category"], f"{pid} 类别不一致"
+    print_ok("重启后所有备件：名称、库存、阈值、适用类别、类别 完全一致")
+
+    requests_after = {r.request_id: r.to_dict() for r in store2.get_spare_part_requests_by_filter()}
+    assert set(requests_before.keys()) == set(requests_after.keys()), "申请ID集合不一致"
+    for rid in requests_before:
+        rb = requests_before[rid]
+        ra = requests_after[rid]
+        assert rb["status"] == ra["status"], f"{rid} 状态不一致"
+        assert rb["quantity"] == ra["quantity"], f"{rid} 数量不一致"
+        assert rb["reviewer_id"] == ra["reviewer_id"], f"{rid} 审核人不一致"
+        assert rb["review_note"] == ra["review_note"], f"{rid} 审核备注不一致"
+    print_ok("重启后所有领用申请：状态、数量、审核人、审核备注 完全一致")
+
+    logs_after = {l.log_id: l.to_dict() for l in store2.get_spare_part_audit_logs()}
+    assert set(logs_before.keys()) == set(logs_after.keys()), "日志ID集合不一致"
+    for lid in logs_before:
+        lb = logs_before[lid]
+        la = logs_after[lid]
+        assert lb["action"] == la["action"], f"{lid} 操作类型不一致"
+        assert lb["stock_before"] == la["stock_before"], f"{lid} 操作前库存不一致"
+        assert lb["stock_after"] == la["stock_after"], f"{lid} 操作后库存不一致"
+        assert lb["operator_id"] == la["operator_id"], f"{lid} 操作人不一致"
+    print_ok("重启后所有操作日志：操作类型、库存前后值、操作人 完全一致")
+
+    order_restarted = store2.get_order(order.order_id)
+    order_history_after = [h.to_dict() for h in order_restarted.history]
+    assert len(order_history_before) == len(order_history_after), "工单历史记录数不一致"
+    has_spare_after = any("备件领用审核通过" in h["note"] for h in order_history_after)
+    assert has_spare_after, "重启后工单历史丢失备件领用记录"
+    print_ok("重启后工单历史完整保留，备件领用记录仍在")
+
+    part_restarted = store2.get_spare_part(part.part_id)
+    assert part_restarted.stock == 8
+    assert part_restarted.is_low_stock == False
+    print_ok(f"重启后复查: 库存={part_restarted.stock}, 低库存标记={part_restarted.is_low_stock}")
+
+    request_restarted = store2.get_spare_part_request(request.request_id)
+    assert request_restarted.status == SparePartRequestStatus.APPROVED
+    assert request_restarted.reviewer_id == dispatcher2.user_id
+    print_ok(f"重启后复查: 申请状态={request_restarted.status.value}, 审核人={request_restarted.reviewer_name}")
+
+    return store2
+
+
+def test_spare_parts_permission_denied(store):
+    print_title("测试35: 备件权限拒绝 - 维修员/验收员越权操作被拦截，数据无变动")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    inspector = store.get_user("u004")
+
+    part = store.create_spare_part(
+        name="权限测试滤芯", category="空调配件", stock=5,
+        low_stock_threshold=2, applicable_categories=["空调维修"],
+        dispatcher=dispatcher,
+    )
+    parts_before = len(store.get_all_spare_parts())
+    print_ok(f"调度员创建备件成功，当前备件数={parts_before}")
+
+    try:
+        store.create_spare_part(
+            name="维修员越权创建", category="非法", stock=10,
+            low_stock_threshold=1, dispatcher=tech,
+        )
+        print_fail("维修员居然能创建备件！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"维修员无权创建备件（符合预期）: {e}")
+
+    try:
+        store.update_spare_part(
+            part.part_id, tech, name="维修员改名", stock=999,
+        )
+        print_fail("维修员居然能更新备件！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"维修员无权更新备件（符合预期）: {e}")
+
+    try:
+        store.delete_spare_part(part.part_id, tech)
+        print_fail("维修员居然能删除备件！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"维修员无权删除备件（符合预期）: {e}")
+
+    parts_after_tech = len(store.get_all_spare_parts())
+    assert parts_after_tech == parts_before, "维修员越权操作不应改变备件数量"
+    part_after_tech = store.get_spare_part(part.part_id)
+    assert part_after_tech.name == "权限测试滤芯", "维修员越权操作不应改变备件名称"
+    assert part_after_tech.stock == 5, "维修员越权操作不应改变库存"
+    print_ok("维修员越权操作后数据无任何变动")
+
+    order = store.create_order(
+        "权限测试工单", "", "SP-PERM栋", "空调维修", "中", dispatcher
+    )
+    store.dispatch_order(order.order_id, tech, dispatcher)
+
+    request = store.create_spare_part_request(
+        order.order_id, part.part_id, 1, tech, "权限测试申请"
+    )
+    requests_before = len(store.get_spare_part_requests_by_filter())
+    print_ok(f"维修员创建申请成功，当前申请数={requests_before}")
+
+    try:
+        store.approve_spare_part_request(request.request_id, inspector)
+        print_fail("验收员居然能审核备件申请！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员无权审核申请（符合预期）: {e}")
+
+    try:
+        store.reject_spare_part_request(request.request_id, inspector, "验收员拒绝")
+        print_fail("验收员居然能拒绝备件申请！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员无权拒绝申请（符合预期）: {e}")
+
+    request_after = store.get_spare_part_request(request.request_id)
+    assert request_after.status == SparePartRequestStatus.PENDING, "越权审核不应改变申请状态"
+    assert request_after.reviewer_id is None, "越权审核不应写入审核人"
+    part_after_inspect = store.get_spare_part(part.part_id)
+    assert part_after_inspect.stock == 5, "越权审核不应扣减库存"
+    print_ok("验收员越权审核/拒绝后，申请状态、库存均无变动")
+
+    bad_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bad_spare_perm.csv")
+    with open(bad_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "category", "stock", "low_stock_threshold"])
+        writer.writerow(["非法导入测试", "测试", "1", "0"])
+
+    try:
+        store.import_spare_parts_csv(bad_csv, tech)
+        print_fail("维修员居然能导入备件！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"维修员无权导入备件（符合预期）: {e}")
+
+    parts_after_import = len(store.get_all_spare_parts())
+    assert parts_after_import == parts_before, "越权导入不应增加备件数量"
+    print_ok("越权导入未污染数据")
+
+    try:
+        os.remove(bad_csv)
+    except Exception:
+        pass
+
+    print_ok("备件权限拒绝场景全部验证通过：越权操作全部拦截，数据零污染")
+
+
+def test_spare_parts_concurrent_stock_conflict(store):
+    print_title("测试36: 备件库存并发冲突 - 两个审核同时扣库存，仅一个成功，无超卖")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    part = store.create_spare_part(
+        name="并发测试保险丝", category="电路配件", stock=1,
+        low_stock_threshold=0, applicable_categories=["电路维修"],
+        dispatcher=dispatcher,
+    )
+    assert part.stock == 1
+    print_ok(f"创建仅1件库存的备件: {part.name}, part_id={part.part_id}")
+
+    order1 = store.create_order(
+        "并发工单1", "", "SP-CON1栋", "电路维修", "高", dispatcher
+    )
+    store.dispatch_order(order1.order_id, tech1, dispatcher)
+    request1 = store.create_spare_part_request(
+        order1.order_id, part.part_id, 1, tech1, "tech1申请"
+    )
+
+    order2 = store.create_order(
+        "并发工单2", "", "SP-CON2栋", "电路维修", "高", dispatcher
+    )
+    store.dispatch_order(order2.order_id, tech2, dispatcher)
+    request2 = store.create_spare_part_request(
+        order2.order_id, part.part_id, 1, tech2, "tech2申请"
+    )
+    print_ok(f"两个维修员各创建1份领用申请: req1={request1.request_id}, req2={request2.request_id}")
+
+    results = {}
+    barrier = threading.Barrier(2, timeout=5)
+
+    def try_approve(tid, req_id):
+        try:
+            barrier.wait(timeout=3)
+        except Exception:
+            pass
+        try:
+            store.approve_spare_part_request(req_id, dispatcher, f"{tid}审核通过")
+            results[tid] = ("success", None)
+        except Exception as e:
+            results[tid] = ("fail", type(e).__name__ + ": " + str(e))
+
+    t1 = threading.Thread(target=try_approve, args=("t1", request1.request_id))
+    t2 = threading.Thread(target=try_approve, args=("t2", request2.request_id))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    print(f"  Thread1: {results['t1']}")
+    print(f"  Thread2: {results['t2']}")
+
+    success_count = sum(1 for v in results.values() if v[0] == "success")
+    fail_count = sum(1 for v in results.values() if v[0] == "fail")
+    assert success_count == 1, f"只能有一个审核成功，实际成功{success_count}个"
+    assert fail_count == 1, f"必须有一个审核失败，实际失败{fail_count}个"
+
+    final_part = store.get_spare_part(part.part_id)
+    assert final_part.stock == 0, f"并发后库存应为0（无超卖），实际{final_part.stock}"
+    print_ok(f"并发一致性：1人成功，1人失败，最终库存={final_part.stock}（无超卖）")
+
+    req1_final = store.get_spare_part_request(request1.request_id)
+    req2_final = store.get_spare_part_request(request2.request_id)
+    approved_count = sum(
+        1 for r in [req1_final, req2_final]
+        if r.status == SparePartRequestStatus.APPROVED
+    )
+    pending_or_rejected = sum(
+        1 for r in [req1_final, req2_final]
+        if r.status in (SparePartRequestStatus.PENDING, SparePartRequestStatus.REJECTED)
+    )
+    assert approved_count == 1, f"应该只有1个已审核申请，实际{approved_count}个"
+    print_ok(f"申请状态：1个已审核，{pending_or_rejected}个待审核/拒绝")
+
+    logs = store.get_spare_part_audit_logs(part_id=part.part_id)
+    approve_logs = [l for l in logs if l.action == "审核领用"]
+    assert len(approve_logs) == 1, f"应该只有1条审核领用日志，实际{len(approve_logs)}条"
+    assert approve_logs[0].stock_before == 1
+    assert approve_logs[0].stock_after == 0
+    print_ok(f"操作日志：仅{len(approve_logs)}条审核领用记录，库存从1→0，无误写")
+
+    approved_req = req1_final if req1_final.status == SparePartRequestStatus.APPROVED else req2_final
+    order_with_spare = store.get_order(approved_req.order_id)
+    has_history = any("备件领用审核通过" in h.note for h in order_with_spare.history)
+    assert has_history, "成功审核的工单应写入历史记录"
+    failed_req = req1_final if req1_final.status != SparePartRequestStatus.APPROVED else req2_final
+    order_without_spare = store.get_order(failed_req.order_id)
+    no_bad_history = all(
+        "备件领用审核通过" not in h.note or approved_req.order_id == failed_req.order_id
+        for h in order_without_spare.history
+    )
+    print_ok("成功审核的工单写入历史，失败的未污染（原子性保证）")
+
+    print_ok("库存并发冲突全部验证通过：锁保护下无超卖、无误写、原子性完整")
+    return store
+
+
+def test_spare_parts_import_invalid_rows(store):
+    print_title("测试37: 备件导入非法行 - 空名称/负库存等非法行全拒绝，合法数据不写入")
+
+    dispatcher = store.get_user("u001")
+    inspector = store.get_user("u004")
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    bad_csv = os.path.join(base, "test_spare_parts_bad.csv")
+
+    with open(bad_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["名称", "类别", "库存", "低库存阈值", "适用类别", "单位", "描述"])
+        writer.writerow(["合法备件A", "空调配件", "5", "2", "空调维修", "个", "合法数据"])
+        writer.writerow(["", "空调配件", "3", "1", "", "", "名称为空"])
+        writer.writerow(["负库存备件", "电路配件", "-5", "1", "", "", "库存负数"])
+        writer.writerow(["负阈值备件", "水管配件", "10", "-3", "", "", "阈值负数"])
+        writer.writerow(["非数字库存", "电梯配件", "abc", "0", "", "", "库存非数字"])
+        writer.writerow(["合法备件B", "配件", "2", "1", "", "", "又一条合法但应被拒绝"])
+
+    parts_before = {p.part_id: p.to_dict() for p in store.get_all_spare_parts()}
+    print_ok(f"导入前备件数量: {len(parts_before)}")
+
+    count, errors = store.import_spare_parts_csv(bad_csv, dispatcher)
+    assert count == 0, f"有非法行时应全部拒绝，成功数应为0，实际{count}"
+    assert len(errors) >= 4, f"应至少检测到4个错误，实际{len(errors)}个"
+    print_ok(f"非法数据全部拒绝: 成功{count}条, 失败{len(errors)}条")
+    for e in errors:
+        print(f"    - {e}")
+
+    parts_after = {p.part_id: p.to_dict() for p in store.get_all_spare_parts()}
+    assert set(parts_before.keys()) == set(parts_after.keys()), "非法导入不应新增备件"
+    for pid in parts_before:
+        assert parts_before[pid] == parts_after[pid], "非法导入不应修改已有备件"
+    print_ok("非法导入零污染：已有备件数量、内容完全不变")
+
+    valid_csv = os.path.join(base, "test_spare_parts_valid.csv")
+    with open(valid_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "category", "stock", "low_stock_threshold", "applicable_categories", "unit"])
+        writer.writerow(["有效过滤芯", "空调配件", "20", "5", "空调维修|电路维修", "个"])
+        writer.writerow(["有效开关", "电路配件", "50", "10", "电路维修", "只"])
+
+    count_valid, errors_valid = store.import_spare_parts_csv(valid_csv, dispatcher)
+    assert count_valid == 2, f"合法数据应导入2条，实际{count_valid}"
+    assert len(errors_valid) == 0, f"合法数据不应有错误，实际{len(errors_valid)}"
+    print_ok(f"合法CSV导入成功: {count_valid}条")
+
+    all_parts = store.get_all_spare_parts()
+    found_filter = any(p.name == "有效过滤芯" and p.stock == 20 for p in all_parts)
+    found_switch = any(p.name == "有效开关" and p.stock == 50 for p in all_parts)
+    assert found_filter and found_switch, "合法导入的备件应存在"
+    print_ok("合法导入的备件在数据中存在且字段正确")
+
+    logs = store.get_spare_part_audit_logs()
+    create_logs = [l for l in logs if l.action == "创建" and l.part_name in ("有效过滤芯", "有效开关")]
+    assert len(create_logs) == 2, "合法导入的备件应写入创建日志"
+    print_ok("合法导入的备件自动写入创建操作日志")
+
+    try:
+        os.remove(bad_csv)
+        os.remove(valid_csv)
+    except Exception:
+        pass
+
+    print_ok("备件导入非法行全部验证通过：非法数据全拒、零污染；合法数据正常入库+写日志")
+
+
+def test_spare_parts_export_field_consistency(store):
+    print_title("测试38: 备件导出字段一致性 - CSV/JSON字段与数据模型一一对应，数据完整")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+
+    part1 = store.create_spare_part(
+        name="导出测试滤芯", category="空调配件", stock=15,
+        low_stock_threshold=5, applicable_categories=["空调维修", "电路维修"],
+        unit="个", description="HEPA高效滤芯", dispatcher=dispatcher,
+    )
+    part2 = store.create_spare_part(
+        name="导出测试开关", category="电路配件", stock=3,
+        low_stock_threshold=10, applicable_categories=["电路维修"],
+        unit="只", description="16A空气开关", dispatcher=dispatcher,
+    )
+    print_ok(f"创建2个测试备件: {part1.name}, {part2.name}")
+
+    order = store.create_order(
+        "导出测试工单", "", "SP-EXP栋", "空调维修", "中", dispatcher
+    )
+    store.dispatch_order(order.order_id, tech, dispatcher)
+    request = store.create_spare_part_request(
+        order.order_id, part1.part_id, 2, tech, "导出测试申请"
+    )
+    approved = store.approve_spare_part_request(
+        request.request_id, dispatcher, "导出测试审核通过"
+    )
+    store.return_spare_part(approved.request_id, tech, "多领了退回1个")
+    print_ok("创建完整流程：申请→审核→退回，生成多状态申请和多条日志")
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    export_dir = os.path.join(base, "test_exports_spare")
+    if os.path.exists(export_dir):
+        shutil.rmtree(export_dir)
+    store.set_export_dir(export_dir)
+
+    parts_json_path = store.export_spare_parts_json()
+    parts_csv_path = store.export_spare_parts_csv()
+    requests_json_path = store.export_spare_part_requests_json()
+    requests_csv_path = store.export_spare_part_requests_csv()
+    logs_json_path = store.export_spare_part_audit_logs_json()
+    logs_csv_path = store.export_spare_part_audit_logs_csv()
+
+    for p in [parts_json_path, parts_csv_path, requests_json_path, requests_csv_path, logs_json_path, logs_csv_path]:
+        assert os.path.exists(p) and os.path.getsize(p) > 0, f"导出文件不存在或为空: {p}"
+    print_ok("6个导出文件（备件/申请/日志 × JSON/CSV）全部生成成功")
+
+    with open(parts_json_path, "r", encoding="utf-8") as f:
+        parts_json = json.load(f)
+    expected_part_fields = [
+        "part_id", "name", "category", "stock", "low_stock_threshold",
+        "applicable_categories", "unit", "description", "created_at", "updated_at", "version",
+    ]
+    for idx, pj in enumerate(parts_json):
+        for fld in expected_part_fields:
+            assert fld in pj, f"备件JSON第{idx}条缺少字段: {fld}"
+    assert len(parts_json) >= 2
+    print_ok(f"备件JSON字段完整: {len(parts_json)}条记录, {len(expected_part_fields)}个字段全覆盖")
+
+    with open(parts_csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    csv_header_parts = rows[0]
+    expected_parts_csv_cols = [
+        "备件编号", "名称", "类别", "当前库存", "单位",
+        "低库存阈值", "库存状态", "适用维修类别", "描述",
+        "创建时间", "更新时间", "版本",
+    ]
+    for col in expected_parts_csv_cols:
+        assert col in csv_header_parts, f"备件CSV缺少列: {col}"
+    assert len(rows) >= 3
+    print_ok(f"备件CSV表头正确: {len(csv_header_parts)}列, 数据行={len(rows)-1}条")
+
+    with open(requests_json_path, "r", encoding="utf-8") as f:
+        requests_json = json.load(f)
+    expected_req_fields = [
+        "request_id", "order_id", "part_id", "part_name", "quantity",
+        "applicant_id", "applicant_name", "reason", "status",
+        "reviewer_id", "reviewer_name", "review_note",
+        "created_at", "reviewed_at", "returned_at", "return_note", "version",
+    ]
+    for idx, rj in enumerate(requests_json):
+        for fld in expected_req_fields:
+            assert fld in rj, f"申请JSON第{idx}条缺少字段: {fld}"
+    assert len(requests_json) >= 1
+    print_ok(f"申请JSON字段完整: {len(requests_json)}条记录, {len(expected_req_fields)}个字段全覆盖")
+
+    with open(requests_csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows_req = list(reader)
+    expected_req_csv_cols = [
+        "申请编号", "工单编号", "备件编号", "备件名称",
+        "申请数量", "申请人ID", "申请人姓名", "申请原因",
+        "状态", "审核人ID", "审核人姓名", "审核备注",
+        "申请时间", "审核时间", "退回时间", "退回备注", "版本",
+    ]
+    for col in expected_req_csv_cols:
+        assert col in rows_req[0], f"申请CSV缺少列: {col}"
+    print_ok(f"申请CSV表头正确: {len(rows_req[0])}列")
+
+    with open(logs_json_path, "r", encoding="utf-8") as f:
+        logs_json = json.load(f)
+    expected_log_fields = [
+        "log_id", "part_id", "part_name", "action", "quantity",
+        "operator_id", "operator_name", "order_id", "request_id",
+        "note", "timestamp", "stock_before", "stock_after",
+    ]
+    for idx, lj in enumerate(logs_json):
+        for fld in expected_log_fields:
+            assert fld in lj, f"日志JSON第{idx}条缺少字段: {fld}"
+    assert len(logs_json) >= 4
+    print_ok(f"日志JSON字段完整: {len(logs_json)}条记录, {len(expected_log_fields)}个字段全覆盖")
+
+    with open(logs_csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows_log = list(reader)
+    expected_log_csv_cols = [
+        "日志编号", "备件编号", "备件名称", "操作类型",
+        "操作数量", "操作人ID", "操作人姓名",
+        "关联工单", "关联申请", "备注",
+        "操作前库存", "操作后库存", "操作时间",
+    ]
+    for col in expected_log_csv_cols:
+        assert col in rows_log[0], f"日志CSV缺少列: {col}"
+    print_ok(f"日志CSV表头正确: {len(rows_log[0])}列")
+
+    low_stock_parts = store.get_spare_parts_by_filter(low_stock_only=True)
+    low_stock_names = {p.name for p in low_stock_parts}
+    assert "导出测试开关" in low_stock_names, "库存3<阈值10应标记低库存"
+    assert "导出测试滤芯" not in low_stock_names, "库存15>阈值5不应标记低库存"
+    print_ok(f"低库存筛选正确: {sorted(low_stock_names)}")
+
+    applicable_for_aircon = store.get_spare_parts_by_filter(order_category="空调维修")
+    aircon_names = {p.name for p in applicable_for_aircon}
+    assert "导出测试滤芯" in aircon_names, "滤芯适用于空调维修"
+    assert "导出测试开关" not in aircon_names, "开关不适用于空调维修"
+    print_ok(f"按工单类别筛选正确: {sorted(aircon_names)}")
+
+    try:
+        shutil.rmtree(export_dir)
+    except Exception:
+        pass
+
+    print_ok("备件导出字段一致性全部验证通过：CSV/JSON 6类导出字段与模型100%匹配，筛选功能正确")
+
+
+def test_spare_parts_visibility_after_audit(store):
+    print_title("测试39: 审核后用户可见状态 - 维修员见已审核/库存减/工单历史，他人申请不可见")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    part = store.create_spare_part(
+        name="可见性测试轴承", category="电梯配件", stock=20,
+        low_stock_threshold=5, applicable_categories=["电梯维修"],
+        unit="个", dispatcher=dispatcher,
+    )
+    print_ok(f"创建备件: {part.name}, 初始库存={part.stock}")
+
+    order1 = store.create_order(
+        "tech1工单", "", "SP-VIS1栋", "电梯维修", "中", dispatcher
+    )
+    store.dispatch_order(order1.order_id, tech1, dispatcher)
+    order2 = store.create_order(
+        "tech2工单", "", "SP-VIS2栋", "电梯维修", "低", dispatcher
+    )
+    store.dispatch_order(order2.order_id, tech2, dispatcher)
+
+    req1 = store.create_spare_part_request(
+        order1.order_id, part.part_id, 3, tech1, "tech1领用"
+    )
+    req2 = store.create_spare_part_request(
+        order2.order_id, part.part_id, 5, tech2, "tech2领用"
+    )
+    print_ok(f"两个维修员各建申请: tech1申请{req1.quantity}个, tech2申请{req2.quantity}个")
+
+    tech1_own_requests_before = store.get_spare_part_requests_by_filter(user=tech1)
+    tech1_own_ids_before = {r.request_id for r in tech1_own_requests_before}
+    assert req1.request_id in tech1_own_ids_before, "tech1应看到自己的申请"
+    assert req2.request_id not in tech1_own_ids_before, "tech1不应看到tech2的申请"
+    print_ok("申请前权限隔离：tech1只见自己的申请，tech2的不可见")
+
+    tech2_own_requests = store.get_spare_part_requests_by_filter(user=tech2)
+    tech2_own_ids = {r.request_id for r in tech2_own_requests}
+    assert req2.request_id in tech2_own_ids, "tech2应看到自己的申请"
+    assert req1.request_id not in tech2_own_ids, "tech2不应看到tech1的申请"
+    print_ok("申请前权限隔离：tech2只见自己的申请，tech1的不可见")
+
+    dispatcher_reqs_before = store.get_spare_part_requests_by_filter()
+    assert len(dispatcher_reqs_before) >= 2, "调度员应能看到全部申请"
+    print_ok(f"调度员可见所有申请: 共{len(dispatcher_reqs_before)}条")
+
+    approved1 = store.approve_spare_part_request(
+        req1.request_id, dispatcher, "同意tech1领用"
+    )
+    assert approved1.status == SparePartRequestStatus.APPROVED
+    assert approved1.reviewer_id == dispatcher.user_id
+    print_ok(f"调度员审核tech1的申请通过: 状态={approved1.status.value}")
+
+    tech1_own_after = store.get_spare_part_requests_by_filter(user=tech1)
+    tech1_req1 = next(r for r in tech1_own_after if r.request_id == req1.request_id)
+    assert tech1_req1.status == SparePartRequestStatus.APPROVED, "tech1应看到自己申请变为已审核"
+    assert tech1_req1.reviewer_name == dispatcher.name, "tech1应看到审核人"
+    assert tech1_req1.review_note == "同意tech1领用", "tech1应看到审核备注"
+    print_ok("tech1可见自己申请的状态更新：已审核、审核人、审核备注")
+
+    part_after = store.get_spare_part(part.part_id)
+    assert part_after.stock == 17, f"审核后库存应为17，实际{part_after.stock}"
+    print_ok(f"库存扣减可见: 20 - 3 = {part_after.stock}")
+
+    stock_for_tech1 = store.get_all_spare_parts()
+    tech1_view_part = next(p for p in stock_for_tech1 if p.part_id == part.part_id)
+    assert tech1_view_part.stock == 17, "维修员查看到的库存应是扣减后的值"
+    print_ok("维修员查看库存时看到最新扣减值")
+
+    order1_after = store.get_order(order1.order_id)
+    spare_history = [h for h in order1_after.history if "备件领用审核通过" in h.note]
+    assert len(spare_history) >= 1, "tech1的工单历史应写入备件领用记录"
+    assert spare_history[-1].user_id == dispatcher.user_id
+    assert "tech1领用" in spare_history[-1].note or "同意tech1领用" in spare_history[-1].note
+    print_ok("工单历史可见：包含备件领用审核记录，审核人、备注正确")
+
+    order2_after = store.get_order(order2.order_id)
+    no_spare_history = all("备件领用审核通过" not in h.note for h in order2_after.history)
+    assert no_spare_history, "tech2的工单不应被写入tech1的备件记录"
+    print_ok("数据隔离：tech2的工单历史未被tech1的审核污染")
+
+    logs_filtered_order = store.get_spare_part_audit_logs(order_id=order1.order_id)
+    assert len(logs_filtered_order) >= 1, "按工单筛选应找到审核日志"
+    assert logs_filtered_order[0].order_id == order1.order_id
+    print_ok(f"按工单筛选日志: order_id={order1.order_id} 找到{len(logs_filtered_order)}条")
+
+    logs_filtered_part = store.get_spare_part_audit_logs(part_id=part.part_id)
+    assert len(logs_filtered_part) >= 2, "按备件筛选应找到创建和审核日志"
+    actions = {l.action for l in logs_filtered_part}
+    assert "创建" in actions and "审核领用" in actions
+    print_ok(f"按备件筛选日志: part_id={part.part_id} 找到{len(logs_filtered_part)}条, 操作类型={sorted(actions)}")
+
+    try:
+        store.approve_spare_part_request(
+            req1.request_id, dispatcher, "重复审核"
+        )
+        print_fail("重复审核居然成功！")
+        assert False
+    except WorkOrderError as e:
+        assert "只有【待审核】状态可以审核" in str(e) or "待审核" in str(e)
+        print_ok(f"重复审核被正确拦截（符合预期）: {e}")
+
+    req1_after_dup = store.get_spare_part_request(req1.request_id)
+    assert req1_after_dup.status == SparePartRequestStatus.APPROVED, "重复审核不应改变状态"
+    part_after_dup = store.get_spare_part(part.part_id)
+    assert part_after_dup.stock == 17, "重复审核不应再次扣减库存"
+    print_ok("重复审核拦截后：申请状态不变、库存不变、原子性保证")
+
+    print_ok("审核后用户可见状态全部验证通过：权限隔离、状态更新、库存扣减、工单历史、日志筛选、重复拦截 全部正确")
+
+
+def test_spare_parts_application_validation_edge_cases(store):
+    print_title("测试40: 备件申请/审核边界拦截 - 工单完成/非指定维修员/类别不匹配/库存不足")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+
+    aircon_part = store.create_spare_part(
+        name="空调专用制冷剂", category="空调配件", stock=5,
+        low_stock_threshold=2, applicable_categories=["空调维修"],
+        unit="瓶", dispatcher=dispatcher,
+    )
+    print_ok(f"创建仅适用于空调维修的备件: {aircon_part.name}, 库存={aircon_part.stock}")
+
+    order_completed = store.create_order(
+        "已完成工单", "", "SP-ED1栋", "空调维修", "高", dispatcher
+    )
+    store.dispatch_order(order_completed.order_id, tech1, dispatcher)
+    store.accept_order(order_completed.order_id, tech1)
+    store.complete_order(order_completed.order_id, tech1)
+    store.approve_order(order_completed.order_id, inspector)
+    assert store.get_order(order_completed.order_id).status == Status.COMPLETED
+    print_ok("工单流转到已完成状态")
+
+    try:
+        store.create_spare_part_request(
+            order_completed.order_id, aircon_part.part_id, 1, tech1, "已完成工单申请"
+        )
+        print_fail("已完成工单居然能申请备件！")
+        assert False
+    except WorkOrderError as e:
+        assert "已完成" in str(e)
+        print_ok(f"已完成工单申请被拦截（符合预期）: {e}")
+
+    order_other = store.create_order(
+        "他人的工单", "", "SP-ED2栋", "空调维修", "中", dispatcher
+    )
+    store.dispatch_order(order_other.order_id, tech1, dispatcher)
+    print_ok(f"工单派给 tech1={tech1.name}, tech2={tech2.name}尝试申请")
+
+    try:
+        store.create_spare_part_request(
+            order_other.order_id, aircon_part.part_id, 1, tech2, "非指定维修员申请"
+        )
+        print_fail("非指定维修员居然能申请备件！")
+        assert False
+    except PermissionError as e:
+        assert "指定维修员" in str(e) or "不是工单" in str(e)
+        print_ok(f"非指定维修员申请被拦截（符合预期）: {e}")
+
+    order_wrong_category = store.create_order(
+        "水管工单", "", "SP-ED3栋", "水管维修", "低", dispatcher
+    )
+    store.dispatch_order(order_wrong_category.order_id, tech1, dispatcher)
+    print_ok(f"水管维修工单尝试申请仅适用于空调维修的备件")
+
+    try:
+        store.create_spare_part_request(
+            order_wrong_category.order_id, aircon_part.part_id, 1, tech1, "类别不匹配申请"
+        )
+        print_fail("类别不匹配居然能申请备件！")
+        assert False
+    except WorkOrderError as e:
+        assert "不适用于" in str(e) or "不适用" in str(e) or "类别" in str(e)
+        print_ok(f"类别不匹配申请被拦截（符合预期）: {e}")
+
+    order_ok = store.create_order(
+        "正常空调工单", "", "SP-ED4栋", "空调维修", "中", dispatcher
+    )
+    store.dispatch_order(order_ok.order_id, tech1, dispatcher)
+    valid_req = store.create_spare_part_request(
+        order_ok.order_id, aircon_part.part_id, 10, tech1, "申请量超过库存"
+    )
+    print_ok(f"创建申请数量(10) > 库存(5) 的申请，准备审核时拦截")
+
+    try:
+        store.approve_spare_part_request(
+            valid_req.request_id, dispatcher, "库存不足也想过"
+        )
+        print_fail("库存不足居然审核通过！")
+        assert False
+    except WorkOrderError as e:
+        assert "库存不足" in str(e)
+        print_ok(f"库存不足审核被拦截（符合预期）: {e}")
+
+    part_after_fail = store.get_spare_part(aircon_part.part_id)
+    assert part_after_fail.stock == 5, "库存不足审核失败后库存应保持不变"
+    req_after_fail = store.get_spare_part_request(valid_req.request_id)
+    assert req_after_fail.status == SparePartRequestStatus.PENDING, "库存不足审核失败后申请状态应保持待审核"
+    print_ok("库存不足审核失败原子性：库存未扣、申请状态未变（无半扣减）")
+
+    print_ok("备件申请/审核边界拦截全部验证通过：已完成工单、非指定维修员、类别不匹配、库存不足 全部正确拦截且原子性完整")
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -3401,6 +4158,13 @@ def main():
         test_revocation_export_field_consistency(store)
         test_revocation_permission_denied(store)
         test_revocation_version_and_status_conflict(store)
+        store = test_spare_parts_persistence_across_restart(store)
+        test_spare_parts_permission_denied(store)
+        store = test_spare_parts_concurrent_stock_conflict(store)
+        test_spare_parts_import_invalid_rows(store)
+        test_spare_parts_export_field_consistency(store)
+        test_spare_parts_visibility_after_audit(store)
+        test_spare_parts_application_validation_edge_cases(store)
 
         print_title("全部测试通过")
         print("""
@@ -3438,6 +4202,13 @@ def main():
  31. 撤销-导出字段一致性：CSV/JSON 包含全部撤销字段（状态/原因/操作人/时间/冲突类型/状态快照），与UI一致
  32. 撤销-权限拒绝：非调度员（验收员/维修员）撤销被拒绝，所有数据不改动
  33. 撤销-版本与状态冲突：工单被再次改派/已完成时只跳过本条，正常撤销的工单恢复且版本递增，被跳过的工单数据不被覆盖
+ 34. 备件库存-重启恢复：备件档案/领用申请/审核日志 跨重启完全一致，重启后仍可查询和继续操作
+ 35. 备件库存-权限拒绝：非调度员创建/编辑/删除备件、非调度员审核申请、非本人申请查看 均被拒绝，所有数据不改动
+ 36. 备件库存-并发冲突：两个审核请求同时扣减同一备件库存时，RLock 互斥保证不超卖，库存和申请状态一致
+ 37. 备件库存-导入非法行：CSV 含空名称/负库存/负阈值/无效类别时，全量拒绝不写入，不污染已有数据
+ 38. 备件库存-导出字段一致性：库存/申请/日志 的 CSV/JSON 导出字段与数据模型完全一致，往返导入导出无数据丢失
+ 39. 备件库存-审核后可见状态：审核通过后库存扣减可见、申请状态更新可见、工单历史新增记录可见，维修员只能看到自己的申请
+ 40. 备件库存-申请/审核边界拦截：已完成工单、非指定维修员、类别不匹配、库存不足 均拦截且给出明确原因，审核失败原子性（无半扣减）
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")

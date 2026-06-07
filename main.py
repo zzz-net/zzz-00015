@@ -8,6 +8,7 @@ from models import (
     Role, Status, WorkOrder, User, TimeSlot, CATEGORY_SKILL_MAP,
     BatchDraftItem, BatchReassignmentDraft, BatchReassignmentResult,
     BatchItemResult, ConflictType, RevocationStatus, RevocationConflictType,
+    SparePart, SparePartRequest, SparePartRequestStatus, SparePartAuditLog,
 )
 from datastore import (
     DataStore,
@@ -1372,8 +1373,8 @@ class MaintenanceApp:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         perms = {
-            Role.DISPATCHER: ["orders", "history", "dispatcher", "schedule", "import_export"],
-            Role.TECHNICIAN: ["orders", "history", "technician"],
+            Role.DISPATCHER: ["orders", "history", "dispatcher", "schedule", "spare_parts", "import_export"],
+            Role.TECHNICIAN: ["orders", "history", "technician", "spare_parts"],
             Role.INSPECTOR: ["orders", "history", "inspector", "import_export"],
         }
         tabs = perms.get(self.current_user.role, [])
@@ -1390,6 +1391,8 @@ class MaintenanceApp:
             self._build_technician_tab()
         if "inspector" in tabs:
             self._build_inspector_tab()
+        if "spare_parts" in tabs:
+            self._build_spare_parts_tab()
         if "import_export" in tabs:
             self._build_import_export_tab()
 
@@ -2642,6 +2645,395 @@ class MaintenanceApp:
         except WorkOrderError as e:
             messagebox.showerror("错误", str(e))
 
+    # ==================== 备件库存 & 领用核销 Tab ====================
+    def _build_spare_parts_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="备件库存")
+
+        top_bar = tk.Frame(frame, bg="#2c3e50", height=45)
+        top_bar.pack(fill=tk.X)
+        top_bar.pack_propagate(False)
+        tk.Label(top_bar, text="备件库存与领用核销管理", font=("Microsoft YaHei", 13, "bold"),
+                 bg="#2c3e50", fg="white").pack(side=tk.LEFT, padx=15)
+        self.sp_role_label = tk.Label(top_bar, text="", font=("Microsoft YaHei", 10),
+                                      bg="#2c3e50", fg="#f39c12")
+        self.sp_role_label.pack(side=tk.RIGHT, padx=15)
+        if self.current_user.role == Role.DISPATCHER:
+            self.sp_role_label.configure(text="调度员视角 - 可维护档案/审核申请")
+        else:
+            self.sp_role_label.configure(text="维修员视角 - 仅查看可用库存和自己的申请")
+
+        content = tk.PanedWindow(frame, orient=tk.HORIZONTAL, bg="#f5f6fa", sashrelief=tk.RAISED)
+        content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        left_pane = tk.Frame(content, bg="#f5f6fa")
+        content.add(left_pane, minsize=500)
+
+        right_pane = tk.Frame(content, bg="#f5f6fa")
+        content.add(right_pane, minsize=500)
+
+        self._build_spare_parts_inventory_panel(left_pane)
+        self._build_spare_parts_request_panel(right_pane)
+        self._refresh_spare_parts_tab()
+
+    def _build_spare_parts_inventory_panel(self, parent):
+        panel = tk.LabelFrame(parent, text="备件档案 & 库存", font=("Microsoft YaHei", 11, "bold"),
+                               bg="#f5f6fa", fg="#2c3e50")
+        panel.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        toolbar = tk.Frame(panel, bg="#f5f6fa")
+        toolbar.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Label(toolbar, text="类别筛选:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=0, padx=3, pady=3)
+        self.sp_filter_category = ttk.Combobox(toolbar, values=["全部"] + CATEGORY_OPTIONS,
+                                                state="readonly", width=12, font=("Microsoft YaHei", 10))
+        self.sp_filter_category.set("全部")
+        self.sp_filter_category.grid(row=0, column=1, padx=3, pady=3)
+        self.sp_filter_category.bind("<<ComboboxSelected>>", lambda e: self._refresh_spare_parts_tree())
+
+        self.sp_filter_low = tk.BooleanVar(value=False)
+        tk.Checkbutton(toolbar, text="仅显示低库存", variable=self.sp_filter_low,
+                       font=("Microsoft YaHei", 10), bg="#f5f6fa",
+                       command=self._refresh_spare_parts_tree).grid(row=0, column=2, padx=8, pady=3)
+
+        tk.Button(toolbar, text="刷新", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=8, command=self._refresh_spare_parts_tree).grid(row=0, column=3, padx=3, pady=3)
+
+        if self.current_user.role == Role.DISPATCHER:
+            tk.Button(toolbar, text="新增备件", font=("Microsoft YaHei", 10, "bold"),
+                      bg="#27ae60", fg="white", width=10,
+                      command=self._on_sp_create).grid(row=0, column=4, padx=3, pady=3)
+            tk.Button(toolbar, text="编辑选中", font=("Microsoft YaHei", 10),
+                      bg="#f39c12", fg="white", width=10,
+                      command=self._on_sp_edit).grid(row=0, column=5, padx=3, pady=3)
+            tk.Button(toolbar, text="删除选中", font=("Microsoft YaHei", 10),
+                      bg="#e74c3c", fg="white", width=10,
+                      command=self._on_sp_delete).grid(row=0, column=6, padx=3, pady=3)
+            tk.Button(toolbar, text="导入CSV", font=("Microsoft YaHei", 10),
+                      bg="#9b59b6", fg="white", width=10,
+                      command=self._on_sp_import_csv).grid(row=0, column=7, padx=3, pady=3)
+
+        tk.Button(toolbar, text="导出CSV", font=("Microsoft YaHei", 10),
+                  bg="#16a085", fg="white", width=10,
+                  command=self._on_sp_export_csv).grid(row=0, column=8, padx=3, pady=3)
+        tk.Button(toolbar, text="导出JSON", font=("Microsoft YaHei", 10),
+                  bg="#16a085", fg="white", width=10,
+                  command=self._on_sp_export_json).grid(row=0, column=9, padx=3, pady=3)
+
+        tree_frame = tk.Frame(panel, bg="#f5f6fa")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        cols = ("part_id", "name", "category", "stock", "unit", "threshold", "status", "applicable", "desc")
+        self.sp_parts_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        for c, text, w in [
+            ("part_id", "编号", 140), ("name", "名称", 140), ("category", "类别", 100),
+            ("stock", "库存", 70), ("unit", "单位", 60), ("threshold", "低库阈值", 80),
+            ("status", "状态", 80), ("applicable", "适用工单类别", 180), ("desc", "描述", 180),
+        ]:
+            self.sp_parts_tree.heading(c, text=text)
+            self.sp_parts_tree.column(c, width=w, anchor="center")
+        self.sp_parts_tree.column("name", anchor="w")
+        self.sp_parts_tree.column("desc", anchor="w")
+        self.sp_parts_tree.column("applicable", anchor="w")
+        self.sp_parts_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sp_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.sp_parts_tree.yview)
+        sp_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.sp_parts_tree.configure(yscrollcommand=sp_sb.set)
+        self.sp_parts_tree.tag_configure("low", background="#fdedec")
+        self.sp_parts_tree.tag_configure("ok", background="#eafaf1")
+
+        log_frame = tk.LabelFrame(panel, text="操作日志（按备件筛选）",
+                                   font=("Microsoft YaHei", 11, "bold"), bg="#f5f6fa", fg="#2c3e50")
+        log_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
+        log_cols = ("log_time", "action", "qty", "operator", "before", "after", "order", "note")
+        self.sp_log_tree = ttk.Treeview(log_frame, columns=log_cols, show="headings", height=6)
+        for c, text, w in [
+            ("log_time", "时间", 160), ("action", "操作", 90), ("qty", "数量", 70),
+            ("operator", "操作人", 80), ("before", "操作前", 70), ("after", "操作后", 70),
+            ("order", "关联工单", 140), ("note", "备注", 280),
+        ]:
+            self.sp_log_tree.heading(c, text=text)
+            self.sp_log_tree.column(c, width=w, anchor="center")
+        self.sp_log_tree.column("note", anchor="w")
+        self.sp_log_tree.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+        self.sp_parts_tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_spare_parts_log())
+
+    def _build_spare_parts_request_panel(self, parent):
+        panel = tk.LabelFrame(parent, text="领用申请 & 审核", font=("Microsoft YaHei", 11, "bold"),
+                               bg="#f5f6fa", fg="#2c3e50")
+        panel.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        toolbar = tk.Frame(panel, bg="#f5f6fa")
+        toolbar.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Label(toolbar, text="状态:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=0, padx=3, pady=3)
+        self.sp_req_filter_status = ttk.Combobox(
+            toolbar,
+            values=["全部", "待审核", "已审核", "已拒绝", "已退回"],
+            state="readonly", width=10, font=("Microsoft YaHei", 10))
+        self.sp_req_filter_status.set("全部")
+        self.sp_req_filter_status.grid(row=0, column=1, padx=3, pady=3)
+        self.sp_req_filter_status.bind("<<ComboboxSelected>>", lambda e: self._refresh_spare_parts_requests())
+
+        tk.Label(toolbar, text="工单:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=2, padx=3, pady=3)
+        self.sp_req_filter_order = tk.Entry(toolbar, width=14, font=("Microsoft YaHei", 10))
+        self.sp_req_filter_order.grid(row=0, column=3, padx=3, pady=3)
+
+        tk.Button(toolbar, text="查询", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=6, command=self._refresh_spare_parts_requests).grid(row=0, column=4, padx=3, pady=3)
+
+        if self.current_user.role == Role.TECHNICIAN:
+            tk.Button(toolbar, text="新建领用申请", font=("Microsoft YaHei", 10, "bold"),
+                      bg="#2980b9", fg="white", width=14,
+                      command=self._on_sp_request_create).grid(row=0, column=5, padx=8, pady=3)
+            tk.Button(toolbar, text="退回选中", font=("Microsoft YaHei", 10),
+                      bg="#8e44ad", fg="white", width=10,
+                      command=self._on_sp_return).grid(row=0, column=6, padx=3, pady=3)
+
+        if self.current_user.role == Role.DISPATCHER:
+            tk.Button(toolbar, text="审核通过", font=("Microsoft YaHei", 10, "bold"),
+                      bg="#27ae60", fg="white", width=10,
+                      command=self._on_sp_approve).grid(row=0, column=5, padx=3, pady=3)
+            tk.Button(toolbar, text="审核拒绝", font=("Microsoft YaHei", 10),
+                      bg="#e74c3c", fg="white", width=10,
+                      command=self._on_sp_reject).grid(row=0, column=6, padx=3, pady=3)
+            tk.Button(toolbar, text="导出申请CSV", font=("Microsoft YaHei", 10),
+                      bg="#16a085", fg="white", width=12,
+                      command=self._on_sp_export_requests_csv).grid(row=0, column=7, padx=3, pady=3)
+            tk.Button(toolbar, text="导出日志CSV", font=("Microsoft YaHei", 10),
+                      bg="#16a085", fg="white", width=12,
+                      command=self._on_sp_export_logs_csv).grid(row=0, column=8, padx=3, pady=3)
+
+        tree_frame = tk.Frame(panel, bg="#f5f6fa")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        req_cols = ("req_id", "order_id", "part_id", "part_name", "qty",
+                     "applicant", "status", "reviewer", "reason", "created", "reviewed")
+        self.sp_req_tree = ttk.Treeview(tree_frame, columns=req_cols, show="headings")
+        for c, text, w in [
+            ("req_id", "申请编号", 160), ("order_id", "工单", 140),
+            ("part_id", "备件编号", 110), ("part_name", "备件名称", 120),
+            ("qty", "数量", 60), ("applicant", "申请人", 80),
+            ("status", "状态", 80), ("reviewer", "审核人", 80),
+            ("reason", "原因/备注", 180), ("created", "申请时间", 140), ("reviewed", "审核/退回时间", 140),
+        ]:
+            self.sp_req_tree.heading(c, text=text)
+            self.sp_req_tree.column(c, width=w, anchor="center")
+        self.sp_req_tree.column("reason", anchor="w")
+        self.sp_req_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        req_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.sp_req_tree.yview)
+        req_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.sp_req_tree.configure(yscrollcommand=req_sb.set)
+        self.sp_req_tree.tag_configure("pending", background="#fef9e7")
+        self.sp_req_tree.tag_configure("approved", background="#eafaf1")
+        self.sp_req_tree.tag_configure("rejected", background="#fdedec")
+        self.sp_req_tree.tag_configure("returned", background="#e8daef")
+
+    def _refresh_spare_parts_tab(self):
+        self._refresh_spare_parts_tree()
+        self._refresh_spare_parts_requests()
+        self._refresh_spare_parts_log()
+
+    def _refresh_spare_parts_tree(self):
+        for i in self.sp_parts_tree.get_children():
+            self.sp_parts_tree.delete(i)
+        cat = self.sp_filter_category.get()
+        cat_filter = None if cat == "全部" else cat
+        low_only = self.sp_filter_low.get()
+        try:
+            parts = self.store.get_spare_parts_by_filter(category=cat_filter, low_stock_only=low_only)
+        except WorkOrderError:
+            parts = []
+        for p in parts:
+            tag = "low" if p.is_low_stock else "ok"
+            applicable = "|".join(p.applicable_categories) if p.applicable_categories else "全部"
+            status_text = "低库存" if p.is_low_stock else "正常"
+            self.sp_parts_tree.insert("", tk.END, iid=p.part_id, values=(
+                p.part_id, p.name, p.category, p.stock, p.unit,
+                p.low_stock_threshold, status_text, applicable, p.description,
+            ), tags=(tag,))
+
+    def _refresh_spare_parts_log(self):
+        for i in self.sp_log_tree.get_children():
+            self.sp_log_tree.delete(i)
+        sel = self.sp_parts_tree.selection()
+        part_id = sel[0] if sel else None
+        try:
+            logs = self.store.get_spare_part_audit_logs(part_id=part_id)
+        except WorkOrderError:
+            logs = []
+        for l in logs[:50]:
+            self.sp_log_tree.insert("", tk.END, values=(
+                l.timestamp, l.action, l.quantity, l.operator_name,
+                l.stock_before, l.stock_after, l.order_id or "", l.note,
+            ))
+
+    def _refresh_spare_parts_requests(self):
+        for i in self.sp_req_tree.get_children():
+            self.sp_req_tree.delete(i)
+        status_text = self.sp_req_filter_status.get()
+        status_map = {
+            "待审核": SparePartRequestStatus.PENDING,
+            "已审核": SparePartRequestStatus.APPROVED,
+            "已拒绝": SparePartRequestStatus.REJECTED,
+            "已退回": SparePartRequestStatus.RETURNED,
+        }
+        status_filter = status_map.get(status_text)
+        order_filter = self.sp_req_filter_order.get().strip() or None
+        try:
+            reqs = self.store.get_spare_part_requests_by_filter(
+                user=self.current_user,
+                order_id=order_filter,
+                status=status_filter,
+            )
+        except WorkOrderError:
+            reqs = []
+        for r in reqs:
+            if r.status == SparePartRequestStatus.PENDING:
+                tag = "pending"
+            elif r.status == SparePartRequestStatus.APPROVED:
+                tag = "approved"
+            elif r.status == SparePartRequestStatus.REJECTED:
+                tag = "rejected"
+            else:
+                tag = "returned"
+            time_info = r.reviewed_at or r.returned_at or ""
+            note = r.reason or r.review_note or r.return_note or ""
+            self.sp_req_tree.insert("", tk.END, iid=r.request_id, values=(
+                r.request_id, r.order_id, r.part_id, r.part_name, r.quantity,
+                r.applicant_name, r.status.value, r.reviewer_name or "",
+                note, r.created_at, time_info,
+            ), tags=(tag,))
+
+    def _on_sp_create(self):
+        SparePartEditDialog(self.root, self.store, self.current_user, None, self._refresh_spare_parts_tab)
+
+    def _on_sp_edit(self):
+        sel = self.sp_parts_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要编辑的备件")
+            return
+        part = self.store.get_spare_part(sel[0])
+        if not part:
+            messagebox.showerror("错误", "备件不存在")
+            return
+        SparePartEditDialog(self.root, self.store, self.current_user, part, self._refresh_spare_parts_tab)
+
+    def _on_sp_delete(self):
+        sel = self.sp_parts_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要删除的备件")
+            return
+        if not messagebox.askyesno("确认", "确定删除选中的备件？存在待审核申请的备件无法删除。"):
+            return
+        try:
+            deleted = self.store.delete_spare_part(sel[0], self.current_user)
+            if deleted:
+                messagebox.showinfo("成功", "备件已删除")
+            else:
+                messagebox.showwarning("提示", "备件不存在")
+            self._refresh_spare_parts_tab()
+        except WorkOrderError as e:
+            messagebox.showerror("删除失败", str(e))
+
+    def _on_sp_import_csv(self):
+        path = filedialog.askopenfilename(title="选择备件CSV文件",
+                                            filetypes=[("CSV文件", "*.csv")])
+        if not path:
+            return
+        try:
+            imported, errors = self.store.import_spare_parts_csv(path, self.current_user)
+            if errors:
+                messagebox.showerror("导入失败",
+                    "检测到非法行，全部数据未导入:\n" + "\n".join(errors[:20]))
+            else:
+                messagebox.showinfo("成功", f"已成功导入/更新 {imported} 条备件档案")
+            self._refresh_spare_parts_tab()
+        except WorkOrderError as e:
+            messagebox.showerror("导入失败", str(e))
+
+    def _on_sp_export_csv(self):
+        try:
+            path = self.store.export_spare_parts_csv()
+            messagebox.showinfo("导出成功", f"备件库存已导出到: {path}")
+        except (ExportError, WorkOrderError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_sp_export_json(self):
+        try:
+            path = self.store.export_spare_parts_json()
+            messagebox.showinfo("导出成功", f"备件库存已导出到: {path}")
+        except (ExportError, WorkOrderError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_sp_export_requests_csv(self):
+        try:
+            path = self.store.export_spare_part_requests_csv()
+            messagebox.showinfo("导出成功", f"领用申请已导出到: {path}")
+        except (ExportError, WorkOrderError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_sp_export_logs_csv(self):
+        try:
+            path = self.store.export_spare_part_audit_logs_csv()
+            messagebox.showinfo("导出成功", f"审核日志已导出到: {path}")
+        except (ExportError, WorkOrderError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_sp_request_create(self):
+        SparePartRequestDialog(self.root, self.store, self.current_user, self._refresh_spare_parts_tab)
+
+    def _on_sp_approve(self):
+        sel = self.sp_req_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要审核通过的申请")
+            return
+        note = simpledialog.askstring("审核备注", "请输入审核备注（可留空）:", parent=self.root) or ""
+        failed = 0
+        success = 0
+        for req_id in sel:
+            try:
+                self.store.approve_spare_part_request(req_id, self.current_user, note)
+                success += 1
+            except WorkOrderError as e:
+                failed += 1
+                messagebox.showerror("审核失败", f"申请 {req_id} 审核被拦截:\n{str(e)}")
+        if success:
+            messagebox.showinfo("审核结果", f"成功审核 {success} 条申请，失败 {failed} 条")
+        self._refresh_spare_parts_tab()
+
+    def _on_sp_reject(self):
+        sel = self.sp_req_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要拒绝的申请")
+            return
+        note = simpledialog.askstring("拒绝原因", "请输入拒绝原因（必填）:", parent=self.root)
+        if not note or not note.strip():
+            messagebox.showwarning("提示", "拒绝原因不能为空")
+            return
+        for req_id in sel:
+            try:
+                self.store.reject_spare_part_request(req_id, self.current_user, note)
+            except WorkOrderError as e:
+                messagebox.showerror("拒绝失败", f"申请 {req_id} 处理失败:\n{str(e)}")
+        self._refresh_spare_parts_tab()
+
+    def _on_sp_return(self):
+        sel = self.sp_req_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要退回的已审核申请")
+            return
+        note = simpledialog.askstring("退回备注", "请输入退回备注（可留空）:", parent=self.root) or ""
+        for req_id in sel:
+            try:
+                self.store.return_spare_part(req_id, self.current_user, note)
+            except WorkOrderError as e:
+                messagebox.showerror("退回失败", f"申请 {req_id} 退回被拦截:\n{str(e)}")
+        self._refresh_spare_parts_tab()
+
     def _refresh_all_tabs(self):
         try:
             self._refresh_orders()
@@ -2667,6 +3059,208 @@ class MaintenanceApp:
             self._refresh_inspector_tab()
         except Exception:
             pass
+        try:
+            self._refresh_spare_parts_tab()
+        except Exception:
+            pass
+
+
+class SparePartEditDialog(tk.Toplevel):
+    def __init__(self, parent, store, dispatcher, part: Optional[SparePart], on_done):
+        super().__init__(parent)
+        self.store = store
+        self.dispatcher = dispatcher
+        self.part = part
+        self.on_done = on_done
+        self.title("编辑备件" if part else "新增备件")
+        self.geometry("560x520")
+        self.configure(bg="#f5f6fa")
+        self.grab_set()
+        self.transient(parent)
+        self._build()
+
+    def _build(self):
+        form = tk.Frame(self, bg="#f5f6fa")
+        form.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
+
+        fields = [
+            ("名称:", "name", True),
+            ("类别:", "category", True),
+            ("当前库存:", "stock", True),
+            ("低库存阈值:", "threshold", True),
+            ("单位:", "unit", False),
+        ]
+        self.entries = {}
+        defaults = {
+            "name": self.part.name if self.part else "",
+            "category": self.part.category if self.part else "",
+            "stock": str(self.part.stock) if self.part else "0",
+            "threshold": str(self.part.low_stock_threshold) if self.part else "0",
+            "unit": self.part.unit if self.part else "个",
+        }
+        for i, (label, key, required) in enumerate(fields):
+            tk.Label(form, text=label + ("*" if required else ""),
+                     font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=i, column=0, sticky="e", padx=5, pady=6)
+            e = tk.Entry(form, width=36, font=("Microsoft YaHei", 10))
+            e.insert(0, defaults.get(key, ""))
+            e.grid(row=i, column=1, sticky="w", padx=5, pady=6)
+            self.entries[key] = e
+
+        tk.Label(form, text="适用工单类别 (|分隔，留空=全部):", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=5, column=0, sticky="ne", padx=5, pady=6)
+        self.applicable_text = tk.Text(form, width=36, height=3, font=("Microsoft YaHei", 10))
+        if self.part and self.part.applicable_categories:
+            self.applicable_text.insert("1.0", "|".join(self.part.applicable_categories))
+        self.applicable_text.grid(row=5, column=1, sticky="w", padx=5, pady=6)
+
+        tk.Label(form, text="描述:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=6, column=0, sticky="ne", padx=5, pady=6)
+        self.desc_text = tk.Text(form, width=36, height=4, font=("Microsoft YaHei", 10))
+        if self.part:
+            self.desc_text.insert("1.0", self.part.description)
+        self.desc_text.grid(row=6, column=1, sticky="w", padx=5, pady=6)
+
+        btn_frame = tk.Frame(form, bg="#f5f6fa")
+        btn_frame.grid(row=7, column=0, columnspan=2, pady=15)
+        tk.Button(btn_frame, text="保存", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#27ae60", fg="white", width=12, command=self._on_save).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_frame, text="取消", font=("Microsoft YaHei", 11),
+                  bg="#7f8c8d", fg="white", width=12, command=self.destroy).pack(side=tk.LEFT, padx=8)
+
+    def _on_save(self):
+        name = self.entries["name"].get().strip()
+        category = self.entries["category"].get().strip()
+        try:
+            stock = int(self.entries["stock"].get().strip())
+        except ValueError:
+            messagebox.showerror("错误", "库存必须是整数", parent=self)
+            return
+        try:
+            threshold = int(self.entries["threshold"].get().strip())
+        except ValueError:
+            messagebox.showerror("错误", "低库存阈值必须是整数", parent=self)
+            return
+        unit = self.entries["unit"].get().strip() or "个"
+        applicable_raw = self.applicable_text.get("1.0", tk.END).strip()
+        applicable = [c.strip() for c in applicable_raw.split("|") if c.strip()] if applicable_raw else []
+        description = self.desc_text.get("1.0", tk.END).strip()
+        try:
+            if self.part:
+                self.store.update_spare_part(
+                    part_id=self.part.part_id,
+                    dispatcher=self.dispatcher,
+                    name=name, category=category, stock=stock,
+                    low_stock_threshold=threshold, applicable_categories=applicable,
+                    unit=unit, description=description,
+                )
+            else:
+                self.store.create_spare_part(
+                    name=name, category=category, stock=stock,
+                    low_stock_threshold=threshold, applicable_categories=applicable,
+                    unit=unit, description=description, dispatcher=self.dispatcher,
+                )
+            messagebox.showinfo("成功", "备件已保存", parent=self)
+            if self.on_done:
+                self.on_done()
+            self.destroy()
+        except WorkOrderError as e:
+            messagebox.showerror("保存失败", str(e), parent=self)
+
+
+class SparePartRequestDialog(tk.Toplevel):
+    def __init__(self, parent, store, technician, on_done):
+        super().__init__(parent)
+        self.store = store
+        self.technician = technician
+        self.on_done = on_done
+        self.title("申请领用备件")
+        self.geometry("520x420")
+        self.configure(bg="#f5f6fa")
+        self.grab_set()
+        self.transient(parent)
+        self._build()
+
+    def _build(self):
+        form = tk.Frame(self, bg="#f5f6fa")
+        form.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
+
+        my_orders = self.store.get_orders_by_filter(assignee_id=self.technician.user_id)
+        active_orders = [o for o in my_orders if o.status != Status.COMPLETED]
+        order_values = [f"{o.order_id} - {o.title} ({o.category})" for o in active_orders]
+        self.order_map = {f"{o.order_id} - {o.title} ({o.category})": o for o in active_orders}
+
+        tk.Label(form, text="关联工单*:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=0, sticky="e", padx=5, pady=8)
+        self.order_combo = ttk.Combobox(form, values=order_values, state="readonly",
+                                        width=40, font=("Microsoft YaHei", 10))
+        self.order_combo.grid(row=0, column=1, sticky="w", padx=5, pady=8)
+        self.order_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_parts())
+
+        tk.Label(form, text="领用备件*:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=1, column=0, sticky="e", padx=5, pady=8)
+        self.part_combo = ttk.Combobox(form, values=[], state="readonly",
+                                        width=40, font=("Microsoft YaHei", 10))
+        self.part_combo.grid(row=1, column=1, sticky="w", padx=5, pady=8)
+        self.part_map = {}
+
+        tk.Label(form, text="领用数量*:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=2, column=0, sticky="e", padx=5, pady=8)
+        self.qty_entry = tk.Entry(form, width=40, font=("Microsoft YaHei", 10))
+        self.qty_entry.insert(0, "1")
+        self.qty_entry.grid(row=2, column=1, sticky="w", padx=5, pady=8)
+
+        tk.Label(form, text="申请原因:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=3, column=0, sticky="ne", padx=5, pady=8)
+        self.reason_text = tk.Text(form, width=40, height=4, font=("Microsoft YaHei", 10))
+        self.reason_text.grid(row=3, column=1, sticky="w", padx=5, pady=8)
+
+        btn_frame = tk.Frame(form, bg="#f5f6fa")
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=20)
+        tk.Button(btn_frame, text="提交申请", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#2980b9", fg="white", width=12, command=self._on_submit).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_frame, text="取消", font=("Microsoft YaHei", 11),
+                  bg="#7f8c8d", fg="white", width=12, command=self.destroy).pack(side=tk.LEFT, padx=8)
+
+    def _refresh_parts(self):
+        order_val = self.order_combo.get()
+        order = self.order_map.get(order_val)
+        if not order:
+            self.part_combo["values"] = []
+            self.part_map = {}
+            return
+        try:
+            parts = self.store.get_spare_parts_by_filter(order_category=order.category)
+        except WorkOrderError:
+            parts = []
+        display = [f"{p.part_id} - {p.name} (库存:{p.stock}{p.unit})" for p in parts]
+        self.part_map = {f"{p.part_id} - {p.name} (库存:{p.stock}{p.unit})": p for p in parts}
+        self.part_combo["values"] = display
+
+    def _on_submit(self):
+        order_val = self.order_combo.get()
+        order = self.order_map.get(order_val)
+        if not order:
+            messagebox.showwarning("提示", "请选择关联工单", parent=self)
+            return
+        part_val = self.part_combo.get()
+        part = self.part_map.get(part_val)
+        if not part:
+            messagebox.showwarning("提示", "请选择要领用的备件", parent=self)
+            return
+        try:
+            qty = int(self.qty_entry.get().strip())
+        except ValueError:
+            messagebox.showerror("错误", "领用数量必须是正整数", parent=self)
+            return
+        reason = self.reason_text.get("1.0", tk.END).strip()
+        try:
+            self.store.create_spare_part_request(order.order_id, part.part_id, qty, self.technician, reason)
+            messagebox.showinfo("成功", "申请已提交，等待调度员审核", parent=self)
+            if self.on_done:
+                self.on_done()
+            self.destroy()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("提交失败", str(e), parent=self)
 
 
 def main():
