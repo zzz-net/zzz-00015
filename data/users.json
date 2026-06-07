@@ -1,0 +1,22 @@
+[
+  {
+    "user_id": "u001",
+    "name": "张调度",
+    "role": "dispatcher"
+  },
+  {
+    "user_id": "u002",
+    "name": "李维修",
+    "role": "technician"
+  },
+  {
+    "user_id": "u003",
+    "name": "王维修",
+    "role": "technician"
+  },
+  {
+    "user_id": "u004",
+    "name": "赵验收",
+    "role": "inspector"
+  }
+]
