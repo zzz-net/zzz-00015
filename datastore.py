@@ -18,6 +18,7 @@ from models import (
     AppConfig,
     TimeSlot,
     ReassignmentLog,
+    ReassignmentDraft,
     MatchResult,
     CATEGORY_SKILL_MAP,
 )
@@ -49,10 +50,12 @@ class DataStore:
         self.orders_file = os.path.join(data_dir, "work_orders.json")
         self.users_file = os.path.join(data_dir, "users.json")
         self.config_file = os.path.join(data_dir, "config.json")
+        self.drafts_file = os.path.join(data_dir, "reassignment_drafts.json")
         self._lock = threading.RLock()
         self._orders: Dict[str, WorkOrder] = {}
         self._users: Dict[str, User] = {}
         self._config: AppConfig = AppConfig()
+        self._reassignment_drafts: Dict[str, ReassignmentDraft] = {}
         self._ensure_data_dir()
         self._load_all()
 
@@ -64,6 +67,7 @@ class DataStore:
         self._load_users()
         self._load_orders()
         self._load_config()
+        self._load_reassignment_drafts()
         if not self._users:
             self._init_default_users()
             self._save_users()
@@ -106,6 +110,19 @@ class DataStore:
     def _save_config(self):
         with open(self.config_file, "w", encoding="utf-8") as f:
             json.dump(self._config.to_dict(), f, ensure_ascii=False, indent=2)
+
+    def _load_reassignment_drafts(self):
+        if os.path.exists(self.drafts_file):
+            try:
+                with open(self.drafts_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._reassignment_drafts = {d["order_id"]: ReassignmentDraft.from_dict(d) for d in data}
+            except (json.JSONDecodeError, KeyError):
+                self._reassignment_drafts = {}
+
+    def _save_reassignment_drafts(self):
+        with open(self.drafts_file, "w", encoding="utf-8") as f:
+            json.dump([d.to_dict() for d in self._reassignment_drafts.values()], f, ensure_ascii=False, indent=2)
 
     def _init_default_users(self):
         default_users = [
@@ -536,6 +553,11 @@ class DataStore:
 
             order.bump_version()
             self._save_orders()
+
+            if order_id in self._reassignment_drafts:
+                del self._reassignment_drafts[order_id]
+                self._save_reassignment_drafts()
+
             return order
 
     def get_reassignment_logs(self, order_id: str) -> List[ReassignmentLog]:
@@ -543,6 +565,52 @@ class DataStore:
         if order:
             return list(order.reassignment_logs)
         return []
+
+    # ----- Reassignment Drafts -----
+
+    def save_reassignment_draft(
+        self,
+        order_id: str,
+        dispatcher: User,
+        target_technician: User,
+        reason: str,
+    ) -> ReassignmentDraft:
+        self._check_permission(dispatcher, "reassign")
+        if target_technician.role != Role.TECHNICIAN:
+            raise WorkOrderError(f"只能改派给维修员，【{target_technician.name}】不是维修员")
+        with self._lock:
+            order = self._orders.get(order_id)
+            if not order:
+                raise WorkOrderError(f"工单不存在: {order_id}")
+            draft = ReassignmentDraft(
+                order_id=order_id,
+                dispatcher_id=dispatcher.user_id,
+                target_technician_id=target_technician.user_id,
+                reason=reason.strip(),
+                order_version=order.version,
+            )
+            self._reassignment_drafts[order_id] = draft
+            self._save_reassignment_drafts()
+            return draft
+
+    def get_reassignment_draft(self, order_id: str, dispatcher: Optional[User] = None) -> Optional[ReassignmentDraft]:
+        draft = self._reassignment_drafts.get(order_id)
+        if draft is None:
+            return None
+        if dispatcher is not None and draft.dispatcher_id != dispatcher.user_id:
+            return None
+        return draft
+
+    def delete_reassignment_draft(self, order_id: str, dispatcher: Optional[User] = None) -> bool:
+        with self._lock:
+            draft = self._reassignment_drafts.get(order_id)
+            if draft is None:
+                return False
+            if dispatcher is not None and draft.dispatcher_id != dispatcher.user_id:
+                return False
+            del self._reassignment_drafts[order_id]
+            self._save_reassignment_drafts()
+            return True
 
     # ----- Import -----
 

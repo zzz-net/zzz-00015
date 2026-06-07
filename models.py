@@ -421,6 +421,45 @@ class WorkOrder:
         return self.version
 
 
+class ReassignmentDraft:
+    def __init__(
+        self,
+        order_id: str,
+        dispatcher_id: str,
+        target_technician_id: str,
+        reason: str,
+        order_version: int,
+        created_at: Optional[str] = None,
+    ):
+        self.order_id = order_id
+        self.dispatcher_id = dispatcher_id
+        self.target_technician_id = target_technician_id
+        self.reason = reason
+        self.order_version = order_version
+        self.created_at = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def to_dict(self) -> Dict:
+        return {
+            "order_id": self.order_id,
+            "dispatcher_id": self.dispatcher_id,
+            "target_technician_id": self.target_technician_id,
+            "reason": self.reason,
+            "order_version": self.order_version,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ReassignmentDraft":
+        return cls(
+            data["order_id"],
+            data["dispatcher_id"],
+            data["target_technician_id"],
+            data["reason"],
+            data["order_version"],
+            data.get("created_at"),
+        )
+
+
 class AppConfig:
     def __init__(self, export_dir: str = ""):
         self.export_dir = export_dir

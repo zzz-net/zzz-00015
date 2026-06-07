@@ -56,14 +56,14 @@ class ReassignDialog(tk.Toplevel):
         self.store = store
         self.dispatcher = dispatcher
         self.order = order
-        self.expected_version = order.version
         self.result = None
         self.title("改派工单")
-        self.geometry("600x500")
+        self.geometry("620x560")
         self.configure(bg="#f5f6fa")
         self.grab_set()
         self.transient(parent)
         self._build_ui()
+        self._try_load_draft()
 
     def _build_ui(self):
         style = ttk.Style()
@@ -79,8 +79,13 @@ class ReassignDialog(tk.Toplevel):
         tk.Label(info_frame, text=f"类别: {self.order.category}  优先级: {self.order.priority}",
                  font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=2, column=0, sticky="w", pady=2)
         current = self.order.assignee_name or "(未指派)"
-        tk.Label(info_frame, text=f"当前维修员: {current}", font=("Microsoft YaHei", 10),
-                 bg="#f5f6fa").grid(row=3, column=0, sticky="w", pady=2)
+        tk.Label(info_frame, text=f"当前维修员: {current}  当前版本: v{self.order.version}",
+                 font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=3, column=0, sticky="w", pady=2)
+
+        self.draft_info_label = tk.Label(info_frame, text="", font=("Microsoft YaHei", 9, "bold"),
+                                          bg="#fff3cd", fg="#856404", anchor="w", padx=8, pady=4)
+        self.draft_info_label.grid(row=4, column=0, sticky="we", pady=(6, 0))
+        self.draft_info_label.grid_remove()
 
         tk.Label(self, text="选择新维修员（按匹配度排序）:", font=("Microsoft YaHei", 10, "bold"),
                  bg="#f5f6fa").pack(anchor="w", padx=15)
@@ -123,7 +128,13 @@ class ReassignDialog(tk.Toplevel):
         btn_frame.pack(fill=tk.X, padx=15, pady=15)
         tk.Button(btn_frame, text="确认改派", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
                   width=12, command=self._on_confirm).pack(side=tk.RIGHT, padx=5)
-        tk.Button(btn_frame, text="取消", font=("Microsoft YaHei", 10), bg="#95a5a6", fg="white",
+        tk.Button(btn_frame, text="保存草稿", font=("Microsoft YaHei", 10), bg="#f39c12", fg="white",
+                  width=12, command=self._on_save_draft).pack(side=tk.RIGHT, padx=5)
+        self.clear_draft_btn = tk.Button(btn_frame, text="清除草稿", font=("Microsoft YaHei", 10),
+                                          bg="#95a5a6", fg="white", width=12, command=self._on_clear_draft)
+        self.clear_draft_btn.pack(side=tk.RIGHT, padx=5)
+        self.clear_draft_btn.pack_forget()
+        tk.Button(btn_frame, text="取消", font=("Microsoft YaHei", 10), bg="#7f8c8d", fg="white",
                   width=12, command=self.destroy).pack(side=tk.RIGHT, padx=5)
 
     def _load_technicians(self):
@@ -148,6 +159,56 @@ class ReassignDialog(tk.Toplevel):
                 "; ".join(match.warnings) if match.warnings else "推荐",
             ), tags=(tag,))
 
+    def _try_load_draft(self):
+        draft = self.store.get_reassignment_draft(self.order.order_id, self.dispatcher)
+        if draft is None:
+            return
+        if self.tree.exists(draft.target_technician_id):
+            self.tree.selection_set(draft.target_technician_id)
+            self.tree.see(draft.target_technician_id)
+        self.reason_text.delete("1.0", tk.END)
+        self.reason_text.insert("1.0", draft.reason)
+        tech = self.store.get_user(draft.target_technician_id)
+        tech_name = tech.name if tech else draft.target_technician_id
+        self.draft_info_label.configure(
+            text=f"已载入改派草稿（创建于 {draft.created_at}，目标: {tech_name}，原工单版本 v{draft.order_version}）"
+        )
+        self.draft_info_label.grid()
+        self.clear_draft_btn.pack(side=tk.RIGHT, padx=5)
+
+    def _on_save_draft(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("提示", "请选择新维修员", parent=self)
+            return
+        new_tech_id = selection[0]
+        reason = self.reason_text.get("1.0", tk.END).strip()
+        if not reason:
+            messagebox.showwarning("提示", "请填写改派原因后再保存草稿", parent=self)
+            return
+        try:
+            new_tech = self.store.get_user(new_tech_id)
+            self.store.save_reassignment_draft(self.order.order_id, self.dispatcher, new_tech, reason)
+            messagebox.showinfo("成功", "改派草稿已保存", parent=self)
+            self.draft_info_label.configure(
+                text=f"改派草稿已保存（目标: {new_tech.name}）"
+            )
+            self.draft_info_label.grid()
+            self.clear_draft_btn.pack(side=tk.RIGHT, padx=5)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e), parent=self)
+
+    def _on_clear_draft(self):
+        if not messagebox.askyesno("确认", "确定清除该工单的改派草稿？", parent=self):
+            return
+        deleted = self.store.delete_reassignment_draft(self.order.order_id, self.dispatcher)
+        if deleted:
+            self.draft_info_label.grid_remove()
+            self.clear_draft_btn.pack_forget()
+            self.reason_text.delete("1.0", tk.END)
+            self.tree.selection_remove(self.tree.selection())
+            messagebox.showinfo("成功", "草稿已清除", parent=self)
+
     def _on_confirm(self):
         selection = self.tree.selection()
         if not selection:
@@ -159,17 +220,34 @@ class ReassignDialog(tk.Toplevel):
             messagebox.showwarning("提示", "请填写改派原因", parent=self)
             return
         try:
+            fresh_order = self.store.get_order(self.order.order_id)
+            if not fresh_order:
+                messagebox.showerror("错误", "工单不存在", parent=self)
+                return
+            allowed, msg = self.store.can_reassign(fresh_order, self.dispatcher)
+            if not allowed:
+                messagebox.showerror("无法改派",
+                    f"工单当前状态已变更，不能改派：{msg}\n改派草稿已保留，请刷新后再试。",
+                    parent=self)
+                return
             new_tech = self.store.get_user(new_tech_id)
-            self.store.reassign_order(self.order.order_id, new_tech, self.dispatcher,
-                                       reason, self.expected_version)
+            self.store.reassign_order(fresh_order.order_id, new_tech, self.dispatcher,
+                                       reason, self.order.version)
             self.result = True
             messagebox.showinfo("成功", f"工单已改派给 {new_tech.name}", parent=self)
             self.destroy()
         except ConcurrentOperationError as e:
-            messagebox.showerror("并发冲突", str(e), parent=self)
-            self.destroy()
+            messagebox.showerror("并发冲突",
+                f"{str(e)}\n改派草稿已保留，请刷新工单后再试。",
+                parent=self)
+        except PermissionError as e:
+            messagebox.showerror("权限不足",
+                f"{str(e)}\n改派草稿已保留。",
+                parent=self)
         except WorkOrderError as e:
-            messagebox.showerror("错误", str(e), parent=self)
+            messagebox.showerror("错误",
+                f"{str(e)}\n改派草稿已保留。",
+                parent=self)
 
 
 class LoginDialog(tk.Toplevel):

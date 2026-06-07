@@ -1072,6 +1072,344 @@ def test_gui_startup_and_tabs():
             shutil.rmtree(gui_export_dir)
 
 
+def test_reassignment_drafts_basic(store):
+    print_title("测试17: 改派草稿 - 保存、读取、删除、跨重启、改派成功自动清理")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    order = store.create_order("草稿测试工单", "", "DRAFT栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order.order_id, tech1, dispatcher)
+    version_before = store.get_order(order.order_id).version
+
+    draft = store.save_reassignment_draft(order.order_id, dispatcher, tech2, "测试草稿保存")
+    assert draft.order_id == order.order_id
+    assert draft.dispatcher_id == dispatcher.user_id
+    assert draft.target_technician_id == tech2.user_id
+    assert draft.reason == "测试草稿保存"
+    assert draft.order_version == version_before
+    assert draft.created_at and draft.created_at.strip()
+    print_ok(f"草稿保存成功: order_id={draft.order_id}, target={tech2.name}, version=v{draft.order_version}")
+
+    loaded = store.get_reassignment_draft(order.order_id, dispatcher)
+    assert loaded is not None
+    assert loaded.target_technician_id == tech2.user_id
+    assert loaded.reason == "测试草稿保存"
+    assert loaded.order_version == version_before
+    print_ok(f"草稿读取成功: 目标维修员={tech2.name}, 原因={loaded.reason}")
+
+    other_dispatcher_draft = store.get_reassignment_draft(order.order_id, store.get_user("u004"))
+    assert other_dispatcher_draft is None, "其他用户不能读取不属于自己的草稿"
+    print_ok("草稿按调度员隔离：其他调度员无法读取")
+
+    data_dir = store.data_dir
+    drafts_path = os.path.join(data_dir, "reassignment_drafts.json")
+    assert os.path.exists(drafts_path), "草稿持久化文件不存在"
+    with open(drafts_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert len(raw) >= 1
+    saved_draft = [d for d in raw if d["order_id"] == order.order_id][0]
+    assert saved_draft["target_technician_id"] == tech2.user_id
+    print_ok(f"草稿持久化文件存在且内容正确: {drafts_path}")
+
+    print_ok("重启数据存储，模拟关闭应用...")
+    del store
+    import gc
+    gc.collect()
+    store2 = DataStore(data_dir)
+
+    dispatcher2 = store2.get_user("u001")
+    tech2_2 = store2.get_user("u003")
+    restored = store2.get_reassignment_draft(order.order_id, dispatcher2)
+    assert restored is not None, "重启后草稿未恢复"
+    assert restored.target_technician_id == tech2_2.user_id
+    assert restored.reason == "测试草稿保存"
+    assert restored.order_version == version_before
+    print_ok(f"草稿跨重启恢复成功: 目标={tech2_2.name}, 原因={restored.reason}")
+
+    order2 = store2.get_order(order.order_id)
+    store2.reassign_order(order.order_id, tech2_2, dispatcher2, "正式改派", expected_version=order2.version)
+    assert len(order2.reassignment_logs) >= 1
+    after_reassign_log = store2.get_order(order.order_id).reassignment_logs[-1]
+    assert after_reassign_log.to_user_id == tech2_2.user_id
+    assert after_reassign_log.reason == "正式改派"
+    print_ok(f"正式改派成功: 写入改派日志, 新维修员={after_reassign_log.to_user_name}")
+
+    after_success_draft = store2.get_reassignment_draft(order.order_id, dispatcher2)
+    assert after_success_draft is None, "改派成功后草稿未自动清理"
+    print_ok("改派成功后草稿自动清理")
+
+    order3 = store2.create_order("草稿删除测试", "", "DRAFT2栋", "电路维修", "中", dispatcher2)
+    store2.dispatch_order(order3.order_id, tech2_2, dispatcher2)
+    store2.save_reassignment_draft(order3.order_id, dispatcher2, store2.get_user("u002"), "待删除草稿")
+    draft_before_del = store2.get_reassignment_draft(order3.order_id, dispatcher2)
+    assert draft_before_del is not None
+
+    deleted = store2.delete_reassignment_draft(order3.order_id, dispatcher2)
+    assert deleted == True
+    draft_after_del = store2.get_reassignment_draft(order3.order_id, dispatcher2)
+    assert draft_after_del is None
+    print_ok("草稿手动删除成功")
+
+    delete_again = store2.delete_reassignment_draft(order3.order_id, dispatcher2)
+    assert delete_again == False, "删除不存在的草稿应返回 False"
+    print_ok("重复删除不存在的草稿返回 False，不报错")
+
+    return store2
+
+
+def test_reassignment_drafts_conflicts(store):
+    print_title("测试18: 改派草稿 - 权限拒绝、版本冲突、状态变更场景")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+
+    order = store.create_order("冲突测试工单", "", "CONFLICT栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order.order_id, tech1, dispatcher)
+    base_version = store.get_order(order.order_id).version
+
+    store.save_reassignment_draft(order.order_id, dispatcher, tech2, "冲突场景草稿")
+    assert store.get_reassignment_draft(order.order_id, dispatcher) is not None
+    print_ok("草稿预保存成功，准备测试冲突场景")
+
+    try:
+        store.save_reassignment_draft(order.order_id, inspector, tech2, "验收员想存草稿")
+        print_fail("验收员居然能保存改派草稿！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员无权保存草稿（符合预期）: {e}")
+
+    draft_after_perm_denied = store.get_reassignment_draft(order.order_id, dispatcher)
+    assert draft_after_perm_denied is not None, "权限拒绝后草稿被误删"
+    print_ok("权限拒绝后草稿保留")
+
+    other_tech = store.get_user("u002")
+    try:
+        store.delete_reassignment_draft(order.order_id, other_tech)
+        print_ok("非调度员用户无权删除草稿，delete 返回 False（符合预期）")
+    except Exception as e:
+        print_fail(f"非调度员删除草稿抛出异常: {e}")
+        assert False
+
+    order_obj = store.get_order(order.order_id)
+    store.reassign_order(order.order_id, tech2, dispatcher, "他人抢先改派", expected_version=order_obj.version)
+    order_after_other = store.get_order(order.order_id)
+    assert order_after_other.version > base_version
+    print_ok(f"模拟他人抢先改派: 版本从 v{base_version} 升级到 v{order_after_other.version}")
+
+    draft_after_version_change = store.get_reassignment_draft(order.order_id, dispatcher)
+    assert draft_after_version_change is None
+    print_ok("他人成功改派后，目标工单的草稿已被自动清理")
+
+    order2 = store.create_order("状态变更测试工单", "", "STATUS栋", "水管维修", "高", dispatcher)
+    store.dispatch_order(order2.order_id, tech1, dispatcher)
+    store.accept_order(order2.order_id, tech1)
+    store.complete_order(order2.order_id, tech1)
+
+    store.save_reassignment_draft(order2.order_id, dispatcher, tech2, "状态变更场景草稿")
+    saved = store.get_reassignment_draft(order2.order_id, dispatcher)
+    assert saved is not None
+    assert saved.order_version == store.get_order(order2.order_id).version
+    print_ok(f"待验收状态保存草稿成功: version=v{saved.order_version}")
+
+    order2_obj = store.get_order(order2.order_id)
+    store.approve_order(order2.order_id, inspector)
+    final_order = store.get_order(order2.order_id)
+    assert final_order.status == Status.COMPLETED
+    print_ok("工单流转到已完成状态")
+
+    draft_after_completed = store.get_reassignment_draft(order2.order_id, dispatcher)
+    assert draft_after_completed is not None, "草稿应保留直到提交校验时才提示"
+    print_ok("已完成状态的工单草稿仍然保留，提交时才给出提示")
+
+    try:
+        store.reassign_order(order2.order_id, tech1, dispatcher, "已完成工单尝试改派")
+        print_fail("已完成工单居然能改派！")
+        assert False
+    except WorkOrderError as e:
+        print_ok(f"已完成工单改派被拒绝（符合预期）: {e}")
+
+    still_exists = store.get_reassignment_draft(order2.order_id, dispatcher)
+    assert still_exists is not None, "改派失败后草稿被误删"
+    print_ok("改派失败后草稿保留")
+
+    try:
+        store.save_reassignment_draft(order2.order_id, dispatcher, store.get_user("u004"), "派给验收员的草稿")
+        print_fail("保存草稿给非维修员居然成功！")
+        assert False
+    except WorkOrderError as e:
+        print_ok(f"草稿目标必须是维修员（符合预期）: {e}")
+
+    fake_order_id = "WO_NONEXISTENT_12345"
+    try:
+        store.save_reassignment_draft(fake_order_id, dispatcher, tech1, "不存在工单的草稿")
+        print_fail("不存在工单居然能保存草稿！")
+        assert False
+    except WorkOrderError as e:
+        print_ok(f"不存在工单保存草稿被拒绝（符合预期）: {e}")
+
+
+def test_gui_reassign_drafts():
+    print_title("测试19: GUI 改派草稿功能回归（自动载入、清除、冲突保留草稿）")
+
+    import tkinter as tk
+    from tkinter import messagebox
+
+    gui_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_draft_test_data")
+    if os.path.exists(gui_data_dir):
+        shutil.rmtree(gui_data_dir)
+    gui_export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_draft_test_exports")
+    if os.path.exists(gui_export_dir):
+        shutil.rmtree(gui_export_dir)
+
+    captured = {"showerror": [], "showinfo": [], "showwarning": [], "askyesno": []}
+
+    def fake_showerror(title, msg, **kw):
+        captured["showerror"].append((title, msg))
+
+    def fake_showinfo(title, msg, **kw):
+        captured["showinfo"].append((title, msg))
+
+    def fake_showwarning(title, msg, **kw):
+        captured["showwarning"].append((title, msg))
+
+    def fake_askyesno(title, msg, **kw):
+        captured["askyesno"].append((title, msg))
+        return True
+
+    orig_showerror = messagebox.showerror
+    orig_showinfo = messagebox.showinfo
+    orig_showwarning = messagebox.showwarning
+    orig_askyesno = messagebox.askyesno
+    messagebox.showerror = fake_showerror
+    messagebox.showinfo = fake_showinfo
+    messagebox.showwarning = fake_showwarning
+    messagebox.askyesno = fake_askyesno
+
+    root = None
+    try:
+        store = DataStore(gui_data_dir)
+        store.set_export_dir(gui_export_dir)
+        dispatcher = store.get_user("u001")
+        tech1 = store.get_user("u002")
+        tech2 = store.get_user("u003")
+        assert dispatcher.role == Role.DISPATCHER
+
+        order = store.create_order("GUI草稿测试", "", "GUI栋", "空调维修", "高", dispatcher)
+        store.dispatch_order(order.order_id, tech1, dispatcher)
+
+        store.save_reassignment_draft(order.order_id, dispatcher, tech2, "GUI预存草稿理由")
+        saved_draft = store.get_reassignment_draft(order.order_id, dispatcher)
+        assert saved_draft is not None
+        print_ok(f"预存草稿成功: 目标={tech2.name}, 原因=GUI预存草稿理由")
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+
+        from main import MaintenanceApp, ReassignDialog
+        app = MaintenanceApp.__new__(MaintenanceApp)
+        app.root = root
+        app.store = store
+        app.current_user = dispatcher
+        app._configure_styles()
+
+        fresh_order = store.get_order(order.order_id)
+        dlg = ReassignDialog.__new__(ReassignDialog)
+        dlg.store = store
+        dlg.dispatcher = dispatcher
+        dlg.order = fresh_order
+        dlg.result = None
+        dlg.parent = root
+        ReassignDialog.__init__(dlg, root, store, dispatcher, fresh_order)
+        root.update()
+
+        assert hasattr(dlg, "draft_info_label"), "缺少 draft_info_label 控件"
+        assert hasattr(dlg, "clear_draft_btn"), "缺少 clear_draft_btn 控件"
+        print_ok("改派对话框草稿相关控件创建正常")
+
+        selection = dlg.tree.selection()
+        assert len(selection) == 1 and selection[0] == tech2.user_id, f"草稿未自动选中目标维修员, 实际={selection}"
+        print_ok(f"草稿自动载入: 维修员树选中 {tech2.user_id} ({tech2.name})")
+
+        loaded_reason = dlg.reason_text.get("1.0", tk.END).strip()
+        assert loaded_reason == "GUI预存草稿理由", f"草稿原因未自动回填, 实际='{loaded_reason}'"
+        print_ok(f"草稿原因自动回填: '{loaded_reason}'")
+
+        draft_info_text = dlg.draft_info_label.cget("text")
+        assert "已载入改派草稿" in draft_info_text, f"草稿信息提示内容不正确, 实际='{draft_info_text}'"
+        draft_info_bg = dlg.draft_info_label.cget("bg")
+        assert draft_info_bg == "#fff3cd", f"草稿提示条背景色不正确"
+        print_ok("草稿载入提示条配置正确（内容和背景色）")
+
+        clear_btn_text = dlg.clear_draft_btn.cget("text")
+        assert clear_btn_text == "清除草稿", f"清除草稿按钮文字不正确"
+        print_ok("清除草稿按钮配置正确")
+
+        captured["showinfo"].clear()
+        captured["askyesno"].clear()
+        dlg._on_clear_draft()
+        root.update()
+        assert len(captured["askyesno"]) >= 1, "清除草稿未弹确认框"
+        assert len(captured["showinfo"]) >= 1, "清除草稿未弹成功提示"
+        print_ok("清除草稿: 确认框和成功提示弹出正常")
+
+        after_clear = store.get_reassignment_draft(order.order_id, dispatcher)
+        assert after_clear is None, "点击清除草稿后底层数据未删除"
+        print_ok("清除草稿: 底层数据存储中草稿已删除")
+
+        order2 = store.create_order("GUI冲突草稿测试", "", "GUIC栋", "电路维修", "高", dispatcher)
+        store.dispatch_order(order2.order_id, tech1, dispatcher)
+        order2_obj = store.get_order(order2.order_id)
+        store.save_reassignment_draft(order2.order_id, dispatcher, tech2, "冲突场景草稿")
+
+        inspector = store.get_user("u004")
+        store.accept_order(order2.order_id, tech1)
+        store.complete_order(order2.order_id, tech1)
+        store.approve_order(order2.order_id, inspector)
+        order2_final = store.get_order(order2.order_id)
+        assert order2_final.status == Status.COMPLETED
+        print_ok("工单状态流转到已完成，制造冲突场景")
+
+        draft_still_there = store.get_reassignment_draft(order2.order_id, dispatcher)
+        assert draft_still_there is not None, "冲突前草稿已丢失"
+
+        captured["showerror"].clear()
+        dlg2 = ReassignDialog(root, store, dispatcher, store.get_order(order2.order_id))
+        dlg2.tree.selection_set(tech2.user_id)
+        dlg2.reason_text.insert("1.0", "尝试提交冲突改派")
+        dlg2._on_confirm()
+        root.update()
+        assert len(captured["showerror"]) >= 1, "状态变更冲突未弹错误提示"
+        last_err_title, last_err_msg = captured["showerror"][-1]
+        assert "草稿已保留" in last_err_msg, f"错误提示未说明草稿保留, 消息='{last_err_msg}'"
+        print_ok(f"状态变更冲突: 错误提示包含草稿保留说明 - '{last_err_title}'")
+
+        draft_after_failed_confirm = store.get_reassignment_draft(order2.order_id, dispatcher)
+        assert draft_after_failed_confirm is not None, "冲突提交失败后草稿被误删"
+        print_ok("冲突提交失败后草稿保留")
+
+        print_ok("GUI 改派草稿功能全部验证通过（自动载入、清除、冲突保留）")
+
+    finally:
+        messagebox.showerror = orig_showerror
+        messagebox.showinfo = orig_showinfo
+        messagebox.showwarning = orig_showwarning
+        messagebox.askyesno = orig_askyesno
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        if os.path.exists(gui_data_dir):
+            shutil.rmtree(gui_data_dir)
+        if os.path.exists(gui_export_dir):
+            shutil.rmtree(gui_export_dir)
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -1094,7 +1432,10 @@ def main():
         test_enhanced_exports(store)
         store = test_persistence(store)
         store = test_persistence_extended(store)
+        store = test_reassignment_drafts_basic(store)
+        test_reassignment_drafts_conflicts(store)
         test_gui_startup_and_tabs()
+        test_gui_reassign_drafts()
 
         print_title("全部测试通过")
         print("""
@@ -1115,6 +1456,9 @@ def main():
  14. 增强导出：JSON/CSV含排班、负载、改派历史
  15. 扩展持久化：排班/技能/改派记录跨重启完全一致
  16. GUI 回归：调度员启动、5个Tab切换、导出JSON/CSV、非法导入拒绝、无TclError
+ 17. 改派草稿：保存、读取、按调度员隔离、跨重启持久化、改派成功自动清理、手动删除
+ 18. 改派草稿冲突：权限拒绝、版本变更、状态流转 时草稿保留不覆盖
+ 19. GUI 改派草稿：弹窗自动载入草稿、一键清除、冲突时提示且保留草稿
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")
