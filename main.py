@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 from models import (
     Role, Status, WorkOrder, User, TimeSlot, CATEGORY_SKILL_MAP,
     BatchDraftItem, BatchReassignmentDraft, BatchReassignmentResult,
-    BatchItemResult, ConflictType,
+    BatchItemResult, ConflictType, RevocationStatus, RevocationConflictType,
 )
 from datastore import (
     DataStore,
@@ -300,6 +300,7 @@ class BatchReassignDialog(tk.Toplevel):
         self.last_result: Optional[BatchReassignmentResult] = None
         self.result_filter_status: str = "all"
         self.result_filter_conflict: str = "all"
+        self.result_filter_revocation: str = "all"
         self.title("批量改派预案")
         self.geometry("1280x880")
         self.configure(bg="#f5f6fa")
@@ -512,9 +513,26 @@ class BatchReassignDialog(tk.Toplevel):
         self.result_conflict_combo.pack(side=tk.LEFT, padx=3)
         self.result_conflict_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_result_detail_view())
 
+        tk.Label(result_toolbar, text="撤销状态:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").pack(side=tk.LEFT, padx=(15, 3))
+        self.result_revocation_combo = ttk.Combobox(
+            result_toolbar,
+            values=["全部", "已撤销", "可撤销", "不可撤销", "冲突跳过"],
+            state="readonly", width=10, font=("Microsoft YaHei", 10),
+        )
+        self.result_revocation_combo.set("全部")
+        self.result_revocation_combo.pack(side=tk.LEFT, padx=3)
+        self.result_revocation_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_result_detail_view())
+
         tk.Button(result_toolbar, text="刷新结果", font=("Microsoft YaHei", 10),
                   bg="#3498db", fg="white", width=10,
                   command=self._refresh_result_detail_view).pack(side=tk.LEFT, padx=(15, 3))
+        tk.Button(result_toolbar, text="撤销选中", font=("Microsoft YaHei", 10, "bold"),
+                  bg="#e74c3c", fg="white", width=10,
+                  command=self._on_revoke_selected).pack(side=tk.LEFT, padx=3)
+        tk.Button(result_toolbar, text="撤销全部可撤销", font=("Microsoft YaHei", 10, "bold"),
+                  bg="#c0392b", fg="white", width=14,
+                  command=self._on_revoke_all_revocable).pack(side=tk.LEFT, padx=3)
         tk.Button(result_toolbar, text="定位原草稿", font=("Microsoft YaHei", 10),
                   bg="#e67e22", fg="white", width=12,
                   command=self._locate_original_draft).pack(side=tk.LEFT, padx=3)
@@ -530,10 +548,11 @@ class BatchReassignDialog(tk.Toplevel):
         result_tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         r_cols = (
-            "status", "order_id", "order_title",
+            "status", "revocation_status", "order_id", "order_title",
             "orig_assignee", "target_assignee",
             "version", "permission", "skill", "capacity", "schedule",
             "log_written", "conflict_types", "reason", "error",
+            "revocation_reason", "revocation_operator", "revocation_timestamp",
             "item_timestamp",
         )
         self.result_detail_tree = ttk.Treeview(
@@ -541,19 +560,23 @@ class BatchReassignDialog(tk.Toplevel):
         )
         col_config = [
             ("status", "结果", 60),
-            ("order_id", "工单编号", 140),
-            ("order_title", "工单标题", 150),
-            ("orig_assignee", "原维修员", 80),
-            ("target_assignee", "新维修员", 80),
-            ("version", "版本", 55),
-            ("permission", "权限", 55),
-            ("skill", "技能", 55),
-            ("capacity", "容量", 55),
-            ("schedule", "排班", 55),
-            ("log_written", "日志", 55),
-            ("conflict_types", "冲突类型", 170),
-            ("reason", "改派原因", 160),
-            ("error", "错误/跳过原因", 230),
+            ("revocation_status", "撤销状态", 80),
+            ("order_id", "工单编号", 130),
+            ("order_title", "工单标题", 140),
+            ("orig_assignee", "原维修员", 75),
+            ("target_assignee", "新维修员", 75),
+            ("version", "版本", 50),
+            ("permission", "权限", 50),
+            ("skill", "技能", 50),
+            ("capacity", "容量", 50),
+            ("schedule", "排班", 50),
+            ("log_written", "日志", 50),
+            ("conflict_types", "冲突类型", 140),
+            ("reason", "改派原因", 130),
+            ("error", "错误/跳过原因", 180),
+            ("revocation_reason", "撤销原因", 130),
+            ("revocation_operator", "撤销操作人", 80),
+            ("revocation_timestamp", "撤销时间", 140),
             ("item_timestamp", "处理时间", 140),
         ]
         for c, text, w in col_config:
@@ -563,6 +586,7 @@ class BatchReassignDialog(tk.Toplevel):
         self.result_detail_tree.column("conflict_types", anchor="w")
         self.result_detail_tree.column("reason", anchor="w")
         self.result_detail_tree.column("error", anchor="w")
+        self.result_detail_tree.column("revocation_reason", anchor="w")
         self.result_detail_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         r_sb = ttk.Scrollbar(result_tree_frame, orient="vertical", command=self.result_detail_tree.yview)
         r_sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -571,6 +595,9 @@ class BatchReassignDialog(tk.Toplevel):
         self.result_detail_tree.tag_configure("skipped", background="#fef9e7")
         self.result_detail_tree.tag_configure("failed", background="#fdedec")
         self.result_detail_tree.tag_configure("log_fail", background="#fdecea")
+        self.result_detail_tree.tag_configure("revoked", background="#e8daef")
+        self.result_detail_tree.tag_configure("revocable", background="#d5f5e3")
+        self.result_detail_tree.tag_configure("conflict_skipped", background="#fadbd8")
         self.result_detail_tree.bind("<Double-1>", self._on_result_double_click)
 
         result_text_frame = tk.Frame(result_frame, bg="#f5f6fa")
@@ -879,15 +906,18 @@ class BatchReassignDialog(tk.Toplevel):
         self.result_text.delete("1.0", tk.END)
         lines = [
             f"批量改派执行完成  结果编号: {result.result_id}  提交人: {result.dispatcher_name}  时间: {result.timestamp}",
-            f"  总计: {result.total_count} 条  成功: {result.success_count} 条    跳过: {result.skipped_count} 条    失败: {result.failed_count} 条",
+            f"  总计: {result.total_count} 条  成功: {result.success_count} 条    跳过: {result.skipped_count} 条    失败: {result.failed_count} 条"
+            f"    已撤销: {result.revoked_count} 条    可撤销: {result.revocable_count} 条    不可撤销: {result.not_revocable_count} 条    冲突跳过: {result.revocation_conflict_skipped_count} 条",
         ]
         for r in result.results:
             status_label = r.status_label
             info = f"  [{status_label}] {r.order_id} -> {r.target_technician_name or '?'}"
-            if r.error_message:
+            if r.revoked:
+                info += f"  已撤销（{r.revocation_operator_name or '?'}，原因: {r.revocation_reason or '无'}）"
+            elif r.error_message:
                 info += f"  原因: {r.error_message}"
             lines.append(info)
-        lines.append("提示：上方明细表格可筛选结果，双击或点击“定位原草稿”回到预案")
+        lines.append("提示：上方明细表格可筛选结果和撤销状态，选中成功条目后可点击“撤销选中”或“撤销全部可撤销”")
         self.result_text.insert(tk.END, "\n".join(lines))
         self.result_text.configure(state=tk.DISABLED)
 
@@ -950,6 +980,20 @@ class BatchReassignDialog(tk.Toplevel):
         }
         return selected in {conflict_labels.get(c, c) for c in item.conflict_types}
 
+    def _apply_revocation_filter(self, item: BatchItemResult) -> bool:
+        selected = self.result_revocation_combo.get()
+        if selected == "全部":
+            return True
+        if selected == "已撤销":
+            return item.revoked
+        if selected == "可撤销":
+            return item.success and not item.revoked and item.revocation_status == RevocationStatus.REVOCABLE
+        if selected == "不可撤销":
+            return item.success and not item.revoked and item.revocation_status == RevocationStatus.NOT_REVOCABLE
+        if selected == "冲突跳过":
+            return item.revocation_status == RevocationStatus.CONFLICT_SKIPPED
+        return True
+
     def _refresh_result_detail_view(self):
         for i in self.result_detail_tree.get_children():
             self.result_detail_tree.delete(i)
@@ -991,19 +1035,34 @@ class BatchReassignDialog(tk.Toplevel):
                 continue
             if not self._apply_conflict_filter(r):
                 continue
+            if not self._apply_revocation_filter(r):
+                continue
             shown += 1
-            if r.success:
-                tag = "success"
+            tags = []
+            if r.revoked:
+                tags.append("revoked")
+                base_tag = "revoked"
+            elif r.success and not r.revoked and r.revocation_status == RevocationStatus.REVOCABLE:
+                tags.append("revocable")
+                base_tag = "revocable"
+            elif r.revocation_status == RevocationStatus.CONFLICT_SKIPPED:
+                tags.append("conflict_skipped")
+                base_tag = "conflict_skipped"
+            elif r.success:
+                tags.append("success")
+                base_tag = "success"
             elif r.skipped:
-                tag = "skipped"
+                tags.append("skipped")
+                base_tag = "skipped"
             else:
-                tag = "failed"
-            tags = [tag]
-            if not r.log_written:
+                tags.append("failed")
+                base_tag = "failed"
+            if not r.log_written and r.success and not r.revoked:
                 tags.append("log_fail")
             ctypes_display = ",".join(conflict_labels.get(c, c) for c in (r.conflict_types or []))
             self.result_detail_tree.insert("", tk.END, iid=str(idx), values=(
                 r.status_label,
+                r.revocation_status_label,
                 r.order_id,
                 r.order_title or "",
                 r.original_assignee_name or "(未指派)",
@@ -1017,12 +1076,109 @@ class BatchReassignDialog(tk.Toplevel):
                 ctypes_display,
                 r.reason or "",
                 r.error_message or "",
+                r.revocation_reason or "",
+                r.revocation_operator_name or "",
+                r.revocation_timestamp or "",
                 r.item_timestamp or "",
             ), tags=tuple(tags))
         self.result_summary_label.configure(
             text=f"显示 {shown} / {result.total_count} 条  "
-                 f"(成功 {result.success_count} / 跳过 {result.skipped_count} / 失败 {result.failed_count})",
+                 f"(成功 {result.success_count} / 跳过 {result.skipped_count} / 失败 {result.failed_count}"
+                 f" / 已撤销 {result.revoked_count} / 可撤销 {result.revocable_count}"
+                 f" / 不可撤销 {result.not_revocable_count} / 冲突跳过 {result.revocation_conflict_skipped_count})",
         )
+
+    def _prompt_revocation_reason(self) -> Optional[str]:
+        reason = simpledialog.askstring(
+            "撤销原因",
+            "请填写撤销原因（必填）：",
+            parent=self,
+        )
+        if reason is None:
+            return None
+        reason = reason.strip()
+        if not reason:
+            messagebox.showwarning("提示", "撤销原因不能为空", parent=self)
+            return None
+        return reason
+
+    def _on_revoke_selected(self):
+        if self.last_result is None:
+            messagebox.showwarning("提示", "当前没有批量改派结果可撤销", parent=self)
+            return
+        sel = self.result_detail_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先在结果明细中选中要撤销的条目", parent=self)
+            return
+        order_ids = []
+        for s in sel:
+            idx = int(s)
+            if idx < len(self.last_result.results):
+                r = self.last_result.results[idx]
+                if r.success and not r.revoked:
+                    order_ids.append(r.order_id)
+        if not order_ids:
+            messagebox.showwarning("提示", "选中的条目中没有可撤销的成功改派项", parent=self)
+            return
+        reason = self._prompt_revocation_reason()
+        if not reason:
+            return
+        if not messagebox.askyesno(
+            "确认撤销",
+            f"确定撤销选中的 {len(order_ids)} 条成功改派？\n"
+            f"工单将恢复到改派前的维修员和状态。",
+            parent=self,
+        ):
+            return
+        self._execute_revocation(order_ids, reason)
+
+    def _on_revoke_all_revocable(self):
+        if self.last_result is None:
+            messagebox.showwarning("提示", "当前没有批量改派结果可撤销", parent=self)
+            return
+        order_ids = [
+            r.order_id for r in self.last_result.results
+            if r.success and not r.revoked and r.revocation_status == RevocationStatus.REVOCABLE
+        ]
+        if not order_ids:
+            messagebox.showinfo("提示", "当前没有可撤销的条目", parent=self)
+            return
+        reason = self._prompt_revocation_reason()
+        if not reason:
+            return
+        if not messagebox.askyesno(
+            "确认撤销",
+            f"确定撤销所有 {len(order_ids)} 条可撤销的成功改派？\n"
+            f"工单将恢复到改派前的维修员和状态。\n"
+            f"已被再次改派、已完成、原维修员不存在等情况将自动跳过。",
+            parent=self,
+        ):
+            return
+        self._execute_revocation(order_ids, reason)
+
+    def _execute_revocation(self, order_ids: List[str], reason: str):
+        try:
+            rev_result = self.store.revoke_batch_items(
+                self.last_result, order_ids, self.dispatcher, reason
+            )
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("撤销失败", str(e), parent=self)
+            return
+        refreshed = self.store.get_batch_result(self.last_result.result_id)
+        if refreshed:
+            self.last_result = refreshed
+        self._show_result(self.last_result)
+        msg_lines = [
+            f"撤销操作完成！",
+            f"总计: {rev_result['total']} 条",
+            f"成功撤销: {rev_result['success']} 条",
+            f"冲突跳过: {rev_result['skipped']} 条",
+            f"失败: {rev_result['failed']} 条",
+        ]
+        if rev_result["skipped"] > 0:
+            msg_lines.append("")
+            msg_lines.append("冲突跳过的条目详情可在结果明细的“撤销状态”列中查看。")
+        messagebox.showinfo("撤销完成", "\n".join(msg_lines), parent=self)
 
     def _on_result_double_click(self, event):
         self._locate_original_draft()

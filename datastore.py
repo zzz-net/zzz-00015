@@ -26,6 +26,9 @@ from models import (
     BatchReassignmentResult,
     BatchItemResult,
     ConflictType,
+    RevocationRecord,
+    RevocationStatus,
+    RevocationConflictType,
 )
 
 
@@ -58,6 +61,7 @@ class DataStore:
         self.drafts_file = os.path.join(data_dir, "reassignment_drafts.json")
         self.batch_drafts_file = os.path.join(data_dir, "batch_reassignment_drafts.json")
         self.batch_results_file = os.path.join(data_dir, "batch_reassignment_results.json")
+        self.revocation_records_file = os.path.join(data_dir, "revocation_records.json")
         self._lock = threading.RLock()
         self._orders: Dict[str, WorkOrder] = {}
         self._users: Dict[str, User] = {}
@@ -65,6 +69,7 @@ class DataStore:
         self._reassignment_drafts: Dict[str, ReassignmentDraft] = {}
         self._batch_reassignment_drafts: Dict[str, BatchReassignmentDraft] = {}
         self._batch_reassignment_results: Dict[str, BatchReassignmentResult] = {}
+        self._revocation_records: Dict[str, RevocationRecord] = {}
         self._ensure_data_dir()
         self._load_all()
 
@@ -79,9 +84,40 @@ class DataStore:
         self._load_reassignment_drafts()
         self._load_batch_reassignment_drafts()
         self._load_batch_reassignment_results()
+        self._load_revocation_records()
+        self._sync_revocation_statuses()
         if not self._users:
             self._init_default_users()
             self._save_users()
+
+    def _load_revocation_records(self):
+        if os.path.exists(self.revocation_records_file):
+            try:
+                with open(self.revocation_records_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._revocation_records = {
+                        r["revocation_id"]: RevocationRecord.from_dict(r) for r in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._revocation_records = {}
+
+    def _save_revocation_records(self):
+        with open(self.revocation_records_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [r.to_dict() for r in self._revocation_records.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def _sync_revocation_statuses(self):
+        for result in self._batch_reassignment_results.values():
+            for item in result.results:
+                if item.revoked and item.revocation_id:
+                    rev = self._revocation_records.get(item.revocation_id)
+                    if rev and not rev.success:
+                        item.revoked = False
+                        item.revocation_status = RevocationStatus.CONFLICT_SKIPPED
+                elif item.success and not item.revoked:
+                    item.revocation_status = self._evaluate_revocability(item)
 
     def _load_users(self):
         if os.path.exists(self.users_file):
@@ -200,6 +236,284 @@ class DataStore:
             return None
         results.sort(key=lambda r: (r.timestamp, r.result_id), reverse=True)
         return results[0]
+
+    def _evaluate_revocability(self, item: BatchItemResult) -> str:
+        if item.revoked:
+            return RevocationStatus.REVOKED
+        if not item.success:
+            return RevocationStatus.NOT_REVOCABLE
+        order = self._orders.get(item.order_id)
+        if not order:
+            return RevocationStatus.NOT_REVOCABLE
+        if order.status == Status.COMPLETED:
+            return RevocationStatus.NOT_REVOCABLE
+        if order.assignee_id != item.target_technician_id:
+            return RevocationStatus.NOT_REVOCABLE
+        original_tech = self._users.get(item.original_assignee_id) if item.original_assignee_id else None
+        if original_tech is None:
+            return RevocationStatus.NOT_REVOCABLE
+        if original_tech.role != Role.TECHNICIAN:
+            return RevocationStatus.NOT_REVOCABLE
+        return RevocationStatus.REVOCABLE
+
+    def _find_original_status_for_revocation(
+        self, order: WorkOrder, item: BatchItemResult
+    ) -> Status:
+        if item.original_status_snapshot:
+            try:
+                return Status(item.original_status_snapshot)
+            except ValueError:
+                pass
+        target_log = None
+        for log in reversed(order.reassignment_logs):
+            if (log.to_user_id == item.target_technician_id and
+                    log.dispatcher_id == item.operator_id):
+                target_log = log
+                break
+        if target_log:
+            for hist in reversed(order.history):
+                if hist.timestamp <= target_log.timestamp:
+                    try:
+                        return Status(hist.status)
+                    except ValueError:
+                        continue
+        return Status.DISPATCHED
+
+    def _check_order_reassigned_after_batch(
+        self, order: WorkOrder, item: BatchItemResult
+    ) -> bool:
+        if order.assignee_id != item.target_technician_id:
+            return True
+        batch_ts = item.item_timestamp
+        for log in order.reassignment_logs:
+            if log.to_user_id == item.target_technician_id and log.timestamp >= batch_ts:
+                for later_log in order.reassignment_logs:
+                    if later_log.timestamp > log.timestamp:
+                        return True
+                break
+        return False
+
+    def can_revoke_item(self, item: BatchItemResult, dispatcher: User) -> Tuple[bool, Optional[str], Optional[str]]:
+        if "reassign" not in ROLE_PERMISSIONS.get(dispatcher.role, []):
+            return False, RevocationConflictType.PERMISSION_DENIED, f"用户【{dispatcher.name}】无权撤销改派"
+        if item.revoked:
+            return False, RevocationConflictType.ALREADY_REVOKED, "该条目已被撤销"
+        if not item.success:
+            return False, None, "非成功改派条目不可撤销"
+        order = self._orders.get(item.order_id)
+        if not order:
+            return False, RevocationConflictType.ORDER_NOT_FOUND, f"工单不存在: {item.order_id}"
+        if order.status == Status.COMPLETED:
+            return False, RevocationConflictType.ORDER_COMPLETED, "工单已完成，不可撤销"
+        if self._check_order_reassigned_after_batch(order, item):
+            return False, RevocationConflictType.ORDER_REASSIGNED, "工单已被他人再次改派"
+        if order.assignee_id != item.target_technician_id:
+            return False, RevocationConflictType.ORDER_REASSIGNED, "工单当前维修员与改派目标不一致"
+        original_tech = self._users.get(item.original_assignee_id) if item.original_assignee_id else None
+        if original_tech is None:
+            return False, RevocationConflictType.TECHNICIAN_REMOVED, "原维修员不存在"
+        if original_tech.role != Role.TECHNICIAN:
+            return False, RevocationConflictType.TECHNICIAN_REMOVED, "原用户已不是维修员"
+        return True, None, None
+
+    def revoke_batch_items(
+        self,
+        result: BatchReassignmentResult,
+        order_ids: List[str],
+        dispatcher: User,
+        reason: str,
+    ) -> Dict:
+        self._check_permission(dispatcher, "reassign")
+        if not reason or not reason.strip():
+            raise WorkOrderError("撤销必须填写原因")
+
+        revocation_success = 0
+        revocation_skipped = 0
+        revocation_failed = 0
+        revocation_records: List[RevocationRecord] = []
+
+        with self._lock:
+            result_in_store = self._batch_reassignment_results.get(result.result_id)
+            if result_in_store is None:
+                raise WorkOrderError(f"批量改派结果不存在: {result.result_id}")
+            result = result_in_store
+
+            order_id_set = set(order_ids)
+            items_to_revoke = [r for r in result.results if r.order_id in order_id_set]
+
+            for item in items_to_revoke:
+                can_revoke, conflict_type, conflict_msg = self.can_revoke_item(item, dispatcher)
+
+                revocation_id = "REV" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+                if not can_revoke:
+                    if conflict_type:
+                        if conflict_type != RevocationConflictType.ALREADY_REVOKED:
+                            item.revocation_status = RevocationStatus.CONFLICT_SKIPPED
+                            item.revocation_conflict_type = conflict_type
+                            item.revocation_conflict_message = conflict_msg
+                            item.revocation_id = revocation_id
+                        revocation_skipped += 1
+                    else:
+                        revocation_failed += 1
+                    _order = self._orders.get(item.order_id)
+                    _current_status = _order.status.value if _order else "unknown"
+                    _orig_status = item.original_status_snapshot or "unknown"
+                    rec = RevocationRecord(
+                        revocation_id=revocation_id,
+                        result_id=result.result_id,
+                        draft_id=result.draft_id,
+                        order_id=item.order_id,
+                        operator_id=dispatcher.user_id,
+                        operator_name=dispatcher.name,
+                        reason=reason.strip(),
+                        original_assignee_id=item.original_assignee_id,
+                        original_assignee_name=item.original_assignee_name,
+                        original_status=_orig_status,
+                        revoked_assignee_id=item.target_technician_id,
+                        revoked_assignee_name=item.target_technician_name,
+                        revoked_status=_current_status,
+                        timestamp=now_ts,
+                        conflict_type=conflict_type,
+                        conflict_message=conflict_msg,
+                        success=False,
+                    )
+                    self._revocation_records[revocation_id] = rec
+                    revocation_records.append(rec)
+                    continue
+
+                try:
+                    order = self._orders[item.order_id]
+                    original_tech = self._users[item.original_assignee_id]
+                    original_status = self._find_original_status_for_revocation(order, item)
+
+                    revert_log = ReassignmentLog(
+                        order_id=order.order_id,
+                        from_user_id=order.assignee_id or "",
+                        from_user_name=order.assignee_name or "(未指派)",
+                        to_user_id=original_tech.user_id,
+                        to_user_name=original_tech.name,
+                        reason=f"撤销改派: {reason.strip()}",
+                        dispatcher_id=dispatcher.user_id,
+                        dispatcher_name=dispatcher.name,
+                        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    order.add_reassignment_log(revert_log)
+                    order.assignee_id = original_tech.user_id
+                    order.assignee_name = original_tech.name
+
+                    old_status = order.status
+                    if original_status in REASSIGNABLE_STATUSES or original_status == Status.DISPATCHED:
+                        order.status = original_status
+                    else:
+                        order.status = Status.DISPATCHED
+
+                    self._add_history(
+                        order,
+                        order.status,
+                        dispatcher,
+                        f"撤销改派，从 {item.target_technician_name} 恢复给 {original_tech.name}，原因: {reason.strip()}（由{old_status.value}恢复为{order.status.value}）",
+                    )
+                    order.bump_version()
+                    self._save_orders()
+
+                    item.revoked = True
+                    item.revocation_status = RevocationStatus.REVOKED
+                    item.revocation_id = revocation_id
+                    item.revocation_reason = reason.strip()
+                    item.revocation_operator_id = dispatcher.user_id
+                    item.revocation_operator_name = dispatcher.name
+                    item.revocation_timestamp = now_ts
+                    item.revocation_conflict_type = None
+                    item.revocation_conflict_message = None
+                    item.original_status_snapshot = original_status.value
+
+                    rec = RevocationRecord(
+                        revocation_id=revocation_id,
+                        result_id=result.result_id,
+                        draft_id=result.draft_id,
+                        order_id=item.order_id,
+                        operator_id=dispatcher.user_id,
+                        operator_name=dispatcher.name,
+                        reason=reason.strip(),
+                        original_assignee_id=original_tech.user_id,
+                        original_assignee_name=original_tech.name,
+                        original_status=original_status.value,
+                        revoked_assignee_id=item.target_technician_id,
+                        revoked_assignee_name=item.target_technician_name,
+                        revoked_status=old_status.value,
+                        timestamp=now_ts,
+                        success=True,
+                    )
+                    self._revocation_records[revocation_id] = rec
+                    revocation_records.append(rec)
+                    revocation_success += 1
+
+                except Exception as e:
+                    revocation_failed += 1
+                    err_msg = str(e)
+                    item.revocation_status = RevocationStatus.CONFLICT_SKIPPED
+                    item.revocation_conflict_type = RevocationConflictType.ORDER_REASSIGNED
+                    item.revocation_conflict_message = f"撤销异常: {err_msg}"
+                    _order_exc = self._orders.get(item.order_id)
+                    _current_status_exc = _order_exc.status.value if _order_exc else "unknown"
+                    _orig_status_exc = item.original_status_snapshot or "unknown"
+                    rec = RevocationRecord(
+                        revocation_id=revocation_id,
+                        result_id=result.result_id,
+                        draft_id=result.draft_id,
+                        order_id=item.order_id,
+                        operator_id=dispatcher.user_id,
+                        operator_name=dispatcher.name,
+                        reason=reason.strip(),
+                        original_assignee_id=item.original_assignee_id,
+                        original_assignee_name=item.original_assignee_name,
+                        original_status=_orig_status_exc,
+                        revoked_assignee_id=item.target_technician_id,
+                        revoked_assignee_name=item.target_technician_name,
+                        revoked_status=_current_status_exc,
+                        timestamp=now_ts,
+                        conflict_type=RevocationConflictType.ORDER_REASSIGNED,
+                        conflict_message=f"撤销异常: {err_msg}",
+                        success=False,
+                    )
+                    self._revocation_records[revocation_id] = rec
+                    item.revocation_id = revocation_id
+                    revocation_records.append(rec)
+
+            self._save_revocation_records()
+            self._save_batch_reassignment_results()
+
+            for r in result.results:
+                if r.success and not r.revoked and r.revocation_status != RevocationStatus.CONFLICT_SKIPPED:
+                    r.revocation_status = self._evaluate_revocability(r)
+
+        return {
+            "success": revocation_success,
+            "skipped": revocation_skipped,
+            "failed": revocation_failed,
+            "total": len(items_to_revoke),
+            "records": revocation_records,
+        }
+
+    def get_revocation_records_by_result(self, result_id: str) -> List[RevocationRecord]:
+        return sorted(
+            [r for r in self._revocation_records.values() if r.result_id == result_id],
+            key=lambda r: r.timestamp,
+        )
+
+    def get_revocation_records_by_order(self, order_id: str) -> List[RevocationRecord]:
+        return sorted(
+            [r for r in self._revocation_records.values() if r.order_id == order_id],
+            key=lambda r: r.timestamp,
+        )
+
+    def get_all_revocation_records(self) -> List[RevocationRecord]:
+        return sorted(
+            list(self._revocation_records.values()),
+            key=lambda r: r.timestamp,
+        )
 
     def _init_default_users(self):
         default_users = [
@@ -1355,6 +1669,8 @@ class DataStore:
                         schedule_passed=schedule_ok,
                         log_written=log_written,
                         log_write_error=log_write_error,
+                        revocation_status=RevocationStatus.REVOCABLE,
+                        original_status_snapshot=order.status.value,
                         **common_fields,
                     ))
                 except (PermissionError, ConcurrentOperationError, WorkOrderError) as e:
@@ -1413,6 +1729,9 @@ class DataStore:
                     "日志已写入", "日志写入异常",
                     "冲突类型", "改派原因", "错误/跳过原因",
                     "成功标记", "跳过标记",
+                    "撤销状态", "是否已撤销", "撤销记录ID", "撤销原因",
+                    "撤销操作人ID", "撤销操作人姓名", "撤销时间",
+                    "撤销冲突类型", "撤销冲突描述", "原始状态快照",
                 ])
                 for r in result.results:
                     order = self._orders.get(r.order_id)
@@ -1451,6 +1770,16 @@ class DataStore:
                         r.error_message or "",
                         "是" if r.success else "否",
                         "是" if r.skipped else "否",
+                        r.revocation_status_label,
+                        "是" if r.revoked else "否",
+                        r.revocation_id or "",
+                        r.revocation_reason or "",
+                        r.revocation_operator_id or "",
+                        r.revocation_operator_name or "",
+                        r.revocation_timestamp or "",
+                        r.revocation_conflict_type or "",
+                        r.revocation_conflict_message or "",
+                        r.original_status_snapshot or "",
                     ])
         except OSError as e:
             raise ExportError(f"写入CSV文件失败: {str(e)}")

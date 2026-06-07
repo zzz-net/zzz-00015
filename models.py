@@ -472,6 +472,115 @@ class ConflictType(str, Enum):
     ORDER_REMOVED = "order_removed"
 
 
+class RevocationStatus(str, Enum):
+    NOT_REVOKED = "not_revoked"
+    REVOCABLE = "revocable"
+    REVOKED = "revoked"
+    NOT_REVOCABLE = "not_revocable"
+    CONFLICT_SKIPPED = "conflict_skipped"
+
+
+class RevocationConflictType(str, Enum):
+    NONE = "none"
+    ALREADY_REVOKED = "already_revoked"
+    ORDER_REASSIGNED = "order_reassigned"
+    ORDER_COMPLETED = "order_completed"
+    TECHNICIAN_REMOVED = "technician_removed"
+    PERMISSION_DENIED = "permission_denied"
+    VERSION_MISMATCH = "version_mismatch"
+    ORDER_NOT_FOUND = "order_not_found"
+
+
+class RevocationRecord:
+    def __init__(
+        self,
+        revocation_id: str,
+        result_id: str,
+        draft_id: Optional[str],
+        order_id: str,
+        operator_id: str,
+        operator_name: str,
+        reason: str,
+        original_assignee_id: str,
+        original_assignee_name: str,
+        original_status: str,
+        revoked_assignee_id: str,
+        revoked_assignee_name: str,
+        revoked_status: str,
+        timestamp: Optional[str] = None,
+        conflict_type: str = RevocationConflictType.NONE,
+        conflict_message: Optional[str] = None,
+        success: bool = False,
+    ):
+        self.revocation_id = revocation_id
+        self.result_id = result_id
+        self.draft_id = draft_id
+        self.order_id = order_id
+        self.operator_id = operator_id
+        self.operator_name = operator_name
+        self.reason = reason
+        self.original_assignee_id = original_assignee_id
+        self.original_assignee_name = original_assignee_name
+        self.original_status = original_status
+        self.revoked_assignee_id = revoked_assignee_id
+        self.revoked_assignee_name = revoked_assignee_name
+        self.revoked_status = revoked_status
+        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        self.conflict_type = conflict_type
+        self.conflict_message = conflict_message
+        self.success = success
+
+    def to_dict(self) -> Dict:
+        return {
+            "revocation_id": self.revocation_id,
+            "result_id": self.result_id,
+            "draft_id": self.draft_id,
+            "order_id": self.order_id,
+            "operator_id": self.operator_id,
+            "operator_name": self.operator_name,
+            "reason": self.reason,
+            "original_assignee_id": self.original_assignee_id,
+            "original_assignee_name": self.original_assignee_name,
+            "original_status": self.original_status,
+            "revoked_assignee_id": self.revoked_assignee_id,
+            "revoked_assignee_name": self.revoked_assignee_name,
+            "revoked_status": self.revoked_status,
+            "timestamp": self.timestamp,
+            "conflict_type": self.conflict_type,
+            "conflict_message": self.conflict_message,
+            "success": self.success,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "RevocationRecord":
+        return cls(
+            revocation_id=data["revocation_id"],
+            result_id=data["result_id"],
+            draft_id=data.get("draft_id"),
+            order_id=data["order_id"],
+            operator_id=data["operator_id"],
+            operator_name=data["operator_name"],
+            reason=data["reason"],
+            original_assignee_id=data["original_assignee_id"],
+            original_assignee_name=data["original_assignee_name"],
+            original_status=data["original_status"],
+            revoked_assignee_id=data["revoked_assignee_id"],
+            revoked_assignee_name=data["revoked_assignee_name"],
+            revoked_status=data["revoked_status"],
+            timestamp=data.get("timestamp"),
+            conflict_type=data.get("conflict_type", RevocationConflictType.NONE),
+            conflict_message=data.get("conflict_message"),
+            success=data.get("success", False),
+        )
+
+    @property
+    def status_label(self) -> str:
+        if self.success:
+            return "撤销成功"
+        else:
+            return f"撤销跳过: {self.conflict_message or self.conflict_type}"
+
+
 class BatchDraftItem:
     def __init__(
         self,
@@ -604,6 +713,16 @@ class BatchItemResult:
         operator_id: Optional[str] = None,
         operator_name: Optional[str] = None,
         draft_id: Optional[str] = None,
+        revoked: bool = False,
+        revocation_status: str = RevocationStatus.NOT_REVOKED,
+        revocation_id: Optional[str] = None,
+        revocation_reason: Optional[str] = None,
+        revocation_operator_id: Optional[str] = None,
+        revocation_operator_name: Optional[str] = None,
+        revocation_timestamp: Optional[str] = None,
+        revocation_conflict_type: Optional[str] = None,
+        revocation_conflict_message: Optional[str] = None,
+        original_status_snapshot: Optional[str] = None,
     ):
         self.order_id = order_id
         self.success = success
@@ -632,15 +751,38 @@ class BatchItemResult:
         self.operator_id = operator_id
         self.operator_name = operator_name
         self.draft_id = draft_id
+        self.revoked = revoked
+        self.revocation_status = revocation_status
+        self.revocation_id = revocation_id
+        self.revocation_reason = revocation_reason
+        self.revocation_operator_id = revocation_operator_id
+        self.revocation_operator_name = revocation_operator_name
+        self.revocation_timestamp = revocation_timestamp
+        self.revocation_conflict_type = revocation_conflict_type
+        self.revocation_conflict_message = revocation_conflict_message
+        self.original_status_snapshot = original_status_snapshot
 
     @property
     def status_label(self) -> str:
+        if self.revoked:
+            return "已撤销"
         if self.success:
             return "成功"
         elif self.skipped:
             return "跳过"
         else:
             return "失败"
+
+    @property
+    def revocation_status_label(self) -> str:
+        labels = {
+            RevocationStatus.NOT_REVOKED: "未撤销",
+            RevocationStatus.REVOCABLE: "可撤销",
+            RevocationStatus.REVOKED: "已撤销",
+            RevocationStatus.NOT_REVOCABLE: "不可撤销",
+            RevocationStatus.CONFLICT_SKIPPED: "冲突跳过",
+        }
+        return labels.get(self.revocation_status, self.revocation_status)
 
     @property
     def summary(self) -> str:
@@ -698,6 +840,17 @@ class BatchItemResult:
             "operator_name": self.operator_name,
             "draft_id": self.draft_id,
             "status_label": self.status_label,
+            "revoked": self.revoked,
+            "revocation_status": self.revocation_status,
+            "revocation_status_label": self.revocation_status_label,
+            "revocation_id": self.revocation_id,
+            "revocation_reason": self.revocation_reason,
+            "revocation_operator_id": self.revocation_operator_id,
+            "revocation_operator_name": self.revocation_operator_name,
+            "revocation_timestamp": self.revocation_timestamp,
+            "revocation_conflict_type": self.revocation_conflict_type,
+            "revocation_conflict_message": self.revocation_conflict_message,
+            "original_status_snapshot": self.original_status_snapshot,
         }
 
     @classmethod
@@ -730,6 +883,16 @@ class BatchItemResult:
             operator_id=data.get("operator_id"),
             operator_name=data.get("operator_name"),
             draft_id=data.get("draft_id"),
+            revoked=data.get("revoked", False),
+            revocation_status=data.get("revocation_status", RevocationStatus.NOT_REVOKED),
+            revocation_id=data.get("revocation_id"),
+            revocation_reason=data.get("revocation_reason"),
+            revocation_operator_id=data.get("revocation_operator_id"),
+            revocation_operator_name=data.get("revocation_operator_name"),
+            revocation_timestamp=data.get("revocation_timestamp"),
+            revocation_conflict_type=data.get("revocation_conflict_type"),
+            revocation_conflict_message=data.get("revocation_conflict_message"),
+            original_status_snapshot=data.get("original_status_snapshot"),
         )
 
 
@@ -758,7 +921,7 @@ class BatchReassignmentResult:
 
     @property
     def success_count(self) -> int:
-        return sum(1 for r in self.results if r.success)
+        return sum(1 for r in self.results if r.success and not r.revoked)
 
     @property
     def skipped_count(self) -> int:
@@ -773,6 +936,31 @@ class BatchReassignmentResult:
         return len(self.results)
 
     @property
+    def revoked_count(self) -> int:
+        return sum(1 for r in self.results if r.revoked)
+
+    @property
+    def revocable_count(self) -> int:
+        return sum(
+            1 for r in self.results
+            if r.success and not r.revoked and r.revocation_status == RevocationStatus.REVOCABLE
+        )
+
+    @property
+    def not_revocable_count(self) -> int:
+        return sum(
+            1 for r in self.results
+            if r.success and not r.revoked and r.revocation_status == RevocationStatus.NOT_REVOCABLE
+        )
+
+    @property
+    def revocation_conflict_skipped_count(self) -> int:
+        return sum(
+            1 for r in self.results
+            if r.revocation_status == RevocationStatus.CONFLICT_SKIPPED
+        )
+
+    @property
     def all_conflict_types(self) -> Set[str]:
         seen = set()
         for r in self.results:
@@ -780,22 +968,42 @@ class BatchReassignmentResult:
                 seen.add(ct)
         return seen
 
+    @property
+    def all_revocation_conflict_types(self) -> Set[str]:
+        seen = set()
+        for r in self.results:
+            if r.revocation_conflict_type:
+                seen.add(r.revocation_conflict_type)
+        return seen
+
     def filter_results(
         self,
         status: Optional[str] = None,
         conflict_type: Optional[str] = None,
+        revocation_status: Optional[str] = None,
     ) -> List[BatchItemResult]:
         filtered = []
         for r in self.results:
             if status and status != "all":
-                if status == "success" and not r.success:
+                if status == "success" and not (r.success and not r.revoked):
                     continue
                 if status == "skipped" and not r.skipped:
                     continue
                 if status == "failed" and (r.success or r.skipped):
                     continue
+                if status == "revoked" and not r.revoked:
+                    continue
             if conflict_type and conflict_type != "all" and conflict_type not in r.conflict_types:
                 continue
+            if revocation_status and revocation_status != "all":
+                if revocation_status == "revoked" and not r.revoked:
+                    continue
+                if revocation_status == "revocable" and not (r.success and not r.revoked and r.revocation_status == RevocationStatus.REVOCABLE):
+                    continue
+                if revocation_status == "not_revocable" and not (r.success and not r.revoked and r.revocation_status == RevocationStatus.NOT_REVOCABLE):
+                    continue
+                if revocation_status == "conflict_skipped" and r.revocation_status != RevocationStatus.CONFLICT_SKIPPED:
+                    continue
             filtered.append(r)
         return filtered
 
@@ -810,7 +1018,12 @@ class BatchReassignmentResult:
             "skipped_count": self.skipped_count,
             "failed_count": self.failed_count,
             "total_count": self.total_count,
+            "revoked_count": self.revoked_count,
+            "revocable_count": self.revocable_count,
+            "not_revocable_count": self.not_revocable_count,
+            "revocation_conflict_skipped_count": self.revocation_conflict_skipped_count,
             "all_conflict_types": sorted(self.all_conflict_types),
+            "all_revocation_conflict_types": sorted(self.all_revocation_conflict_types),
             "note": self.note,
             "results": [r.to_dict() for r in self.results],
         }

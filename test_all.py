@@ -2750,6 +2750,617 @@ def test_batch_result_log_write_failure_tracking(store):
     print_ok("日志写入失败追踪 + 所有追溯字段 + 序列化往返 全部通过")
 
 
+def _ensure_tech_capacity(store, tech_id, min_parallel=50):
+    tech = store.get_user(tech_id)
+    if tech:
+        load = store.get_technician_load(tech_id)
+        tech.max_parallel_orders = max(load + min_parallel, min_parallel)
+        store._save_users()
+
+
+def test_revocation_partial(store):
+    print_title("测试28: 撤销 - 部分撤销（选中几条成功项，其他保留，工单和状态正确回滚）")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    _ensure_tech_capacity(store, "u002")
+    _ensure_tech_capacity(store, "u003")
+
+    order_a = store.create_order("撤销测试A", "", "REVA栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_a.order_id, tech1, dispatcher)
+    order_b = store.create_order("撤销测试B", "", "REVB栋", "水管维修", "中", dispatcher)
+    store.dispatch_order(order_b.order_id, tech1, dispatcher)
+    order_c = store.create_order("撤销测试C", "", "REVC栋", "电路维修", "低", dispatcher)
+    store.dispatch_order(order_c.order_id, tech1, dispatcher)
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+    if "水管" not in tech2.skills:
+        tech2.skills.append("水管")
+    if "电路" not in tech2.skills:
+        tech2.skills.append("电路")
+    store._save_users()
+
+    items = store.generate_batch_recommendations(
+        [order_a.order_id, order_b.order_id, order_c.order_id], dispatcher
+    )
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "撤销测试批量改派"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+
+    assert result.success_count == 3, f"3条应全部成功，实际成功={result.success_count}"
+    for r in result.results:
+        assert r.success
+        assert r.revocation_status == "revocable"
+    print_ok(f"批量改派3条全部成功，状态均为可撤销: success_count={result.success_count}")
+
+    a_assignee_before = store.get_order(order_a.order_id).assignee_id
+    b_assignee_before = store.get_order(order_b.order_id).assignee_id
+    c_assignee_before = store.get_order(order_c.order_id).assignee_id
+    assert a_assignee_before == tech2.user_id
+    assert b_assignee_before == tech2.user_id
+    assert c_assignee_before == tech2.user_id
+    print_ok(f"改派后3条工单维修员均为 {tech2.name}")
+
+    rev_result = store.revoke_batch_items(
+        result, [order_a.order_id, order_c.order_id], dispatcher, "测试部分撤销：只撤销A和C"
+    )
+    assert rev_result["success"] == 2
+    assert rev_result["skipped"] == 0
+    assert rev_result["failed"] == 0
+    assert rev_result["total"] == 2
+    print_ok(f"撤销A和C: 成功={rev_result['success']}, 跳过={rev_result['skipped']}, 失败={rev_result['failed']}")
+
+    refreshed = store.get_batch_result(result.result_id)
+    assert refreshed.revoked_count == 2
+    assert refreshed.success_count == 1
+    assert refreshed.revocable_count == 1
+    print_ok(f"结果统计: 已撤销={refreshed.revoked_count}, 剩余有效成功={refreshed.success_count}, 可撤销={refreshed.revocable_count}")
+
+    a_after = store.get_order(order_a.order_id)
+    b_after = store.get_order(order_b.order_id)
+    c_after = store.get_order(order_c.order_id)
+    assert a_after.assignee_id == tech1.user_id, f"工单A应恢复给{tech1.name}"
+    assert b_after.assignee_id == tech2.user_id, f"工单B应保留给{tech2.name}"
+    assert c_after.assignee_id == tech1.user_id, f"工单C应恢复给{tech1.name}"
+    print_ok(f"工单状态验证: A→{a_after.assignee_name}, B→{b_after.assignee_name}, C→{c_after.assignee_name}")
+
+    for r in refreshed.results:
+        if r.order_id in (order_a.order_id, order_c.order_id):
+            assert r.revoked
+            assert r.revocation_status == "revoked"
+            assert r.revocation_reason == "测试部分撤销：只撤销A和C"
+            assert r.revocation_operator_id == dispatcher.user_id
+            assert r.revocation_operator_name == dispatcher.name
+            assert r.revocation_id and r.revocation_id.startswith("REV")
+            assert r.revocation_timestamp
+        elif r.order_id == order_b.order_id:
+            assert not r.revoked
+            assert r.revocation_status == "revocable"
+    print_ok("每条结果条目撤销字段正确（已撤销/可撤销、原因、操作人、时间、记录ID）")
+
+    a_logs = store.get_reassignment_logs(order_a.order_id)
+    assert len(a_logs) >= 2
+    last_log = a_logs[-1]
+    assert last_log.to_user_id == tech1.user_id
+    assert "撤销改派" in last_log.reason
+    assert last_log.dispatcher_id == dispatcher.user_id
+    print_ok(f"撤销写入改派日志: 工单A最后一条日志→{last_log.to_user_name}, 原因含'撤销改派'")
+
+    all_records = store.get_revocation_records_by_result(result.result_id)
+    assert len(all_records) == 2
+    for rec in all_records:
+        assert rec.success
+        assert rec.result_id == result.result_id
+        assert rec.draft_id == draft.draft_id
+        assert rec.operator_id == dispatcher.user_id
+        assert rec.original_assignee_id == tech1.user_id
+        assert rec.revoked_assignee_id == tech2.user_id
+    print_ok(f"撤销记录持久化: 共{len(all_records)}条，result_id/draft_id/操作人/原/新维修员均正确")
+
+
+def test_revocation_duplicate_interception(store):
+    print_title("测试29: 撤销 - 重复撤销拦截（已撤销/再次改派/已完成/原维修员不存在 都应跳过，不影响其他有效撤销）")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+    _ensure_tech_capacity(store, "u002")
+    _ensure_tech_capacity(store, "u003")
+
+    order_revoked = store.create_order("重复撤销-已撤销", "", "DUP1", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_revoked.order_id, tech1, dispatcher)
+    order_reassigned = store.create_order("重复撤销-再次改派", "", "DUP2", "水管维修", "高", dispatcher)
+    store.dispatch_order(order_reassigned.order_id, tech1, dispatcher)
+    order_completed = store.create_order("重复撤销-已完成", "", "DUP3", "电路维修", "高", dispatcher)
+    store.dispatch_order(order_completed.order_id, tech1, dispatcher)
+    order_valid = store.create_order("重复撤销-正常撤销", "", "DUP4", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_valid.order_id, tech1, dispatcher)
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+    if "水管" not in tech2.skills:
+        tech2.skills.append("水管")
+    if "电路" not in tech2.skills:
+        tech2.skills.append("电路")
+    store._save_users()
+
+    order_ids = [order_revoked.order_id, order_reassigned.order_id, order_completed.order_id, order_valid.order_id]
+    items = store.generate_batch_recommendations(order_ids, dispatcher)
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "重复撤销测试批量改派"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+    assert result.success_count == 4, f"4条应全部成功，实际成功={result.success_count}"
+    print_ok(f"批量改派4条成功: {[r.order_id for r in result.results if r.success]}")
+
+    store.revoke_batch_items(result, [order_revoked.order_id], dispatcher, "先撤销第一条，制造已撤销状态")
+    print_ok("预撤销第一条，制造'已撤销'场景")
+
+    other_dispatcher = store.get_user("u001")
+    store.reassign_order(order_reassigned.order_id, tech1, other_dispatcher, "他人再次改派")
+    print_ok("第二条被他人再次改派回原维修员，制造'工单被再次改派'场景")
+
+    store.accept_order(order_completed.order_id, tech2)
+    store.complete_order(order_completed.order_id, tech2)
+    store.approve_order(order_completed.order_id, inspector)
+    completed_order = store.get_order(order_completed.order_id)
+    assert completed_order.status == Status.COMPLETED
+    print_ok("第三条流转到已完成，制造'工单已完成'场景")
+
+    rev_result = store.revoke_batch_items(
+        result,
+        [order_revoked.order_id, order_reassigned.order_id, order_completed.order_id, order_valid.order_id],
+        dispatcher,
+        "重复撤销综合测试",
+    )
+    print_ok(f"4条一起撤销: 成功={rev_result['success']}, 跳过={rev_result['skipped']}, 失败={rev_result['failed']}")
+    assert rev_result["success"] == 1, f"只有第4条应成功撤销，实际成功={rev_result['success']}"
+    assert rev_result["skipped"] == 3, f"前3条应跳过，实际跳过={rev_result['skipped']}"
+    assert rev_result["failed"] == 0
+
+    refreshed = store.get_batch_result(result.result_id)
+    item_map = {r.order_id: r for r in refreshed.results}
+
+    r1 = item_map[order_revoked.order_id]
+    assert r1.revoked and r1.revocation_status == "revoked"
+    print_ok(f"已撤销条目: 跳过, 状态仍为已撤销, conflict_type未覆盖原始撤销记录")
+
+    r2 = item_map[order_reassigned.order_id]
+    assert not r2.revoked
+    assert r2.revocation_status == "conflict_skipped"
+    assert r2.revocation_conflict_type == "order_reassigned"
+    assert r2.revocation_conflict_message and "再次改派" in r2.revocation_conflict_message
+    print_ok(f"再次改派条目: 冲突跳过, conflict_type=order_reassigned, 冲突描述正确")
+
+    r3 = item_map[order_completed.order_id]
+    assert not r3.revoked
+    assert r3.revocation_status == "conflict_skipped"
+    assert r3.revocation_conflict_type == "order_completed"
+    print_ok(f"已完成条目: 冲突跳过, conflict_type=order_completed")
+
+    r4 = item_map[order_valid.order_id]
+    assert r4.revoked and r4.revocation_status == "revoked"
+    valid_after = store.get_order(order_valid.order_id)
+    assert valid_after.assignee_id == tech1.user_id
+    print_ok(f"正常撤销条目: 已撤销, 工单维修员恢复为 {valid_after.assignee_name}")
+
+    assert refreshed.success_count == 0 or refreshed.revoked_count >= 2
+    records = store.get_revocation_records_by_result(result.result_id)
+    assert len(records) >= 4
+    success_records = [r for r in records if r.success]
+    skipped_records = [r for r in records if not r.success]
+    assert len(success_records) == 2
+    assert len(skipped_records) == 3
+    print_ok(f"撤销记录统计: 成功{len(success_records)}条, 跳过{len(skipped_records)}条, 重复撤销未产生多余成功记录")
+
+
+def test_revocation_persistence_across_restart(store):
+    print_title("测试30: 撤销 - 重启恢复（撤销记录、结果条目撤销状态跨重启完整一致）")
+
+    data_dir = store.data_dir
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    _ensure_tech_capacity(store, "u002")
+    _ensure_tech_capacity(store, "u003")
+
+    order1 = store.create_order("重启撤销测试1", "", "RST1", "空调维修", "高", dispatcher)
+    store.dispatch_order(order1.order_id, tech1, dispatcher)
+    order2 = store.create_order("重启撤销测试2", "", "RST2", "水管维修", "中", dispatcher)
+    store.dispatch_order(order2.order_id, tech1, dispatcher)
+    order3 = store.create_order("重启撤销测试3", "", "RST3", "电路维修", "低", dispatcher)
+    store.dispatch_order(order3.order_id, tech1, dispatcher)
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+    if "水管" not in tech2.skills:
+        tech2.skills.append("水管")
+    if "电路" not in tech2.skills:
+        tech2.skills.append("电路")
+    store._save_users()
+
+    items = store.generate_batch_recommendations([order1.order_id, order2.order_id, order3.order_id], dispatcher)
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "重启撤销测试批量改派"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+    assert result.success_count == 3
+
+    rev_result = store.revoke_batch_items(result, [order1.order_id, order3.order_id], dispatcher, "重启前撤销：1和3")
+    assert rev_result["success"] == 2
+    print_ok(f"重启前: 成功撤销{rev_result['success']}条, result_id={result.result_id}")
+
+    result_before = store.get_batch_result(result.result_id)
+    result_dict_before = result_before.to_dict()
+    records_before = store.get_all_revocation_records()
+    records_dict_before = [r.to_dict() for r in records_before]
+    order1_before = store.get_order(order1.order_id).to_dict()
+    order2_before = store.get_order(order2.order_id).to_dict()
+    order3_before = store.get_order(order3.order_id).to_dict()
+
+    rev_file = os.path.join(data_dir, "revocation_records.json")
+    assert os.path.exists(rev_file), "撤销记录持久化文件不存在"
+    with open(rev_file, "r", encoding="utf-8") as f:
+        rev_raw = json.load(f)
+    assert len(rev_raw) >= 2
+    print_ok(f"撤销记录持久化文件存在: {rev_file}, 共{len(rev_raw)}条记录")
+
+    print_ok("重启数据存储，模拟关闭应用...")
+    del store
+    import gc
+    gc.collect()
+
+    store2 = DataStore(data_dir)
+
+    result_after = store2.get_batch_result(result.result_id)
+    assert result_after is not None, "重启后批量改派结果丢失"
+    result_dict_after = result_after.to_dict()
+    assert result_dict_before["revoked_count"] == result_dict_after["revoked_count"]
+    assert result_dict_before["revocable_count"] == result_dict_after["revocable_count"]
+    assert result_dict_before["success_count"] == result_dict_after["success_count"]
+    print_ok(f"重启后结果统计一致: revoked={result_dict_after['revoked_count']}, revocable={result_dict_after['revocable_count']}, success={result_dict_after['success_count']}")
+
+    for r_before, r_after in zip(result_before.results, result_after.results):
+        assert r_before.order_id == r_after.order_id
+        assert r_before.revoked == r_after.revoked
+        assert r_before.revocation_status == r_after.revocation_status
+        assert r_before.revocation_reason == r_after.revocation_reason
+        assert r_before.revocation_operator_id == r_after.revocation_operator_id
+        assert r_before.revocation_id == r_after.revocation_id
+        assert r_before.revocation_timestamp == r_after.revocation_timestamp
+        assert r_before.original_status_snapshot == r_after.original_status_snapshot
+    print_ok("重启后每条结果条目撤销字段完全一致（撤销状态/原因/操作人/记录ID/时间/状态快照）")
+
+    records_after = store2.get_all_revocation_records()
+    records_dict_after = [r.to_dict() for r in records_after]
+    assert len(records_dict_before) == len(records_dict_after)
+    for rb, ra in zip(sorted(records_dict_before, key=lambda x: x["revocation_id"]),
+                      sorted(records_dict_after, key=lambda x: x["revocation_id"])):
+        assert rb["revocation_id"] == ra["revocation_id"]
+        assert rb["success"] == ra["success"]
+        assert rb["operator_id"] == ra["operator_id"]
+        assert rb["reason"] == ra["reason"]
+        assert rb["result_id"] == ra["result_id"]
+        assert rb["draft_id"] == ra["draft_id"]
+        assert rb["order_id"] == ra["order_id"]
+    print_ok(f"重启后撤销记录完全一致: 共{len(records_after)}条")
+
+    order1_after = store2.get_order(order1.order_id).to_dict()
+    order2_after = store2.get_order(order2.order_id).to_dict()
+    order3_after = store2.get_order(order3.order_id).to_dict()
+    assert order1_before["assignee_id"] == order1_after["assignee_id"]
+    assert order2_before["assignee_id"] == order2_after["assignee_id"]
+    assert order3_before["assignee_id"] == order3_after["assignee_id"]
+    assert order1_before["status"] == order1_after["status"]
+    assert order2_before["status"] == order2_after["status"]
+    assert order3_before["status"] == order3_after["status"]
+    assert len(order1_before["reassignment_logs"]) == len(order1_after["reassignment_logs"])
+    print_ok("重启后工单数据（维修员/状态/改派日志）完全一致")
+
+    rev_result2 = store2.revoke_batch_items(result_after, [order2.order_id], dispatcher, "重启后再撤销第2条")
+    assert rev_result2["success"] == 1
+    order2_final = store2.get_order(order2.order_id)
+    assert order2_final.assignee_id == tech1.user_id
+    print_ok("重启后仍可继续撤销剩余可撤销条目，撤销操作正常生效")
+
+    return store2
+
+
+def test_revocation_export_field_consistency(store):
+    print_title("测试31: 撤销 - 导出字段一致性（CSV/JSON包含撤销字段，与UI显示一致）")
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    export_dir = os.path.join(base, "test_exports_revocation")
+    if os.path.exists(export_dir):
+        shutil.rmtree(export_dir)
+    store.set_export_dir(export_dir)
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    _ensure_tech_capacity(store, "u002")
+    _ensure_tech_capacity(store, "u003")
+
+    order_a = store.create_order("导出撤销测试A", "", "EXPA", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_a.order_id, tech1, dispatcher)
+    order_b = store.create_order("导出撤销测试B", "", "EXPB", "水管维修", "中", dispatcher)
+    store.dispatch_order(order_b.order_id, tech1, dispatcher)
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+    if "水管" not in tech2.skills:
+        tech2.skills.append("水管")
+    store._save_users()
+
+    items = store.generate_batch_recommendations([order_a.order_id, order_b.order_id], dispatcher)
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "导出一致性测试批量改派"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+
+    store.revoke_batch_items(result, [order_a.order_id], dispatcher, "只撤销A，B保留")
+    refreshed = store.get_batch_result(result.result_id)
+
+    json_path = store.export_batch_result_json(refreshed)
+    assert os.path.exists(json_path) and os.path.getsize(json_path) > 0
+    with open(json_path, "r", encoding="utf-8") as f:
+        jdata = json.load(f)
+    assert "revoked_count" in jdata
+    assert "revocable_count" in jdata
+    assert "not_revocable_count" in jdata
+    assert "revocation_conflict_skipped_count" in jdata
+    assert "all_revocation_conflict_types" in jdata
+    assert jdata["revoked_count"] == 1
+    assert jdata["revocable_count"] == 1
+    print_ok(f"JSON顶层包含撤销统计: revoked={jdata['revoked_count']}, revocable={jdata['revocable_count']}")
+
+    for item_j in jdata["results"]:
+        assert "revoked" in item_j
+        assert "revocation_status" in item_j
+        assert "revocation_status_label" in item_j
+        assert "revocation_id" in item_j
+        assert "revocation_reason" in item_j
+        assert "revocation_operator_id" in item_j
+        assert "revocation_operator_name" in item_j
+        assert "revocation_timestamp" in item_j
+        assert "revocation_conflict_type" in item_j
+        assert "revocation_conflict_message" in item_j
+        assert "original_status_snapshot" in item_j
+        if item_j["order_id"] == order_a.order_id:
+            assert item_j["revoked"] is True
+            assert item_j["revocation_status"] == "revoked"
+            assert item_j["revocation_reason"] == "只撤销A，B保留"
+            assert item_j["revocation_operator_name"] == dispatcher.name
+            assert item_j["status_label"] == "已撤销"
+        elif item_j["order_id"] == order_b.order_id:
+            assert item_j["revoked"] is False
+            assert item_j["revocation_status"] == "revocable"
+            assert item_j["status_label"] == "成功"
+    print_ok("JSON每条结果包含11个撤销字段，数据与模型一致（A已撤销/B可撤销）")
+
+    csv_path = store.export_batch_result_csv(refreshed)
+    assert os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+    expected_rev_cols = [
+        "撤销状态", "是否已撤销", "撤销记录ID", "撤销原因",
+        "撤销操作人ID", "撤销操作人姓名", "撤销时间",
+        "撤销冲突类型", "撤销冲突描述", "原始状态快照",
+    ]
+    for col in expected_rev_cols:
+        assert col in header, f"CSV表头缺少列: {col}, 实际表头: {header}"
+    assert len(rows) == 2
+    print_ok(f"CSV表头包含10个撤销相关列: {expected_rev_cols}")
+
+    rev_status_idx = header.index("撤销状态")
+    is_revoked_idx = header.index("是否已撤销")
+    rev_reason_idx = header.index("撤销原因")
+    rev_op_idx = header.index("撤销操作人姓名")
+    result_idx = header.index("执行结果")
+
+    for row in rows:
+        order_id = row[header.index("工单编号")]
+        if order_id == order_a.order_id:
+            assert row[rev_status_idx] == "已撤销"
+            assert row[is_revoked_idx] == "是"
+            assert row[rev_reason_idx] == "只撤销A，B保留"
+            assert row[rev_op_idx] == dispatcher.name
+            assert row[result_idx] == "已撤销"
+        elif order_id == order_b.order_id:
+            assert row[rev_status_idx] == "可撤销"
+            assert row[is_revoked_idx] == "否"
+            assert row[result_idx] == "成功"
+    print_ok("CSV导出数据与模型一致（A已撤销/B可撤销，与JSON、UI显示一致）")
+
+
+def test_revocation_permission_denied(store):
+    print_title("测试32: 撤销 - 权限拒绝（非调度员无权撤销，且不改动任何数据）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+    _ensure_tech_capacity(store, "u002")
+    _ensure_tech_capacity(store, "u003")
+
+    order = store.create_order("权限拒绝撤销测试", "", "PERM栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order.order_id, tech, dispatcher)
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+        store._save_users()
+
+    items = store.generate_batch_recommendations([order.order_id], dispatcher)
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "权限测试批量改派"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+    assert result.success_count == 1
+
+    order_before = store.get_order(order.order_id).to_dict()
+    result_before = store.get_batch_result(result.result_id).to_dict()
+    records_count_before = len(store.get_all_revocation_records())
+    print_ok(f"权限拒绝测试: 改派成功, 准备以验收员身份尝试撤销")
+
+    try:
+        store.revoke_batch_items(result, [order.order_id], inspector, "验收员尝试撤销")
+        print_fail("验收员居然能撤销改派！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员撤销被 PermissionError 拒绝（符合预期）: {e}")
+
+    order_after = store.get_order(order.order_id).to_dict()
+    result_after = store.get_batch_result(result.result_id).to_dict()
+    records_count_after = len(store.get_all_revocation_records())
+
+    assert order_before["assignee_id"] == order_after["assignee_id"], "权限拒绝时工单维修员不应变化"
+    assert order_before["status"] == order_after["status"], "权限拒绝时工单状态不应变化"
+    assert order_before["version"] == order_after["version"], "权限拒绝时工单版本不应变化"
+    assert len(order_before["reassignment_logs"]) == len(order_after["reassignment_logs"]), "权限拒绝时不应新增改派日志"
+    print_ok("权限拒绝时：工单维修员/状态/版本/改派日志均未变化")
+
+    assert result_before["revoked_count"] == result_after["revoked_count"]
+    assert result_before["revocable_count"] == result_after["revocable_count"]
+    assert result_after["results"][0]["revoked"] is False
+    assert result_after["results"][0]["revocation_status"] == "revocable"
+    print_ok("权限拒绝时：批量结果撤销统计和条目状态未变化")
+
+    assert records_count_before == records_count_after, "权限拒绝时不应写入撤销记录"
+    print_ok("权限拒绝时：撤销记录未增加")
+
+    try:
+        store.revoke_batch_items(result, [order.order_id], tech, "维修员尝试撤销")
+        print_fail("维修员居然能撤销改派！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"维修员撤销也被 PermissionError 拒绝（符合预期）: {e}")
+
+    order_after2 = store.get_order(order.order_id).to_dict()
+    assert order_before["assignee_id"] == order_after2["assignee_id"]
+    assert len(store.get_all_revocation_records()) == records_count_before
+    print_ok("维修员撤销同样：所有数据未受影响")
+
+
+def test_revocation_version_and_status_conflict(store):
+    print_title("测试33: 撤销 - 版本冲突与状态流转冲突（工单被改派/完成后只跳过本条，其他有效撤销正常执行）")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+    _ensure_tech_capacity(store, "u002")
+    _ensure_tech_capacity(store, "u003")
+
+    order_conflict = store.create_order("版本冲突测试", "", "VC栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_conflict.order_id, tech1, dispatcher)
+    order_ok = store.create_order("正常撤销测试", "", "VC2栋", "水管维修", "中", dispatcher)
+    store.dispatch_order(order_ok.order_id, tech1, dispatcher)
+    order_done = store.create_order("已完成冲突测试", "", "VC3栋", "电路维修", "低", dispatcher)
+    store.dispatch_order(order_done.order_id, tech1, dispatcher)
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+    if "水管" not in tech2.skills:
+        tech2.skills.append("水管")
+    if "电路" not in tech2.skills:
+        tech2.skills.append("电路")
+    store._save_users()
+
+    items = store.generate_batch_recommendations(
+        [order_conflict.order_id, order_ok.order_id, order_done.order_id], dispatcher
+    )
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "版本冲突测试批量改派"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+    assert result.success_count == 3
+
+    store.reassign_order(order_conflict.order_id, tech1, dispatcher, "调度员自己再次改派回去，制造版本变化")
+    conflict_order_after = store.get_order(order_conflict.order_id)
+    print_ok(f"工单被再次改派: 版本升级, 维修员回到{conflict_order_after.assignee_name}")
+
+    store.accept_order(order_done.order_id, tech2)
+    store.complete_order(order_done.order_id, tech2)
+    store.approve_order(order_done.order_id, inspector)
+    done_order = store.get_order(order_done.order_id)
+    assert done_order.status == Status.COMPLETED
+    print_ok(f"工单流转到已完成: status={done_order.status.value}")
+
+    ok_order_before = store.get_order(order_ok.order_id).to_dict()
+
+    rev_result = store.revoke_batch_items(
+        result,
+        [order_conflict.order_id, order_ok.order_id, order_done.order_id],
+        dispatcher,
+        "版本+状态+正常 混合撤销",
+    )
+    print_ok(f"3条一起撤销: 成功={rev_result['success']}, 跳过={rev_result['skipped']}, 失败={rev_result['failed']}")
+    assert rev_result["success"] == 1
+    assert rev_result["skipped"] == 2
+    assert rev_result["failed"] == 0
+
+    refreshed = store.get_batch_result(result.result_id)
+    item_map = {r.order_id: r for r in refreshed.results}
+
+    r_conflict = item_map[order_conflict.order_id]
+    assert not r_conflict.revoked
+    assert r_conflict.revocation_status == "conflict_skipped"
+    assert r_conflict.revocation_conflict_type in ("order_reassigned",)
+    print_ok(f"再次改派条目: 冲突跳过, conflict_type={r_conflict.revocation_conflict_type}")
+
+    r_done = item_map[order_done.order_id]
+    assert not r_done.revoked
+    assert r_done.revocation_status == "conflict_skipped"
+    assert r_done.revocation_conflict_type == "order_completed"
+    print_ok(f"已完成条目: 冲突跳过, conflict_type=order_completed")
+
+    r_ok = item_map[order_ok.order_id]
+    assert r_ok.revoked
+    assert r_ok.revocation_status == "revoked"
+    assert r_ok.revocation_reason == "版本+状态+正常 混合撤销"
+    ok_after = store.get_order(order_ok.order_id)
+    assert ok_after.assignee_id == tech1.user_id, f"正常撤销的工单应恢复到{tech1.name}"
+    assert ok_after.version > ok_order_before["version"], "正常撤销的工单版本号应递增"
+    print_ok(f"正常撤销条目: 已撤销, 工单恢复给{ok_after.assignee_name}, 版本从v{ok_order_before['version']}→v{ok_after.version}")
+
+    conflict_final = store.get_order(order_conflict.order_id)
+    done_final = store.get_order(order_done.order_id)
+    assert conflict_final.assignee_id == tech1.user_id, "被跳过的冲突条目工单不应被改动"
+    assert done_final.status == Status.COMPLETED, "被跳过的已完成条目状态不应被改动"
+    assert done_final.assignee_id == tech2.user_id, "被跳过的已完成条目维修员不应被改动"
+    print_ok("被跳过的冲突/已完成条目：工单数据完全未被覆盖（维修员/状态保持不变）")
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -2784,6 +3395,12 @@ def main():
         test_batch_result_export_fields_consistency(store)
         test_batch_result_filter_by_status_and_conflict(store)
         test_batch_result_log_write_failure_tracking(store)
+        test_revocation_partial(store)
+        test_revocation_duplicate_interception(store)
+        store = test_revocation_persistence_across_restart(store)
+        test_revocation_export_field_consistency(store)
+        test_revocation_permission_denied(store)
+        test_revocation_version_and_status_conflict(store)
 
         print_title("全部测试通过")
         print("""
@@ -2815,6 +3432,12 @@ def main():
  25. 批量改派结果导出一致性：CSV/JSON 字段与数据模型一致，所有原因/校验/追溯信息不丢失
  26. 批量改派结果过滤：按成功/跳过/失败、按冲突类型过滤，status_label/summary 计算属性
  27. 批量改派结果日志失败追踪：5项校验标志、操作人/草稿/工单/维修员追溯、to_dict/from_dict 往返
+ 28. 撤销-部分撤销：选中几条成功项撤销，工单/状态回滚正确，未选条目保留，撤销字段完整
+ 29. 撤销-重复撤销拦截：已撤销/再次改派/已完成/原维修员不存在 均跳过，不覆盖有效变更
+ 30. 撤销-重启恢复：撤销记录、结果条目撤销状态、工单数据 跨重启完全一致，重启后仍可继续撤销
+ 31. 撤销-导出字段一致性：CSV/JSON 包含全部撤销字段（状态/原因/操作人/时间/冲突类型/状态快照），与UI一致
+ 32. 撤销-权限拒绝：非调度员（验收员/维修员）撤销被拒绝，所有数据不改动
+ 33. 撤销-版本与状态冲突：工单被再次改派/已完成时只跳过本条，正常撤销的工单恢复且版本递增，被跳过的工单数据不被覆盖
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")

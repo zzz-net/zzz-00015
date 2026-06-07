@@ -14,7 +14,7 @@
     "skills": [
       "电路"
     ],
-    "max_parallel_orders": 100,
+    "max_parallel_orders": 71,
     "time_slots": [
       {
         "day_of_week": 0,
@@ -34,9 +34,10 @@
     "role": "technician",
     "skills": [
       "水管",
-      "空调"
+      "空调",
+      "电路"
     ],
-    "max_parallel_orders": 13,
+    "max_parallel_orders": 67,
     "time_slots": [
       {
         "day_of_week": 2,
