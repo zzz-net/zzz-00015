@@ -1,8 +1,8 @@
 [
   {
-    "log_id": "RCL202606071922563102244425",
-    "reschedule_id": "RS202606071922563033886D9F",
-    "order_id": "WO20260607192256B592",
+    "log_id": "RCL202606072009149045182A00",
+    "reschedule_id": "RS202606072009148976973D07",
+    "order_id": "WO2026060720091476AF",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -11,12 +11,12 @@
     "selected_slot_end": "2026-06-11 16:00",
     "reject_reason": "",
     "note": "客户同意第一个时间",
-    "timestamp": "2026-06-07 19:22:56.310224"
+    "timestamp": "2026-06-07 20:09:14.904518"
   },
   {
-    "log_id": "RCL20260607192256421073C4E4",
-    "reschedule_id": "RS20260607192256413728DB1B",
-    "order_id": "WO202606071922563ACF",
+    "log_id": "RCL202606072009150153752703",
+    "reschedule_id": "RS202606072009150070767346",
+    "order_id": "WO202606072009147220",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -25,12 +25,12 @@
     "selected_slot_end": "2026-06-26 11:00",
     "reject_reason": "",
     "note": "",
-    "timestamp": "2026-06-07 19:22:56.421073"
+    "timestamp": "2026-06-07 20:09:15.015375"
   },
   {
-    "log_id": "RCL2026060719225645135293C3",
-    "reschedule_id": "RS202606071922564435140664",
-    "order_id": "WO202606071922564808",
+    "log_id": "RCL202606072009150442404E1F",
+    "reschedule_id": "RS202606072009150368744E37",
+    "order_id": "WO202606072009152DC5",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -39,12 +39,12 @@
     "selected_slot_end": "2026-07-01 11:00",
     "reject_reason": "",
     "note": "",
-    "timestamp": "2026-06-07 19:22:56.451352"
+    "timestamp": "2026-06-07 20:09:15.045199"
   },
   {
-    "log_id": "RCL202606071922565123787B5F",
-    "reschedule_id": "RS202606071922565045692680",
-    "order_id": "WO2026060719225646B2",
+    "log_id": "RCL2026060720091510386444B8",
+    "reschedule_id": "RS20260607200915095940332F",
+    "order_id": "WO20260607200915FCBB",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -53,12 +53,12 @@
     "selected_slot_end": null,
     "reject_reason": "时间不合适",
     "note": "",
-    "timestamp": "2026-06-07 19:22:56.512378"
+    "timestamp": "2026-06-07 20:09:15.103864"
   },
   {
-    "log_id": "RCL20260607192256528493F559",
-    "reschedule_id": "RS202606071922564807825DF1",
-    "order_id": "WO20260607192256BFC8",
+    "log_id": "RCL20260607200915119235F105",
+    "reschedule_id": "RS20260607200915073970DC2F",
+    "order_id": "WO20260607200915585A",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -67,12 +67,12 @@
     "selected_slot_end": "2026-07-02 16:00",
     "reject_reason": "",
     "note": "",
-    "timestamp": "2026-06-07 19:22:56.528493"
+    "timestamp": "2026-06-07 20:09:15.119235"
   },
   {
-    "log_id": "RCL20260607192256600289C463",
-    "reschedule_id": "RS20260607192256591547DC16",
-    "order_id": "WO2026060719225667FE",
+    "log_id": "RCL20260607200915188210964B",
+    "reschedule_id": "RS2026060720091518044834EC",
+    "order_id": "WO20260607200915A2DD",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -81,12 +81,12 @@
     "selected_slot_end": "2026-09-01 11:00",
     "reject_reason": "",
     "note": "确认备注",
-    "timestamp": "2026-06-07 19:22:56.600289"
+    "timestamp": "2026-06-07 20:09:15.188210"
   },
   {
-    "log_id": "RCL2026060719225664520825BF",
-    "reschedule_id": "RS20260607192256636900F017",
-    "order_id": "WO20260607192256D491",
+    "log_id": "RCL202606072009152326584E05",
+    "reschedule_id": "RS2026060720091522387486B2",
+    "order_id": "WO20260607200915E790",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -95,12 +95,12 @@
     "selected_slot_end": "2026-10-02 16:00",
     "reject_reason": "",
     "note": "",
-    "timestamp": "2026-06-07 19:22:56.645208"
+    "timestamp": "2026-06-07 20:09:15.232658"
   },
   {
-    "log_id": "RCL202606071922566945094C14",
-    "reschedule_id": "RS20260607192256685292B5C1",
-    "order_id": "WO20260607192256F035",
+    "log_id": "RCL202606072009152814908767",
+    "reschedule_id": "RS20260607200915272209AEB2",
+    "order_id": "WO2026060720091557E8",
     "confirmer_id": "u002",
     "confirmer_name": "李维修",
     "confirmer_role": "technician",
@@ -109,6 +109,20 @@
     "selected_slot_end": null,
     "reject_reason": "当天有其他安排",
     "note": "抱歉",
-    "timestamp": "2026-06-07 19:22:56.694509"
+    "timestamp": "2026-06-07 20:09:15.281490"
+  },
+  {
+    "log_id": "RCL202606072009153395779BD9",
+    "reschedule_id": "RS202606072009153308125E1D",
+    "order_id": "WO20260607200915324F",
+    "confirmer_id": "u001",
+    "confirmer_name": "张调度",
+    "confirmer_role": "dispatcher",
+    "decision": "confirm",
+    "selected_slot_start": "2026-12-06 10:00",
+    "selected_slot_end": "2026-12-06 12:00",
+    "reject_reason": "",
+    "note": "调度员选择了第二段时间",
+    "timestamp": "2026-06-07 20:09:15.339577"
   }
 ]

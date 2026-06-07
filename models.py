@@ -38,7 +38,7 @@ REASSIGNABLE_STATUSES = {
 
 
 ROLE_PERMISSIONS = {
-    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule", "manage_spare_parts", "review_spare_part_requests", "import_spare_parts", "export_spare_parts", "create_reschedule", "cancel_reschedule", "view_reschedules", "import_reschedules", "export_reschedules", "confirm_arrival", "view_arrivals"],
+    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule", "manage_spare_parts", "review_spare_part_requests", "import_spare_parts", "export_spare_parts", "create_reschedule", "cancel_reschedule", "view_reschedules", "import_reschedules", "export_reschedules", "confirm_reschedule", "confirm_arrival", "view_arrivals"],
     Role.TECHNICIAN: ["accept", "complete", "view_history", "request_spare_parts", "view_own_spare_part_requests", "view_spare_parts_stock", "confirm_reschedule", "view_own_reschedules", "confirm_arrival", "view_own_arrivals"],
     Role.INSPECTOR: ["approve", "reject", "view_history", "export", "view_reschedules"],
 }
