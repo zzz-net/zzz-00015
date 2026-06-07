@@ -1598,6 +1598,404 @@ def test_gui_reassign_drafts():
             shutil.rmtree(gui_export_dir)
 
 
+def test_batch_reassignment_datastore(store):
+    print_title("测试20: 批量改派预案 DataStore - 推荐、草稿、冲突检测、部分成功、结果导出")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+
+    order1 = store.create_order("批量改派工单1", "", "BATCH1栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order1.order_id, tech1, dispatcher)
+    order2 = store.create_order("批量改派工单2", "", "BATCH2栋", "水管维修", "中", dispatcher)
+    store.dispatch_order(order2.order_id, tech1, dispatcher)
+    order3 = store.create_order("批量改派工单3", "", "BATCH3栋", "电路维修", "低", dispatcher)
+    order3_v = store.get_order(order3.order_id).version
+
+    order_ids = [order1.order_id, order2.order_id, order3.order_id]
+    items = store.generate_batch_recommendations(order_ids, dispatcher)
+    assert len(items) == 3, f"应为3条推荐，实际{len(items)}"
+    for it in items:
+        assert it.order_id in order_ids
+        assert it.target_technician_id
+        assert it.reason
+        assert it.match_score is not None
+    print_ok(f"批量推荐生成成功: {len(items)} 条工单，每条含推荐维修员、原因、匹配分")
+
+    for it in items:
+        if it.order_id == order1.order_id:
+            it.target_technician_id = tech2.user_id
+            it.reason = "批量改派-调整目标"
+            it.tech_skills_snapshot = list(tech2.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+            it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    assert draft.draft_id.startswith("BRD")
+    assert draft.dispatcher_id == dispatcher.user_id
+    assert len(draft.items) == 3
+    print_ok(f"批量草稿保存成功: draft_id={draft.draft_id}, 条目数={len(draft.items)}")
+
+    loaded = store.get_batch_reassignment_draft(draft.draft_id, dispatcher)
+    assert loaded is not None
+    assert loaded.draft_id == draft.draft_id
+    assert len(loaded.items) == 3
+    print_ok("批量草稿读取成功")
+
+    other_load = store.get_batch_reassignment_draft(draft.draft_id, inspector)
+    assert other_load is None, "其他用户不应读取到不属于自己的草稿"
+    print_ok("批量草稿按调度员隔离")
+
+    all_drafts = store.get_batch_drafts_by_dispatcher(dispatcher)
+    assert len(all_drafts) >= 1
+    print_ok(f"按调度员查询草稿成功: 共 {len(all_drafts)} 个")
+
+    data_dir = store.data_dir
+    batch_path = os.path.join(data_dir, "batch_reassignment_drafts.json")
+    assert os.path.exists(batch_path), "批量草稿持久化文件不存在"
+    with open(batch_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert any(d["draft_id"] == draft.draft_id for d in raw)
+    print_ok(f"批量草稿持久化文件存在且内容正确: {batch_path}")
+
+    print_ok("重启 DataStore 模拟关闭应用...")
+    del store
+    import gc as _gc
+    _gc.collect()
+    store2 = DataStore(data_dir)
+    dispatcher2 = store2.get_user("u001")
+
+    restored = store2.get_batch_reassignment_draft(draft.draft_id, dispatcher2)
+    assert restored is not None, "重启后批量草稿未恢复"
+    assert restored.draft_id == draft.draft_id
+    assert len(restored.items) == 3
+    print_ok(f"跨重启批量草稿恢复成功: {restored.draft_id}")
+
+    conflicts = store2.detect_batch_conflicts(restored)
+    assert len(conflicts) == 0, "不应存在冲突"
+    print_ok("重启后冲突检测: 无冲突（符合预期）")
+
+    tech2_2 = store2.get_user("u003")
+    order2_2 = store2.get_order(order2.order_id)
+    store2.reassign_order(order2_2.order_id, tech2_2, dispatcher2, "他人抢先改派工单2",
+                           expected_version=order2_2.version)
+    order2_after = store2.get_order(order2.order_id)
+    assert order2_after.assignee_id == tech2_2.user_id
+    print_ok(f"模拟他人抢先改派工单2: 新维修员={order2_after.assignee_name}")
+
+    conflicts_after = store2.detect_batch_conflicts(restored)
+    assert order2.order_id in conflicts_after
+    ct = conflicts_after[order2.order_id]
+    assert any(c in ("version_mismatch", "status_changed") for c in ct)
+    print_ok(f"冲突检测: 工单2 检测到冲突 {[c.value if hasattr(c, 'value') else c for c in ct]}")
+
+    order3_obj = store2.get_order(order3.order_id)
+    store2.dispatch_order(order3.order_id, tech2_2, dispatcher2)
+    store2.accept_order(order3.order_id, tech2_2)
+    store2.complete_order(order3.order_id, tech2_2)
+    store2.approve_order(order3.order_id, inspector)
+    order3_final = store2.get_order(order3.order_id)
+    assert order3_final.status.value == "已完成"
+    print_ok(f"工单3 流转到已完成")
+
+    conflicts_more = store2.detect_batch_conflicts(restored)
+    assert order3.order_id in conflicts_more
+    print_ok(f"冲突检测: 工单3（已完成）检测到状态变更冲突")
+
+    result = store2.execute_batch_reassignment(restored, dispatcher2)
+    assert result.dispatcher_id == dispatcher2.user_id
+    assert result.success_count + result.skipped_count + result.failed_count == len(result.results)
+    assert result.success_count >= 1, f"至少工单1应成功，实际成功数={result.success_count}"
+    assert result.skipped_count >= 2, f"至少工单2和工单3应跳过，实际跳过={result.skipped_count}"
+    print_ok(f"批量提交执行完成: 成功={result.success_count}, 跳过={result.skipped_count}, 失败={result.failed_count}")
+
+    for r in result.results:
+        if r.order_id == order1.order_id:
+            assert r.success, f"工单1应成功，实际: success={r.success}, error={r.error_message}"
+            assert r.target_technician_id == tech2.user_id
+            assert r.reason == "批量改派-调整目标"
+            print_ok(f"工单1改派成功: 新维修员={r.target_technician_name}, 原因={r.reason}")
+        elif r.order_id == order2.order_id:
+            assert r.skipped
+            assert r.error_message is not None
+            print_ok(f"工单2跳过（版本冲突）: {r.error_message}")
+        elif r.order_id == order3.order_id:
+            assert r.skipped
+            assert r.error_message is not None
+            print_ok(f"工单3跳过（已完成）: {r.error_message}")
+
+    order1_logs = store2.get_reassignment_logs(order1.order_id)
+    assert len(order1_logs) >= 1
+    last_log = order1_logs[-1]
+    assert last_log.to_user_id == tech2.user_id
+    assert last_log.dispatcher_id == dispatcher2.user_id
+    assert last_log.reason == "批量改派-调整目标"
+    print_ok(f"成功项写入原有改派日志: 从 {last_log.from_user_name} 到 {last_log.to_user_name}")
+
+    refreshed_draft = store2.get_batch_reassignment_draft(draft.draft_id, dispatcher2)
+    if refreshed_draft:
+        remaining_ids = {it.order_id for it in refreshed_draft.items}
+        assert order1.order_id not in remaining_ids
+        print_ok(f"成功项从草稿中移除，剩余 {len(refreshed_draft.items)} 条")
+    else:
+        print_ok("全部成功后草稿自动清理")
+
+    export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_exports_batch")
+    store2.set_export_dir(export_dir)
+    csv_path = store2.export_batch_result_csv(result)
+    json_path = store2.export_batch_result_json(result)
+    assert os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    assert os.path.exists(json_path) and os.path.getsize(json_path) > 0
+    print_ok(f"结果导出 CSV: {csv_path} ({os.path.getsize(csv_path)}字节)")
+    print_ok(f"结果导出 JSON: {json_path} ({os.path.getsize(json_path)}字节)")
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        assert "提交人" in header
+        assert "执行结果" in header
+        assert "错误/跳过原因" in header
+        rows = list(reader)
+        assert len(rows) == 3
+    print_ok("CSV导出字段正确（含提交人、执行结果、原因）")
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        jdata = json.load(f)
+    assert jdata["dispatcher_name"] == dispatcher2.name
+    assert jdata["success_count"] == result.success_count
+    assert len(jdata["results"]) == 3
+    print_ok("JSON导出字段正确（含提交人、成功/跳过计数）")
+
+    try:
+        store2.generate_batch_recommendations(order_ids, inspector)
+        print_fail("验收员居然能生成批量推荐！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员无权生成批量推荐（符合预期）: {e}")
+
+    try:
+        store2.save_batch_reassignment_draft(inspector, items)
+        print_fail("验收员居然能保存批量草稿！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员无权保存批量草稿（符合预期）: {e}")
+
+    print_ok("批量改派预案 DataStore 层全部验证通过")
+
+    return store2
+
+
+def test_gui_batch_reassignment():
+    print_title("测试21: GUI 批量改派预案 - 草稿恢复、冲突标记、部分成功、结果导出")
+
+    import tkinter as tk
+    from tkinter import messagebox
+
+    gui_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_batch_test_data")
+    if os.path.exists(gui_data_dir):
+        shutil.rmtree(gui_data_dir)
+    gui_export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_batch_test_exports")
+    if os.path.exists(gui_export_dir):
+        shutil.rmtree(gui_export_dir)
+
+    captured = {"showerror": [], "showinfo": [], "showwarning": [], "askyesno": []}
+
+    def fake_showerror(title, msg, **kw):
+        captured["showerror"].append((title, msg))
+
+    def fake_showinfo(title, msg, **kw):
+        captured["showinfo"].append((title, msg))
+
+    def fake_showwarning(title, msg, **kw):
+        captured["showwarning"].append((title, msg))
+
+    def fake_askyesno(title, msg, **kw):
+        captured["askyesno"].append((title, msg))
+        return True
+
+    orig_showerror = messagebox.showerror
+    orig_showinfo = messagebox.showinfo
+    orig_showwarning = messagebox.showwarning
+    orig_askyesno = messagebox.askyesno
+    messagebox.showerror = fake_showerror
+    messagebox.showinfo = fake_showinfo
+    messagebox.showwarning = fake_showwarning
+    messagebox.askyesno = fake_askyesno
+
+    root = None
+    try:
+        store = DataStore(gui_data_dir)
+        store.set_export_dir(gui_export_dir)
+        dispatcher = store.get_user("u001")
+        tech1 = store.get_user("u002")
+        tech2 = store.get_user("u003")
+        inspector = store.get_user("u004")
+
+        order_a = store.create_order("GUI批量A", "", "GUIBTA", "空调维修", "高", dispatcher)
+        store.dispatch_order(order_a.order_id, tech1, dispatcher)
+        order_b = store.create_order("GUI批量B", "", "GUIBTB", "水管维修", "中", dispatcher)
+        store.dispatch_order(order_b.order_id, tech1, dispatcher)
+        order_c = store.create_order("GUI批量C", "", "GUIBTC", "电路维修", "低", dispatcher)
+
+        items = store.generate_batch_recommendations([order_a.order_id, order_b.order_id, order_c.order_id], dispatcher)
+        pre_draft = store.save_batch_reassignment_draft(dispatcher, items)
+        print_ok(f"GUI测试: 预保存批量草稿 {pre_draft.draft_id}")
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+
+        from main import MaintenanceApp, BatchReassignDialog
+        app = MaintenanceApp.__new__(MaintenanceApp)
+        app.root = root
+        app.store = store
+        app.current_user = dispatcher
+        app._configure_styles()
+
+        captured["showinfo"].clear()
+        captured["showwarning"].clear()
+        dlg = BatchReassignDialog(root, store, dispatcher, pre_draft)
+        root.update()
+
+        assert hasattr(dlg, "draft_items")
+        assert len(dlg.draft_items) == 3
+        assert hasattr(dlg, "detail_tree")
+        assert hasattr(dlg, "picker_tree")
+        assert hasattr(dlg, "conflicts")
+        print_ok("GUI批量改派对话框控件创建正常，草稿条目自动载入")
+
+        detail_rows = dlg.detail_tree.get_children()
+        assert len(detail_rows) == 3, f"详情树应显示3条，实际{len(detail_rows)}"
+        print_ok(f"GUI载入草稿后详情列表显示 {len(detail_rows)} 条")
+
+        assert hasattr(dlg, "draft_status_label")
+        status_text = dlg.draft_status_label.cget("text")
+        assert pre_draft.draft_id in status_text
+        print_ok(f"GUI草稿状态条显示草稿编号: '{status_text[:60]}...'")
+
+        dlg._detect_and_show_conflicts()
+        root.update()
+        assert len(dlg.conflicts) == 0
+        print_ok("GUI冲突检测: 初始无冲突")
+
+        order_b_obj = store.get_order(order_b.order_id)
+        store.reassign_order(order_b.order_id, tech2, dispatcher, "他人抢先改派GUI-B",
+                              expected_version=order_b_obj.version)
+        store.dispatch_order(order_c.order_id, tech2, dispatcher)
+        store.accept_order(order_c.order_id, tech2)
+        store.complete_order(order_c.order_id, tech2)
+        store.approve_order(order_c.order_id, inspector)
+        print_ok("GUI测试: 外部修改工单B和工单C制造冲突")
+
+        captured["showwarning"].clear()
+        dlg._detect_and_show_conflicts()
+        root.update()
+        assert len(dlg.conflicts) >= 2, f"应检测到至少2条冲突，实际{len(dlg.conflicts)}"
+        print_ok(f"GUI冲突检测: 检测到 {len(dlg.conflicts)} 条冲突，界面标记")
+
+        for tag_name in ["conflict"]:
+            tags = dlg.detail_tree.tag_configure(tag_name)
+            assert tags is not None
+        print_ok("GUI冲突行样式配置正常（conflict 标记）")
+
+        for it in dlg.draft_items:
+            if it.order_id == order_a.order_id:
+                it.target_technician_id = tech2.user_id
+                it.reason = "GUI批量改派-调整目标A"
+                it.tech_skills_snapshot = list(tech2.skills)
+                it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+                it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+                break
+        dlg._refresh_detail_view()
+        root.update()
+        print_ok("GUI测试: 修改工单A的目标维修员为王维修（tech2）")
+
+        captured["showinfo"].clear()
+        captured["askyesno"].clear()
+        dlg._on_submit_batch()
+        root.update()
+
+        assert len(captured["askyesno"]) >= 1
+        print_ok("GUI提交前弹出确认框")
+
+        assert dlg.last_result is not None
+        result = dlg.last_result
+        assert result.success_count >= 1
+        assert result.skipped_count >= 2
+        print_ok(f"GUI批量提交执行结果: 成功={result.success_count}, 跳过={result.skipped_count}")
+
+        result_text = dlg.result_text.get("1.0", tk.END)
+        assert "成功" in result_text
+        assert "跳过" in result_text
+        assert dispatcher.name in result_text
+        print_ok("GUI执行结果文本显示正常（含成功/跳过计数、提交人）")
+
+        logs_a = store.get_reassignment_logs(order_a.order_id)
+        assert len(logs_a) >= 1
+        print_ok(f"GUI批量提交: 成功工单已写入原有改派日志（{len(logs_a)}条）")
+
+        captured["showinfo"].clear()
+        dlg._export_result("csv")
+        root.update()
+        dlg._export_result("json")
+        root.update()
+
+        export_files = []
+        if os.path.exists(gui_export_dir):
+            export_files = os.listdir(gui_export_dir)
+        batch_files = [f for f in export_files if f.startswith("batch_reassignment_")]
+        assert len(batch_files) >= 2, f"应导出CSV和JSON两个文件，实际{len(batch_files)}"
+        print_ok(f"GUI批量结果导出成功: {batch_files}")
+
+        dlg.destroy()
+        root.update()
+
+        drafts_list = store.get_batch_drafts_by_dispatcher(dispatcher)
+        if drafts_list:
+            remaining = drafts_list[0]
+            remaining_ids = {it.order_id for it in remaining.items}
+            assert order_a.order_id not in remaining_ids
+            print_ok(f"GUI部分成功后草稿中移除成功项，剩余 {len(remaining.items)} 条")
+
+        captured["showinfo"].clear()
+        captured["askyesno"].clear()
+        app2 = MaintenanceApp.__new__(MaintenanceApp)
+        app2.root = root
+        app2.store = store
+        app2.current_user = dispatcher
+        app2._configure_styles()
+        app2._on_restore_batch_draft()
+        root.update()
+
+        top_levels = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+        assert len(top_levels) >= 1
+        restore_dlg = top_levels[-1]
+        assert "恢复" in restore_dlg.title()
+        print_ok("GUI恢复批量草稿对话框打开正常")
+
+        for w in restore_dlg.winfo_children():
+            w.destroy()
+        restore_dlg.destroy()
+        root.update()
+
+        print_ok("GUI 批量改派预案全部验证通过")
+
+    finally:
+        messagebox.showerror = orig_showerror
+        messagebox.showinfo = orig_showinfo
+        messagebox.showwarning = orig_showwarning
+        messagebox.askyesno = orig_askyesno
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        if os.path.exists(gui_data_dir):
+            shutil.rmtree(gui_data_dir)
+        if os.path.exists(gui_export_dir):
+            shutil.rmtree(gui_export_dir)
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -1624,6 +2022,8 @@ def main():
         test_reassignment_drafts_conflicts(store)
         test_gui_startup_and_tabs()
         test_gui_reassign_drafts()
+        store = test_batch_reassignment_datastore(store)
+        test_gui_batch_reassignment()
 
         print_title("全部测试通过")
         print("""
@@ -1647,6 +2047,8 @@ def main():
  17. 改派草稿：保存、读取、按调度员隔离、跨重启持久化、改派成功自动清理、手动删除
  18. 改派草稿冲突：权限拒绝、版本变更、状态流转 时草稿保留不覆盖
  19. GUI 改派草稿：弹窗自动载入草稿、一键清除、冲突时提示且保留草稿
+ 20. 批量改派 DataStore：多工单推荐、草稿跨重启、冲突检测(版本/状态/维修员)、部分成功部分跳过、日志写入、CSV/JSON结果导出、权限拒绝
+ 21. GUI 批量改派：草稿自动载入+冲突标记、部分成功结果展示、导出功能、恢复草稿对话框
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")

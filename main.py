@@ -3,7 +3,12 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import os
 import sys
 from datetime import datetime
-from models import Role, Status, WorkOrder, User, TimeSlot, CATEGORY_SKILL_MAP
+from typing import List, Dict, Optional
+from models import (
+    Role, Status, WorkOrder, User, TimeSlot, CATEGORY_SKILL_MAP,
+    BatchDraftItem, BatchReassignmentDraft, BatchReassignmentResult,
+    BatchItemResult, ConflictType,
+)
 from datastore import (
     DataStore,
     WorkOrderError,
@@ -281,6 +286,524 @@ class ReassignDialog(tk.Toplevel):
             messagebox.showerror("错误",
                 f"{str(e)}\n改派草稿和现场输入已保留。",
                 parent=self)
+
+
+class BatchReassignDialog(tk.Toplevel):
+    def __init__(self, parent, store, dispatcher, existing_draft: Optional[BatchReassignmentDraft] = None):
+        super().__init__(parent)
+        self.store = store
+        self.dispatcher = dispatcher
+        self.existing_draft = existing_draft
+        self.current_draft: Optional[BatchReassignmentDraft] = existing_draft
+        self.draft_items: List[BatchDraftItem] = []
+        self.conflicts: Dict[str, List[ConflictType]] = {}
+        self.last_result: Optional[BatchReassignmentResult] = None
+        self.title("批量改派预案")
+        self.geometry("1180x760")
+        self.configure(bg="#f5f6fa")
+        self.grab_set()
+        self.transient(parent)
+        self._build_ui()
+        if existing_draft:
+            self._load_existing_draft(existing_draft)
+
+    def _build_ui(self):
+        style = ttk.Style()
+        style.configure("Batch.Treeview", rowheight=32, font=("Microsoft YaHei", 9))
+        style.configure("Batch.Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
+
+        top_bar = tk.Frame(self, bg="#2c3e50", height=50)
+        top_bar.pack(fill=tk.X)
+        top_bar.pack_propagate(False)
+        tk.Label(top_bar, text="批量改派预案管理", font=("Microsoft YaHei", 14, "bold"),
+                 bg="#2c3e50", fg="white").pack(side=tk.LEFT, padx=15)
+        self.draft_status_label = tk.Label(top_bar, text="", font=("Microsoft YaHei", 10),
+                                            bg="#2c3e50", fg="#f39c12")
+        self.draft_status_label.pack(side=tk.LEFT, padx=10)
+
+        picker_frame = tk.LabelFrame(self, text="第1步：勾选要批量改派的工单（待派/已派）",
+                                      font=("Microsoft YaHei", 11, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        picker_frame.pack(fill=tk.X, padx=10, pady=8)
+
+        picker_inner = tk.Frame(picker_frame, bg="#f5f6fa")
+        picker_inner.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Label(picker_inner, text="状态筛选:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=0, padx=5, pady=5)
+        self.batch_filter_status = ttk.Combobox(picker_inner, values=["待派+已派", "仅待派单", "仅已派单"],
+                                                 state="readonly", width=12, font=("Microsoft YaHei", 10))
+        self.batch_filter_status.set("待派+已派")
+        self.batch_filter_status.grid(row=0, column=1, padx=5, pady=5)
+        self.batch_filter_status.bind("<<ComboboxSelected>>", lambda e: self._refresh_order_picker())
+
+        tk.Button(picker_inner, text="刷新工单列表", font=("Microsoft YaHei", 10),
+                  bg="#3498db", fg="white", width=12,
+                  command=self._refresh_order_picker).grid(row=0, column=2, padx=10, pady=5)
+        tk.Button(picker_inner, text="全选", font=("Microsoft YaHei", 10),
+                  bg="#95a5a6", fg="white", width=8,
+                  command=self._select_all_orders).grid(row=0, column=3, padx=3, pady=5)
+        tk.Button(picker_inner, text="全不选", font=("Microsoft YaHei", 10),
+                  bg="#95a5a6", fg="white", width=8,
+                  command=self._clear_all_orders).grid(row=0, column=4, padx=3, pady=5)
+        tk.Button(picker_inner, text="生成推荐并加入预案", font=("Microsoft YaHei", 10, "bold"),
+                  bg="#27ae60", fg="white", width=18,
+                  command=self._generate_recommendations).grid(row=0, column=5, padx=10, pady=5)
+
+        picker_tree_frame = tk.Frame(picker_inner, bg="#f5f6fa")
+        picker_tree_frame.grid(row=1, column=0, columnspan=6, sticky="we", pady=(4, 0))
+        picker_inner.grid_columnconfigure(0, weight=1)
+
+        p_cols = ("select", "order_id", "title", "category", "priority", "status", "assignee", "location")
+        self.picker_tree = ttk.Treeview(picker_tree_frame, columns=p_cols, show="headings",
+                                         height=6, style="Batch.Treeview")
+        self.picker_tree.heading("select", text="选")
+        self.picker_tree.heading("order_id", text="工单编号")
+        self.picker_tree.heading("title", text="标题")
+        self.picker_tree.heading("category", text="类别")
+        self.picker_tree.heading("priority", text="优先级")
+        self.picker_tree.heading("status", text="状态")
+        self.picker_tree.heading("assignee", text="维修员")
+        self.picker_tree.heading("location", text="位置")
+        for c, w in [("select", 30), ("order_id", 140), ("title", 180), ("category", 80),
+                      ("priority", 60), ("status", 70), ("assignee", 70), ("location", 100)]:
+            self.picker_tree.column(c, width=w, anchor="center")
+        self.picker_tree.column("title", anchor="w")
+        self.picker_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        p_sb = ttk.Scrollbar(picker_tree_frame, orient="vertical", command=self.picker_tree.yview)
+        p_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.picker_tree.configure(yscrollcommand=p_sb.set)
+        self.picker_tree.tag_configure("priority_high", background="#fdedec")
+        self.picker_tree.tag_configure("priority_mid", background="#fef9e7")
+        self.picker_tree.tag_configure("priority_low", background="#eaf2f8")
+        self._configure_tree_tags(self.picker_tree)
+        self._refresh_order_picker()
+
+        detail_frame = tk.LabelFrame(self, text="第2步：调整目标维修员和改派原因（可逐条修改）",
+                                      font=("Microsoft YaHei", 11, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        detail_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        toolbar = tk.Frame(detail_frame, bg="#f5f6fa")
+        toolbar.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(toolbar, text="预案条目:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(side=tk.LEFT)
+        self.items_count_label = tk.Label(toolbar, text="0 条", font=("Microsoft YaHei", 10),
+                                           bg="#f5f6fa", fg="#2980b9")
+        self.items_count_label.pack(side=tk.LEFT, padx=5)
+        tk.Label(toolbar, text="冲突:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(side=tk.LEFT, padx=(15, 0))
+        self.conflicts_count_label = tk.Label(toolbar, text="0 条", font=("Microsoft YaHei", 10),
+                                               bg="#f5f6fa", fg="#e74c3c")
+        self.conflicts_count_label.pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="删除选中条目", font=("Microsoft YaHei", 10),
+                  bg="#e74c3c", fg="white", width=12,
+                  command=self._remove_selected_items).pack(side=tk.RIGHT, padx=3)
+        tk.Button(toolbar, text="检测冲突", font=("Microsoft YaHei", 10),
+                  bg="#f39c12", fg="white", width=10,
+                  command=self._detect_and_show_conflicts).pack(side=tk.RIGHT, padx=3)
+        tk.Button(toolbar, text="清空预案", font=("Microsoft YaHei", 10),
+                  bg="#95a5a6", fg="white", width=10,
+                  command=self._clear_all_items).pack(side=tk.RIGHT, padx=3)
+
+        detail_tree_frame = tk.Frame(detail_frame, bg="#f5f6fa")
+        detail_tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        d_cols = ("order_id", "order_title", "old_assignee", "target_tech", "score",
+                   "risk_warnings", "reason", "conflicts")
+        self.detail_tree = ttk.Treeview(detail_tree_frame, columns=d_cols, show="headings",
+                                         style="Batch.Treeview")
+        for c, text, w in [
+            ("order_id", "工单编号", 130),
+            ("order_title", "标题", 150),
+            ("old_assignee", "原维修员", 80),
+            ("target_tech", "目标维修员*", 100),
+            ("score", "匹配分", 60),
+            ("risk_warnings", "风险提示", 220),
+            ("reason", "改派原因*", 180),
+            ("conflicts", "冲突", 160),
+        ]:
+            self.detail_tree.heading(c, text=text)
+            self.detail_tree.column(c, width=w, anchor="center")
+        self.detail_tree.column("order_title", anchor="w")
+        self.detail_tree.column("risk_warnings", anchor="w")
+        self.detail_tree.column("reason", anchor="w")
+        self.detail_tree.column("conflicts", anchor="w")
+        self.detail_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        d_sb = ttk.Scrollbar(detail_tree_frame, orient="vertical", command=self.detail_tree.yview)
+        d_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.detail_tree.configure(yscrollcommand=d_sb.set)
+        self.detail_tree.tag_configure("conflict", background="#fdecea")
+        self.detail_tree.tag_configure("good", background="#eafaf1")
+        self.detail_tree.tag_configure("partial", background="#fef9e7")
+        self.detail_tree.tag_configure("bad", background="#fdedec")
+        self.detail_tree.bind("<Double-1>", self._on_detail_double_click)
+
+        edit_frame = tk.Frame(detail_frame, bg="#f5f6fa")
+        edit_frame.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(edit_frame, text="选中条目后编辑（双击也可修改）:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=0, padx=3, pady=4)
+        tk.Label(edit_frame, text="目标维修员:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=1, padx=3, pady=4)
+        self.edit_tech_combo = ttk.Combobox(edit_frame, state="readonly", width=14, font=("Microsoft YaHei", 10))
+        self.edit_tech_combo.grid(row=0, column=2, padx=3, pady=4)
+        tk.Label(edit_frame, text="改派原因:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=3, padx=3, pady=4)
+        self.edit_reason_entry = tk.Entry(edit_frame, width=28, font=("Microsoft YaHei", 10))
+        self.edit_reason_entry.grid(row=0, column=4, padx=3, pady=4)
+        tk.Button(edit_frame, text="应用修改", font=("Microsoft YaHei", 10),
+                  bg="#3498db", fg="white", width=10,
+                  command=self._apply_item_edit).grid(row=0, column=5, padx=8, pady=4)
+
+        btn_frame = tk.Frame(self, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        tk.Button(btn_frame, text="关闭", font=("Microsoft YaHei", 11),
+                  bg="#7f8c8d", fg="white", width=10,
+                  command=self.destroy).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="导出结果(CSV)", font=("Microsoft YaHei", 11),
+                  bg="#9b59b6", fg="white", width=13,
+                  command=lambda: self._export_result("csv")).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="导出结果(JSON)", font=("Microsoft YaHei", 11),
+                  bg="#9b59b6", fg="white", width=13,
+                  command=lambda: self._export_result("json")).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="保存预案草稿", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#f39c12", fg="white", width=13,
+                  command=self._on_save_draft).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="提交批量改派", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#27ae60", fg="white", width=13,
+                  command=self._on_submit_batch).pack(side=tk.RIGHT, padx=5)
+
+        result_frame = tk.LabelFrame(self, text="执行结果", font=("Microsoft YaHei", 11, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        result_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.result_text = tk.Text(result_frame, height=5, font=("Microsoft YaHei", 9),
+                                    state=tk.DISABLED, bg="#ffffff", wrap=tk.WORD)
+        self.result_text.pack(fill=tk.X, padx=8, pady=6)
+
+    def _configure_tree_tags(self, tree):
+        tree.tag_configure("good", background="#eafaf1")
+        tree.tag_configure("partial", background="#fef9e7")
+        tree.tag_configure("bad", background="#fdedec")
+
+    def _refresh_order_picker(self):
+        for i in self.picker_tree.get_children():
+            self.picker_tree.delete(i)
+        filter_val = self.batch_filter_status.get()
+        statuses = []
+        if filter_val in ("待派+已派", "仅待派单"):
+            statuses.append(Status.PENDING_DISPATCH)
+        if filter_val in ("待派+已派", "仅已派单"):
+            statuses.append(Status.DISPATCHED)
+        try:
+            orders: List[WorkOrder] = []
+            for s in statuses:
+                orders.extend(self.store.get_orders_by_filter(status=s))
+            orders.sort(key=lambda o: o.created_at, reverse=True)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e), parent=self)
+            return
+        existing_in_draft = {it.order_id for it in self.draft_items}
+        for o in orders:
+            if o.order_id in existing_in_draft:
+                continue
+            tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            self.picker_tree.insert("", tk.END, iid=o.order_id, values=(
+                "", o.order_id, o.title, o.category, o.priority,
+                o.status.value, o.assignee_name or "未指派", o.location,
+            ), tags=(tag,))
+
+    def _select_all_orders(self):
+        for iid in self.picker_tree.get_children():
+            vals = list(self.picker_tree.item(iid, "values"))
+            vals[0] = "✓"
+            self.picker_tree.item(iid, values=vals)
+
+    def _clear_all_orders(self):
+        for iid in self.picker_tree.get_children():
+            vals = list(self.picker_tree.item(iid, "values"))
+            vals[0] = ""
+            self.picker_tree.item(iid, values=vals)
+
+    def _generate_recommendations(self):
+        selected_ids = []
+        for iid in self.picker_tree.get_children():
+            vals = self.picker_tree.item(iid, "values")
+            if vals and vals[0] == "✓":
+                selected_ids.append(iid)
+        if not selected_ids:
+            messagebox.showwarning("提示", "请先勾选要加入预案的工单", parent=self)
+            return
+        try:
+            items = self.store.generate_batch_recommendations(selected_ids, self.dispatcher)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e), parent=self)
+            return
+        existing_ids = {it.order_id for it in self.draft_items}
+        added = 0
+        for it in items:
+            if it.order_id not in existing_ids:
+                self.draft_items.append(it)
+                existing_ids.add(it.order_id)
+                added += 1
+        self._refresh_detail_view()
+        self._refresh_order_picker()
+        self._refresh_edit_combo()
+        messagebox.showinfo("成功", f"已为 {added} 条工单生成推荐，可在下方调整", parent=self)
+
+    def _refresh_edit_combo(self):
+        techs = self.store.get_users_by_role(Role.TECHNICIAN)
+        values = [f"{t.user_id} - {t.name}" for t in techs]
+        self.edit_tech_combo["values"] = values
+
+    def _refresh_detail_view(self):
+        for i in self.detail_tree.get_children():
+            self.detail_tree.delete(i)
+        for idx, it in enumerate(self.draft_items):
+            order = self.store.get_order(it.order_id)
+            order_title = order.title if order else "(已删除)"
+            old_name = ""
+            if it.original_assignee_id:
+                old_user = self.store.get_user(it.original_assignee_id)
+                old_name = old_user.name if old_user else it.original_assignee_id
+            tech = self.store.get_user(it.target_technician_id)
+            tech_label = f"{tech.user_id}-{tech.name}" if tech else it.target_technician_id
+            score = it.match_score or 0
+            if score >= 80:
+                tag = "good"
+            elif score >= 50:
+                tag = "partial"
+            else:
+                tag = "bad"
+            conflict_list = self.conflicts.get(it.order_id, [])
+            conflict_str = ",".join(conflict_list) if conflict_list else ""
+            if conflict_list:
+                tag = "conflict"
+            row_tags = (tag,)
+            self.detail_tree.insert("", tk.END, iid=str(idx), values=(
+                it.order_id, order_title, old_name or "(未指派)",
+                tech_label, score,
+                "; ".join(it.risk_warnings) if it.risk_warnings else (
+                    "推荐" if it.recommended else ""),
+                it.reason, conflict_str,
+            ), tags=row_tags)
+        self.items_count_label.configure(text=f"{len(self.draft_items)} 条")
+        conflict_cnt = len(self.conflicts)
+        self.conflicts_count_label.configure(text=f"{conflict_cnt} 条")
+
+    def _on_detail_double_click(self, event):
+        sel = self.detail_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if idx >= len(self.draft_items):
+            return
+        item = self.draft_items[idx]
+        tech = self.store.get_user(item.target_technician_id)
+        if tech:
+            combo_val = f"{tech.user_id} - {tech.name}"
+            vals = self.edit_tech_combo["values"]
+            if combo_val in vals:
+                self.edit_tech_combo.set(combo_val)
+        self.edit_reason_entry.delete(0, tk.END)
+        self.edit_reason_entry.insert(0, item.reason)
+
+    def _apply_item_edit(self):
+        sel = self.detail_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先在下方列表选中要修改的条目", parent=self)
+            return
+        idx = int(sel[0])
+        if idx >= len(self.draft_items):
+            return
+        tech_val = self.edit_tech_combo.get()
+        if not tech_val:
+            messagebox.showwarning("提示", "请选择目标维修员", parent=self)
+            return
+        tech_id = tech_val.split(" - ")[0]
+        tech = self.store.get_user(tech_id)
+        if tech is None:
+            messagebox.showerror("错误", "目标维修员不存在", parent=self)
+            return
+        if tech.role != Role.TECHNICIAN:
+            messagebox.showerror("错误", "目标必须是维修员", parent=self)
+            return
+        reason = self.edit_reason_entry.get().strip()
+        if not reason:
+            messagebox.showwarning("提示", "请填写改派原因", parent=self)
+            return
+        item = self.draft_items[idx]
+        order = self.store.get_order(item.order_id)
+        new_match = self.store.calculate_match(order, tech) if order else None
+        item.target_technician_id = tech.user_id
+        item.reason = reason
+        item.tech_skills_snapshot = list(tech.skills)
+        item.tech_schedule_snapshot = [ts.to_dict() for ts in tech.time_slots]
+        item.tech_max_parallel_snapshot = tech.max_parallel_orders
+        if new_match:
+            item.risk_warnings = list(new_match.warnings)
+            item.match_score = new_match.score
+            item.recommended = new_match.is_recommended
+        self._refresh_detail_view()
+        messagebox.showinfo("成功", "条目已更新", parent=self)
+
+    def _remove_selected_items(self):
+        sel = self.detail_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择要删除的条目", parent=self)
+            return
+        idxs = sorted([int(s) for s in sel], reverse=True)
+        for idx in idxs:
+            if idx < len(self.draft_items):
+                del self.draft_items[idx]
+        self.conflicts = {}
+        self._refresh_detail_view()
+        self._refresh_order_picker()
+
+    def _clear_all_items(self):
+        if not self.draft_items:
+            return
+        if not messagebox.askyesno("确认", "确定清空预案中的所有条目？", parent=self):
+            return
+        self.draft_items = []
+        self.conflicts = {}
+        self._refresh_detail_view()
+        self._refresh_order_picker()
+
+    def _detect_and_show_conflicts(self):
+        if not self.draft_items:
+            self.conflicts = {}
+            self._refresh_detail_view()
+            messagebox.showinfo("提示", "预案为空", parent=self)
+            return
+        temp_draft = BatchReassignmentDraft(
+            draft_id="_tmp",
+            dispatcher_id=self.dispatcher.user_id,
+            dispatcher_name=self.dispatcher.name,
+            items=list(self.draft_items),
+        )
+        self.conflicts = self.store.detect_batch_conflicts(temp_draft)
+        self._refresh_detail_view()
+        if self.conflicts:
+            conflict_labels = {
+                ConflictType.VERSION_MISMATCH: "版本变更",
+                ConflictType.STATUS_CHANGED: "状态变更",
+                ConflictType.TECHNICIAN_REMOVED: "维修员已删除",
+                ConflictType.TECHNICIAN_ROLE_CHANGED: "维修员角色变更",
+                ConflictType.TECHNICIAN_SKILLS_CHANGED: "技能变更",
+                ConflictType.TECHNICIAN_SCHEDULE_CHANGED: "排班变更",
+                ConflictType.TECHNICIAN_CAPACITY_CHANGED: "容量变更",
+                ConflictType.ORDER_REMOVED: "工单已删除",
+            }
+            parts = []
+            for oid, ctypes in self.conflicts.items():
+                labels = [conflict_labels.get(c, c) for c in ctypes]
+                parts.append(f"  {oid}: {', '.join(labels)}")
+            msg = f"检测到 {len(self.conflicts)} 条冲突:\n" + "\n".join(parts)
+            messagebox.showwarning("冲突检测", msg, parent=self)
+        else:
+            messagebox.showinfo("冲突检测", "未检测到冲突", parent=self)
+
+    def _load_existing_draft(self, draft: BatchReassignmentDraft):
+        self.draft_items = list(draft.items)
+        self.draft_status_label.configure(text=f"已载入预案草稿 {draft.draft_id}（创建于 {draft.created_at}）")
+        self._detect_and_show_conflicts()
+        self._refresh_edit_combo()
+        self._refresh_order_picker()
+
+    def _on_save_draft(self):
+        if not self.draft_items:
+            messagebox.showwarning("提示", "预案为空，无法保存", parent=self)
+            return
+        for it in self.draft_items:
+            if not it.reason or not it.reason.strip():
+                messagebox.showwarning("提示", f"工单 {it.order_id} 的改派原因不能为空", parent=self)
+                return
+            if not it.target_technician_id:
+                messagebox.showwarning("提示", f"工单 {it.order_id} 未指定目标维修员", parent=self)
+                return
+        try:
+            draft_id = self.current_draft.draft_id if self.current_draft else None
+            draft = self.store.save_batch_reassignment_draft(self.dispatcher, self.draft_items, draft_id)
+            self.current_draft = draft
+            self.draft_status_label.configure(text=f"草稿已保存: {draft.draft_id}（更新于 {draft.updated_at}）")
+            messagebox.showinfo("成功", f"批量预案草稿已保存: {draft.draft_id}", parent=self)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("保存失败", str(e), parent=self)
+
+    def _on_submit_batch(self):
+        if not self.draft_items:
+            messagebox.showwarning("提示", "预案为空，无法提交", parent=self)
+            return
+        for it in self.draft_items:
+            if not it.reason or not it.reason.strip():
+                messagebox.showwarning("提示", f"工单 {it.order_id} 的改派原因不能为空", parent=self)
+                return
+            if not it.target_technician_id:
+                messagebox.showwarning("提示", f"工单 {it.order_id} 未指定目标维修员", parent=self)
+                return
+        if not messagebox.askyesno("确认",
+                                    f"确定提交批量改派？共 {len(self.draft_items)} 条。\n单条失败将自动跳过，不影响其他条目。",
+                                    parent=self):
+            return
+        temp_draft = BatchReassignmentDraft(
+            draft_id=self.current_draft.draft_id if self.current_draft else "_submit",
+            dispatcher_id=self.dispatcher.user_id,
+            dispatcher_name=self.dispatcher.name,
+            items=list(self.draft_items),
+        )
+        try:
+            result = self.store.execute_batch_reassignment(temp_draft, self.dispatcher)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("提交失败", str(e), parent=self)
+            return
+        self.last_result = result
+        self._show_result(result)
+        if self.current_draft:
+            refreshed = self.store.get_batch_reassignment_draft(self.current_draft.draft_id, self.dispatcher)
+            if refreshed is None:
+                self.current_draft = None
+                self.draft_status_label.configure(text="所有条目执行成功，草稿已清理")
+            else:
+                self.current_draft = refreshed
+                self.draft_items = list(refreshed.items)
+                self.draft_status_label.configure(
+                    text=f"部分成功，剩余 {len(self.draft_items)} 条草稿（更新于 {refreshed.updated_at}）")
+        else:
+            remaining_ids = {r.order_id for r in result.results if not r.success}
+            self.draft_items = [it for it in self.draft_items if it.order_id in remaining_ids]
+            self.conflicts = {}
+        self._refresh_detail_view()
+        self._refresh_order_picker()
+
+    def _show_result(self, result: BatchReassignmentResult):
+        self.result_text.configure(state=tk.NORMAL)
+        self.result_text.delete("1.0", tk.END)
+        lines = [
+            f"批量改派执行完成  提交人: {result.dispatcher_name}  时间: {result.timestamp}",
+            f"  成功: {result.success_count} 条    跳过: {result.skipped_count} 条    失败: {result.failed_count} 条",
+        ]
+        for r in result.results:
+            status = "✓成功" if r.success else ("⊘跳过" if r.skipped else "✗失败")
+            info = f"  [{status}] {r.order_id} -> {r.target_technician_name or '?'}"
+            if r.error_message:
+                info += f"  原因: {r.error_message}"
+            lines.append(info)
+        lines.append("提示：可使用下方导出按钮导出 CSV/JSON 结果文件")
+        self.result_text.insert(tk.END, "\n".join(lines))
+        self.result_text.configure(state=tk.DISABLED)
+
+    def _export_result(self, fmt: str):
+        if self.last_result is None:
+            messagebox.showwarning("提示", "暂无执行结果可导出，请先提交批量改派", parent=self)
+            return
+        try:
+            if fmt == "json":
+                path = self.store.export_batch_result_json(self.last_result)
+            else:
+                path = self.store.export_batch_result_csv(self.last_result)
+            messagebox.showinfo("导出成功", f"批量改派结果已导出到:\n{path}", parent=self)
+        except (ExportError, WorkOrderError) as e:
+            messagebox.showerror("导出失败", str(e), parent=self)
 
 
 class LoginDialog(tk.Toplevel):
@@ -757,6 +1280,10 @@ class MaintenanceApp:
         btn_frame.pack(fill=tk.X, pady=10)
         tk.Button(btn_frame, text="派工给选中维修员", font=("Microsoft YaHei", 11, "bold"),
                   bg="#3498db", fg="white", width=18, command=self._on_dispatch).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="批量改派预案", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#e67e22", fg="white", width=15, command=self._on_batch_reassign).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="恢复批量草稿", font=("Microsoft YaHei", 10),
+                  bg="#8e44ad", fg="white", width=12, command=self._on_restore_batch_draft).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="刷新列表", font=("Microsoft YaHei", 10),
                   bg="#95a5a6", fg="white", width=12, command=self._refresh_dispatch_orders).pack(side=tk.LEFT, padx=5)
 
@@ -865,6 +1392,89 @@ class MaintenanceApp:
             self._refresh_orders()
         except WorkOrderError as e:
             messagebox.showerror("错误", str(e))
+
+    def _on_batch_reassign(self):
+        try:
+            dlg = BatchReassignDialog(self.root, self.store, self.current_user)
+            self.root.wait_window(dlg)
+            self._refresh_all_tabs()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_restore_batch_draft(self):
+        try:
+            drafts = self.store.get_batch_drafts_by_dispatcher(self.current_user)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        if not drafts:
+            messagebox.showinfo("提示", "您暂未保存任何批量改派预案草稿")
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("恢复批量改派预案草稿")
+        dlg.geometry("560x380")
+        dlg.configure(bg="#f5f6fa")
+        dlg.grab_set()
+        dlg.transient(self.root)
+        tk.Label(dlg, text="选择要恢复的预案草稿（按更新时间倒序）:",
+                 font=("Microsoft YaHei", 11, "bold"), bg="#f5f6fa").pack(anchor="w", padx=15, pady=(15, 5))
+        cols = ("draft_id", "item_count", "created_at", "updated_at")
+        tree = ttk.Treeview(dlg, columns=cols, show="headings", height=10)
+        for c, text, w in [("draft_id", "草稿编号", 180), ("item_count", "条目数", 70),
+                            ("created_at", "创建时间", 150), ("updated_at", "更新时间", 150)]:
+            tree.heading(c, text=text)
+            tree.column(c, width=w, anchor="center")
+        tree.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+        drafts_sorted = sorted(drafts, key=lambda d: d.updated_at, reverse=True)
+        for d in drafts_sorted:
+            tree.insert("", tk.END, iid=d.draft_id, values=(
+                d.draft_id, len(d.items), d.created_at, d.updated_at,
+            ))
+        btn_frame = tk.Frame(dlg, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=15, pady=12)
+
+        def _on_restore():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("提示", "请选择要恢复的草稿", parent=dlg)
+                return
+            draft_id = sel[0]
+            draft = self.store.get_batch_reassignment_draft(draft_id, self.current_user)
+            if draft is None:
+                messagebox.showerror("错误", "草稿不存在或不属于您", parent=dlg)
+                return
+            dlg.destroy()
+            try:
+                batch_dlg = BatchReassignDialog(self.root, self.store, self.current_user, draft)
+                self.root.wait_window(batch_dlg)
+                self._refresh_all_tabs()
+            except WorkOrderError as e:
+                messagebox.showerror("错误", str(e))
+
+        def _on_delete():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("提示", "请选择要删除的草稿", parent=dlg)
+                return
+            draft_id = sel[0]
+            if not messagebox.askyesno("确认", f"确定删除草稿 {draft_id}？", parent=dlg):
+                return
+            deleted = self.store.delete_batch_reassignment_draft(draft_id, self.current_user)
+            if deleted:
+                tree.delete(draft_id)
+                messagebox.showinfo("成功", "草稿已删除", parent=dlg)
+            else:
+                messagebox.showerror("错误", "删除失败", parent=dlg)
+
+        tk.Button(btn_frame, text="取消", font=("Microsoft YaHei", 10),
+                  bg="#7f8c8d", fg="white", width=10,
+                  command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="删除选中", font=("Microsoft YaHei", 10),
+                  bg="#e74c3c", fg="white", width=10,
+                  command=_on_delete).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="恢复选中", font=("Microsoft YaHei", 10, "bold"),
+                  bg="#3498db", fg="white", width=10,
+                  command=_on_restore).pack(side=tk.RIGHT, padx=5)
 
     # ==================== 排班管理 Tab ====================
     def _build_schedule_tab(self):

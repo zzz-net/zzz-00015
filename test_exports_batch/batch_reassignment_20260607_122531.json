@@ -1,0 +1,47 @@
+{
+  "dispatcher_id": "u001",
+  "dispatcher_name": "张调度",
+  "timestamp": "2026-06-07 12:25:31",
+  "success_count": 1,
+  "skipped_count": 2,
+  "failed_count": 0,
+  "results": [
+    {
+      "order_id": "WO20260607122531ABE8",
+      "success": true,
+      "skipped": false,
+      "target_technician_id": "u003",
+      "target_technician_name": "王维修",
+      "reason": "批量改派-调整目标",
+      "error_message": null,
+      "conflict_types": [
+        "technician_skills_changed",
+        "technician_capacity_changed"
+      ]
+    },
+    {
+      "order_id": "WO2026060712253199A9",
+      "success": false,
+      "skipped": true,
+      "target_technician_id": "u003",
+      "target_technician_name": "王维修",
+      "reason": "已派单但未接单可改派",
+      "error_message": "版本冲突：草稿v0 vs 当前v1",
+      "conflict_types": [
+        "version_mismatch"
+      ]
+    },
+    {
+      "order_id": "WO20260607122531785A",
+      "success": false,
+      "skipped": true,
+      "target_technician_id": "u002",
+      "target_technician_name": "李维修",
+      "reason": "待派单可直接改派",
+      "error_message": "状态变更：草稿【待派单】 vs 当前【已完成】",
+      "conflict_types": [
+        "status_changed"
+      ]
+    }
+  ]
+}

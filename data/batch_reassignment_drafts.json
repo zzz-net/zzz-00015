@@ -1,0 +1,67 @@
+[
+  {
+    "draft_id": "BRD202606071225312C63",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "items": [
+      {
+        "order_id": "WO2026060712253199A9",
+        "target_technician_id": "u003",
+        "reason": "已派单但未接单可改派",
+        "order_version": 0,
+        "order_status": "已派单",
+        "original_assignee_id": "u002",
+        "recommended": false,
+        "risk_warnings": [
+          "当前不在可接单时段",
+          "已达负载上限 9/1"
+        ],
+        "match_score": 50,
+        "tech_skills_snapshot": [
+          "水管"
+        ],
+        "tech_schedule_snapshot": [
+          {
+            "day_of_week": 2,
+            "start_time": "08:00",
+            "end_time": "17:00"
+          }
+        ],
+        "tech_max_parallel_snapshot": 1
+      },
+      {
+        "order_id": "WO20260607122531785A",
+        "target_technician_id": "u002",
+        "reason": "待派单可直接改派",
+        "order_version": 0,
+        "order_status": "待派单",
+        "original_assignee_id": null,
+        "recommended": false,
+        "risk_warnings": [
+          "当前不在可接单时段",
+          "已达负载上限 5/5"
+        ],
+        "match_score": 50,
+        "tech_skills_snapshot": [
+          "空调",
+          "电路"
+        ],
+        "tech_schedule_snapshot": [
+          {
+            "day_of_week": 0,
+            "start_time": "08:30",
+            "end_time": "17:30"
+          },
+          {
+            "day_of_week": 1,
+            "start_time": "08:30",
+            "end_time": "17:30"
+          }
+        ],
+        "tech_max_parallel_snapshot": 5
+      }
+    ],
+    "created_at": "2026-06-07 12:25:31",
+    "updated_at": "2026-06-07 12:25:31"
+  }
+]

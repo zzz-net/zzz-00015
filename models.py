@@ -460,6 +460,191 @@ class ReassignmentDraft:
         )
 
 
+class ConflictType(str, Enum):
+    NONE = "none"
+    VERSION_MISMATCH = "version_mismatch"
+    STATUS_CHANGED = "status_changed"
+    TECHNICIAN_REMOVED = "technician_removed"
+    TECHNICIAN_ROLE_CHANGED = "technician_role_changed"
+    TECHNICIAN_SKILLS_CHANGED = "technician_skills_changed"
+    TECHNICIAN_SCHEDULE_CHANGED = "technician_schedule_changed"
+    TECHNICIAN_CAPACITY_CHANGED = "technician_capacity_changed"
+    ORDER_REMOVED = "order_removed"
+
+
+class BatchDraftItem:
+    def __init__(
+        self,
+        order_id: str,
+        target_technician_id: str,
+        reason: str,
+        order_version: int,
+        order_status: str,
+        original_assignee_id: Optional[str] = None,
+        recommended: bool = False,
+        risk_warnings: Optional[List[str]] = None,
+        match_score: Optional[int] = None,
+        tech_skills_snapshot: Optional[List[str]] = None,
+        tech_schedule_snapshot: Optional[List[Dict]] = None,
+        tech_max_parallel_snapshot: Optional[int] = None,
+    ):
+        self.order_id = order_id
+        self.target_technician_id = target_technician_id
+        self.reason = reason
+        self.order_version = order_version
+        self.order_status = order_status
+        self.original_assignee_id = original_assignee_id
+        self.recommended = recommended
+        self.risk_warnings = risk_warnings or []
+        self.match_score = match_score
+        self.tech_skills_snapshot = tech_skills_snapshot or []
+        self.tech_schedule_snapshot = tech_schedule_snapshot or []
+        self.tech_max_parallel_snapshot = tech_max_parallel_snapshot
+
+    def to_dict(self) -> Dict:
+        return {
+            "order_id": self.order_id,
+            "target_technician_id": self.target_technician_id,
+            "reason": self.reason,
+            "order_version": self.order_version,
+            "order_status": self.order_status,
+            "original_assignee_id": self.original_assignee_id,
+            "recommended": self.recommended,
+            "risk_warnings": self.risk_warnings,
+            "match_score": self.match_score,
+            "tech_skills_snapshot": self.tech_skills_snapshot,
+            "tech_schedule_snapshot": self.tech_schedule_snapshot,
+            "tech_max_parallel_snapshot": self.tech_max_parallel_snapshot,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "BatchDraftItem":
+        return cls(
+            data["order_id"],
+            data["target_technician_id"],
+            data["reason"],
+            data["order_version"],
+            data["order_status"],
+            data.get("original_assignee_id"),
+            data.get("recommended", False),
+            data.get("risk_warnings", []),
+            data.get("match_score"),
+            data.get("tech_skills_snapshot", []),
+            data.get("tech_schedule_snapshot", []),
+            data.get("tech_max_parallel_snapshot"),
+        )
+
+
+class BatchReassignmentDraft:
+    def __init__(
+        self,
+        draft_id: str,
+        dispatcher_id: str,
+        dispatcher_name: str,
+        items: Optional[List[BatchDraftItem]] = None,
+        created_at: Optional[str] = None,
+        updated_at: Optional[str] = None,
+    ):
+        self.draft_id = draft_id
+        self.dispatcher_id = dispatcher_id
+        self.dispatcher_name = dispatcher_name
+        self.items = items or []
+        self.created_at = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.updated_at = updated_at or self.created_at
+
+    def to_dict(self) -> Dict:
+        return {
+            "draft_id": self.draft_id,
+            "dispatcher_id": self.dispatcher_id,
+            "dispatcher_name": self.dispatcher_name,
+            "items": [item.to_dict() for item in self.items],
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "BatchReassignmentDraft":
+        return cls(
+            data["draft_id"],
+            data["dispatcher_id"],
+            data["dispatcher_name"],
+            [BatchDraftItem.from_dict(i) for i in data.get("items", [])],
+            data.get("created_at"),
+            data.get("updated_at"),
+        )
+
+
+class BatchItemResult:
+    def __init__(
+        self,
+        order_id: str,
+        success: bool,
+        skipped: bool = False,
+        target_technician_id: Optional[str] = None,
+        target_technician_name: Optional[str] = None,
+        reason: Optional[str] = None,
+        error_message: Optional[str] = None,
+        conflict_types: Optional[List[str]] = None,
+    ):
+        self.order_id = order_id
+        self.success = success
+        self.skipped = skipped
+        self.target_technician_id = target_technician_id
+        self.target_technician_name = target_technician_name
+        self.reason = reason
+        self.error_message = error_message
+        self.conflict_types = conflict_types or []
+
+    def to_dict(self) -> Dict:
+        return {
+            "order_id": self.order_id,
+            "success": self.success,
+            "skipped": self.skipped,
+            "target_technician_id": self.target_technician_id,
+            "target_technician_name": self.target_technician_name,
+            "reason": self.reason,
+            "error_message": self.error_message,
+            "conflict_types": self.conflict_types,
+        }
+
+
+class BatchReassignmentResult:
+    def __init__(
+        self,
+        dispatcher_id: str,
+        dispatcher_name: str,
+        timestamp: Optional[str] = None,
+        results: Optional[List[BatchItemResult]] = None,
+    ):
+        self.dispatcher_id = dispatcher_id
+        self.dispatcher_name = dispatcher_name
+        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.results = results or []
+
+    @property
+    def success_count(self) -> int:
+        return sum(1 for r in self.results if r.success)
+
+    @property
+    def skipped_count(self) -> int:
+        return sum(1 for r in self.results if r.skipped)
+
+    @property
+    def failed_count(self) -> int:
+        return sum(1 for r in self.results if not r.success and not r.skipped)
+
+    def to_dict(self) -> Dict:
+        return {
+            "dispatcher_id": self.dispatcher_id,
+            "dispatcher_name": self.dispatcher_name,
+            "timestamp": self.timestamp,
+            "success_count": self.success_count,
+            "skipped_count": self.skipped_count,
+            "failed_count": self.failed_count,
+            "results": [r.to_dict() for r in self.results],
+        }
+
+
 class AppConfig:
     def __init__(self, export_dir: str = ""):
         self.export_dir = export_dir
