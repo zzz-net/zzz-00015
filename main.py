@@ -66,6 +66,7 @@ class ReassignDialog(tk.Toplevel):
         self._try_load_draft()
 
     def _build_ui(self):
+        self._loaded_draft = None
         style = ttk.Style()
         style.configure("Reassign.Treeview", rowheight=28, font=("Microsoft YaHei", 9))
         style.configure("Reassign.Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
@@ -160,6 +161,7 @@ class ReassignDialog(tk.Toplevel):
             ), tags=(tag,))
 
     def _try_load_draft(self):
+        self._loaded_draft = None
         draft = self.store.get_reassignment_draft(self.order.order_id, self.dispatcher)
         if draft is None:
             return
@@ -175,6 +177,7 @@ class ReassignDialog(tk.Toplevel):
         )
         self.draft_info_label.grid()
         self.clear_draft_btn.pack(side=tk.RIGHT, padx=5)
+        self._loaded_draft = draft
 
     def _on_save_draft(self):
         selection = self.tree.selection()
@@ -188,10 +191,11 @@ class ReassignDialog(tk.Toplevel):
             return
         try:
             new_tech = self.store.get_user(new_tech_id)
-            self.store.save_reassignment_draft(self.order.order_id, self.dispatcher, new_tech, reason)
+            draft = self.store.save_reassignment_draft(self.order.order_id, self.dispatcher, new_tech, reason)
+            self._loaded_draft = draft
             messagebox.showinfo("成功", "改派草稿已保存", parent=self)
             self.draft_info_label.configure(
-                text=f"改派草稿已保存（目标: {new_tech.name}）"
+                text=f"改派草稿已保存（目标: {new_tech.name}，原工单版本 v{draft.order_version}）"
             )
             self.draft_info_label.grid()
             self.clear_draft_btn.pack(side=tk.RIGHT, padx=5)
@@ -207,6 +211,7 @@ class ReassignDialog(tk.Toplevel):
             self.clear_draft_btn.pack_forget()
             self.reason_text.delete("1.0", tk.END)
             self.tree.selection_remove(self.tree.selection())
+            self._loaded_draft = None
             messagebox.showinfo("成功", "草稿已清除", parent=self)
 
     def _on_confirm(self):
@@ -224,29 +229,57 @@ class ReassignDialog(tk.Toplevel):
             if not fresh_order:
                 messagebox.showerror("错误", "工单不存在", parent=self)
                 return
+
+            expected_version = (
+                self._loaded_draft.order_version
+                if self._loaded_draft is not None
+                else self.order.version
+            )
+
+            if self._loaded_draft is not None and self._loaded_draft.order_version != fresh_order.version:
+                messagebox.showerror("并发冲突",
+                    f"草稿是基于工单旧版本 v{self._loaded_draft.order_version} 创建的，"
+                    f"当前工单已被其他人改动至 v{fresh_order.version}。\n"
+                    f"本次改派已被拦截，工单数据未被覆盖，草稿和现场输入已保留，请刷新后再试。",
+                    parent=self)
+                return
+
             allowed, msg = self.store.can_reassign(fresh_order, self.dispatcher)
             if not allowed:
                 messagebox.showerror("无法改派",
-                    f"工单当前状态已变更，不能改派：{msg}\n改派草稿已保留，请刷新后再试。",
+                    f"工单当前状态已变更，不能改派：{msg}\n"
+                    f"改派草稿和现场输入已保留，请刷新后再试。",
                     parent=self)
                 return
+
             new_tech = self.store.get_user(new_tech_id)
+            if new_tech is None:
+                messagebox.showerror("错误",
+                    "目标维修员不存在，可能已被删除。草稿和现场输入已保留。",
+                    parent=self)
+                return
+            if new_tech.role != Role.TECHNICIAN:
+                messagebox.showerror("错误",
+                    f"目标用户【{new_tech.name}】已不是维修员。草稿和现场输入已保留。",
+                    parent=self)
+                return
+
             self.store.reassign_order(fresh_order.order_id, new_tech, self.dispatcher,
-                                       reason, self.order.version)
+                                       reason, expected_version)
             self.result = True
             messagebox.showinfo("成功", f"工单已改派给 {new_tech.name}", parent=self)
             self.destroy()
         except ConcurrentOperationError as e:
             messagebox.showerror("并发冲突",
-                f"{str(e)}\n改派草稿已保留，请刷新工单后再试。",
+                f"{str(e)}\n改派草稿和现场输入已保留，请刷新工单后再试。",
                 parent=self)
         except PermissionError as e:
             messagebox.showerror("权限不足",
-                f"{str(e)}\n改派草稿已保留。",
+                f"{str(e)}\n改派草稿和现场输入已保留。",
                 parent=self)
         except WorkOrderError as e:
             messagebox.showerror("错误",
-                f"{str(e)}\n改派草稿已保留。",
+                f"{str(e)}\n改派草稿和现场输入已保留。",
                 parent=self)
 
 

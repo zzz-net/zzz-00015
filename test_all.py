@@ -1251,6 +1251,80 @@ def test_reassignment_drafts_conflicts(store):
     except WorkOrderError as e:
         print_ok(f"不存在工单保存草稿被拒绝（符合预期）: {e}")
 
+    data_dir = store.data_dir
+
+    order_restart = store.create_order("重启草稿版本冲突", "", "RST栋", "水管维修", "高", dispatcher)
+    store.dispatch_order(order_restart.order_id, tech1, dispatcher)
+    order_restart_v1 = store.get_order(order_restart.order_id).version
+    store.save_reassignment_draft(order_restart.order_id, dispatcher, tech2, "草稿保存时是v1")
+    saved_v1_draft = store.get_reassignment_draft(order_restart.order_id, dispatcher)
+    assert saved_v1_draft.order_version == order_restart_v1
+    print_ok(f"保存草稿: 工单版本 v{order_restart_v1}")
+
+    drafts_path = os.path.join(data_dir, "reassignment_drafts.json")
+    with open(drafts_path, "r", encoding="utf-8") as f:
+        raw_drafts_before = json.load(f)
+    stale_draft = None
+    for d in raw_drafts_before:
+        if d["order_id"] == order_restart.order_id:
+            stale_draft = d.copy()
+            stale_draft["order_version"] = order_restart_v1
+    assert stale_draft is not None
+    stale_draft["target_technician_id"] = tech1.user_id
+    stale_draft["reason"] = "手动回写的旧版本v1草稿"
+    print_ok(f"提前备份草稿原始内容，旧版本号锁定为 v{order_restart_v1}")
+
+    order_restart_obj = store.get_order(order_restart.order_id)
+    store.reassign_order(order_restart.order_id, tech2, dispatcher, "他人抢先改派",
+                          expected_version=order_restart_obj.version)
+    order_restart_v2 = store.get_order(order_restart.order_id).version
+    assert order_restart_v2 > order_restart_v1
+    print_ok(f"模拟他人抢先改派: 工单版本从 v{order_restart_v1} 升级到 v{order_restart_v2}")
+
+    other_drafts = [d for d in raw_drafts_before if d["order_id"] != order_restart.order_id]
+    other_drafts.append(stale_draft)
+    with open(drafts_path, "w", encoding="utf-8") as f:
+        json.dump(other_drafts, f, ensure_ascii=False, indent=2)
+    print_ok(f"手动模拟跨重启回写: 草稿版本保留在 v{order_restart_v1}，工单已升级到 v{order_restart_v2}")
+
+    import gc as _gc
+    del store
+    _gc.collect()
+    store_restarted = DataStore(data_dir)
+    dispatcher_r = store_restarted.get_user("u001")
+    tech1_r = store_restarted.get_user("u002")
+
+    restored_stale = store_restarted.get_reassignment_draft(order_restart.order_id, dispatcher_r)
+    assert restored_stale is not None, "跨重启后旧草稿未恢复"
+    assert restored_stale.order_version == order_restart_v1, f"旧草稿版本不对: {restored_stale.order_version}"
+    current_order_r = store_restarted.get_order(order_restart.order_id)
+    assert current_order_r.version == order_restart_v2, f"当前工单版本不对: {current_order_r.version}"
+    print_ok(f"跨重启恢复: 草稿v{restored_stale.order_version} vs 工单v{current_order_r.version}")
+
+    logs_before = len(store_restarted.get_reassignment_logs(order_restart.order_id))
+    try:
+        store_restarted.reassign_order(order_restart.order_id, tech1_r, dispatcher_r,
+                                       "基于旧草稿v1尝试再次改派",
+                                       expected_version=restored_stale.order_version)
+        print_fail("基于旧版本草稿的改派居然通过了版本校验！")
+        assert False
+    except ConcurrentOperationError as e:
+        print_ok(f"DataStore层旧草稿版本冲突拦截成功（符合预期）: {e}")
+
+    logs_after = len(store_restarted.get_reassignment_logs(order_restart.order_id))
+    assert logs_after == logs_before, "版本冲突时不应该写入新的改派日志"
+    print_ok(f"版本冲突时未写入改派日志: 日志数量保持 {logs_before} 条")
+
+    draft_after_conflict = store_restarted.get_reassignment_draft(order_restart.order_id, dispatcher_r)
+    assert draft_after_conflict is not None, "版本冲突时不应该清理草稿"
+    assert draft_after_conflict.order_version == order_restart_v1
+    print_ok("版本冲突时草稿保留，未被清理")
+
+    order_after_conflict = store_restarted.get_order(order_restart.order_id)
+    assert order_after_conflict.assignee_id == tech2.user_id, "版本冲突时工单不应被改动"
+    assert order_after_conflict.version == order_restart_v2, "版本冲突时版本号不应变化"
+    print_ok(f"版本冲突时工单数据未被覆盖: 维修员={order_after_conflict.assignee_name}, 版本=v{order_after_conflict.version}")
+
 
 def test_gui_reassign_drafts():
     print_title("测试19: GUI 改派草稿功能回归（自动载入、清除、冲突保留草稿）")
@@ -1385,14 +1459,128 @@ def test_gui_reassign_drafts():
         root.update()
         assert len(captured["showerror"]) >= 1, "状态变更冲突未弹错误提示"
         last_err_title, last_err_msg = captured["showerror"][-1]
-        assert "草稿已保留" in last_err_msg, f"错误提示未说明草稿保留, 消息='{last_err_msg}'"
+        assert "草稿" in last_err_msg and "保留" in last_err_msg, \
+            f"错误提示未说明草稿保留, 消息='{last_err_msg}'"
         print_ok(f"状态变更冲突: 错误提示包含草稿保留说明 - '{last_err_title}'")
 
         draft_after_failed_confirm = store.get_reassignment_draft(order2.order_id, dispatcher)
         assert draft_after_failed_confirm is not None, "冲突提交失败后草稿被误删"
         print_ok("冲突提交失败后草稿保留")
 
-        print_ok("GUI 改派草稿功能全部验证通过（自动载入、清除、冲突保留）")
+        order3 = store.create_order("GUI版本冲突草稿测试", "", "GUIVC栋", "空调维修", "高", dispatcher)
+        store.dispatch_order(order3.order_id, tech1, dispatcher)
+        order3_v1 = store.get_order(order3.order_id).version
+        store.save_reassignment_draft(order3.order_id, dispatcher, tech2, "GUI版本冲突草稿v1")
+        assert store.get_reassignment_draft(order3.order_id, dispatcher).order_version == order3_v1
+        print_ok(f"GUI版本冲突测试: 保存草稿时工单版本 v{order3_v1}")
+
+        drafts_path_gui = os.path.join(gui_data_dir, "reassignment_drafts.json")
+        with open(drafts_path_gui, "r", encoding="utf-8") as f:
+            raw_gui_before = json.load(f)
+        stale_gui_draft = None
+        for d in raw_gui_before:
+            if d["order_id"] == order3.order_id:
+                stale_gui_draft = d.copy()
+                stale_gui_draft["order_version"] = order3_v1
+                stale_gui_draft["target_technician_id"] = tech1.user_id
+                stale_gui_draft["reason"] = "手动回写GUI测试旧版本草稿v1"
+        assert stale_gui_draft is not None
+        print_ok("提前备份 GUI 草稿原始内容")
+
+        order3_obj = store.get_order(order3.order_id)
+        store.reassign_order(order3.order_id, tech2, dispatcher, "他人抢先改派",
+                              expected_version=order3_obj.version)
+        order3_v2 = store.get_order(order3.order_id).version
+        assert order3_v2 > order3_v1
+        print_ok(f"他人抢先改派: 工单版本 v{order3_v1} → v{order3_v2}")
+
+        other_gui_drafts = [d for d in raw_gui_before if d["order_id"] != order3.order_id]
+        other_gui_drafts.append(stale_gui_draft)
+        with open(drafts_path_gui, "w", encoding="utf-8") as f:
+            json.dump(other_gui_drafts, f, ensure_ascii=False, indent=2)
+        store._load_reassignment_drafts()
+        stale_draft_gui = store.get_reassignment_draft(order3.order_id, dispatcher)
+        assert stale_draft_gui is not None
+        assert stale_draft_gui.order_version == order3_v1
+        print_ok(f"模拟跨重启恢复旧草稿: 草稿v{stale_draft_gui.order_version}, 工单v{store.get_order(order3.order_id).version}")
+
+        captured["showerror"].clear()
+        order3_fresh = store.get_order(order3.order_id)
+        dlg3 = ReassignDialog(root, store, dispatcher, order3_fresh)
+        root.update()
+
+        assert dlg3._loaded_draft is not None, "GUI 载入草稿后 _loaded_draft 应为非空"
+        assert dlg3._loaded_draft.order_version == order3_v1
+        print_ok("GUI 已正确载入旧版本草稿（_loaded_draft 缓存正确）")
+
+        dlg3._on_confirm()
+        root.update()
+        assert len(captured["showerror"]) >= 1, "旧草稿版本冲突 GUI 未弹错误提示"
+        last_vc_title, last_vc_msg = captured["showerror"][-1]
+        assert "并发冲突" in last_vc_title
+        assert "草稿和现场输入已保留" in last_vc_msg
+        assert "工单数据未被覆盖" in last_vc_msg
+        print_ok(f"GUI层版本冲突拦截成功: 标题='{last_vc_title}'")
+
+        logs_vc = store.get_reassignment_logs(order3.order_id)
+        assert len(logs_vc) == 1, f"版本冲突时不应追加日志, 实际有 {len(logs_vc)} 条"
+        print_ok(f"GUI层版本冲突: 改派日志未被写入（仍为 {len(logs_vc)} 条）")
+
+        draft_vc = store.get_reassignment_draft(order3.order_id, dispatcher)
+        assert draft_vc is not None, "GUI版本冲突时草稿应保留"
+        assert draft_vc.order_version == order3_v1
+        print_ok("GUI层版本冲突: 草稿保留未清理")
+
+        order_vc = store.get_order(order3.order_id)
+        assert order_vc.assignee_id == tech2.user_id, "GUI版本冲突时工单数据不应被覆盖"
+        assert order_vc.version == order3_v2
+        print_ok(f"GUI层版本冲突: 工单数据未被覆盖（维修员={order_vc.assignee_name}, 版本=v{order_vc.version}）")
+
+        assert dlg3.winfo_exists(), "GUI版本冲突时对话框不应关闭，保留现场输入"
+        assert dlg3.result is None, "GUI版本冲突时 result 不应被设置"
+        print_ok("GUI层版本冲突: 对话框保留，现场输入未清空")
+        dlg3.destroy()
+
+        order4 = store.create_order("GUI成功改派测试", "", "GUISUC栋", "空调维修", "高", dispatcher)
+        store.dispatch_order(order4.order_id, tech1, dispatcher)
+        store.save_reassignment_draft(order4.order_id, dispatcher, tech2, "成功改派草稿")
+        logs_before_suc = len(store.get_reassignment_logs(order4.order_id))
+        draft_before_suc = store.get_reassignment_draft(order4.order_id, dispatcher)
+        assert draft_before_suc is not None
+        print_ok(f"GUI成功改派: 草稿存在, 当前日志 {logs_before_suc} 条")
+
+        captured["showerror"].clear()
+        captured["showinfo"].clear()
+        order4_fresh = store.get_order(order4.order_id)
+        dlg4 = ReassignDialog(root, store, dispatcher, order4_fresh)
+        root.update()
+        dlg4._on_confirm()
+        root.update()
+
+        assert len(captured["showinfo"]) >= 1, "成功改派未弹成功提示"
+        suc_title, suc_msg = captured["showinfo"][-1]
+        assert "成功" in suc_title
+        print_ok(f"GUI成功改派: 成功提示弹出='{suc_title}'")
+
+        logs_after_suc = store.get_reassignment_logs(order4.order_id)
+        assert len(logs_after_suc) == logs_before_suc + 1, "成功改派应写入一条新日志"
+        last_log = logs_after_suc[-1]
+        assert last_log.to_user_id == tech2.user_id
+        assert last_log.from_user_id == tech1.user_id
+        assert last_log.dispatcher_id == dispatcher.user_id
+        assert last_log.reason == "成功改派草稿"
+        print_ok(f"GUI成功改派: 改派日志已写入 - 从 {last_log.from_user_name} 到 {last_log.to_user_name}, 调度员={last_log.dispatcher_name}, 原因='{last_log.reason}'")
+
+        draft_after_suc = store.get_reassignment_draft(order4.order_id, dispatcher)
+        assert draft_after_suc is None, "成功改派后草稿应自动清理"
+        print_ok("GUI成功改派: 对应草稿已自动清理")
+
+        order4_final = store.get_order(order4.order_id)
+        assert order4_final.assignee_id == tech2.user_id
+        assert order4_final.assignee_name == tech2.name
+        print_ok(f"GUI成功改派: 工单已更新 - 维修员={order4_final.assignee_name}")
+
+        print_ok("GUI 改派草稿功能全部验证通过（自动载入、清除、版本冲突拦截、状态不可改派拦截、成功改派日志+草稿清理）")
 
     finally:
         messagebox.showerror = orig_showerror
