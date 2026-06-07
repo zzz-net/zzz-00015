@@ -1294,11 +1294,11 @@ class MaintenanceApp:
                                       bg="#f5f6fa", fg="#2c3e50")
         export_frame.pack(fill=tk.BOTH, expand=True)
 
+        row = 0
         self.export_filtered_var = tk.BooleanVar(value=False)
         tk.Checkbutton(export_frame, text="仅导出当前工单列表筛选结果", variable=self.export_filtered_var,
-                       font=("Microsoft YaHei", 10), bg="#f5f6fa").pack(anchor="w", padx=10, pady=8)
-
-        row = 0
+                       font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=8, columnspan=2)
+        row += 1
         tk.Label(export_frame, text="工单数据:", font=("Microsoft YaHei", 10, "bold"),
                  bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=5, columnspan=2)
         row += 1

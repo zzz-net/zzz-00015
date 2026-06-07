@@ -907,6 +907,171 @@ def test_persistence_extended(store):
     return store2
 
 
+def test_gui_startup_and_tabs():
+    print_title("测试16: GUI 启动与页面切换回归（导入导出 TclError 修复）")
+
+    import tkinter as tk
+    from tkinter import messagebox
+
+    gui_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_test_data")
+    if os.path.exists(gui_data_dir):
+        shutil.rmtree(gui_data_dir)
+    gui_export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_test_exports")
+    if os.path.exists(gui_export_dir):
+        shutil.rmtree(gui_export_dir)
+
+    captured = {"showerror": [], "showinfo": [], "showwarning": []}
+
+    def fake_showerror(title, msg):
+        captured["showerror"].append((title, msg))
+
+    def fake_showinfo(title, msg):
+        captured["showinfo"].append((title, msg))
+
+    def fake_showwarning(title, msg):
+        captured["showwarning"].append((title, msg))
+
+    orig_showerror = messagebox.showerror
+    orig_showinfo = messagebox.showinfo
+    orig_showwarning = messagebox.showwarning
+    messagebox.showerror = fake_showerror
+    messagebox.showinfo = fake_showinfo
+    messagebox.showwarning = fake_showwarning
+
+    root = None
+    try:
+        store = DataStore(gui_data_dir)
+        store.set_export_dir(gui_export_dir)
+        dispatcher = store.get_user("u001")
+        assert dispatcher.role == Role.DISPATCHER
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+
+        from main import MaintenanceApp
+        app = MaintenanceApp.__new__(MaintenanceApp)
+        app.root = root
+        app.store = store
+        app.current_user = dispatcher
+        app._configure_styles()
+
+        try:
+            app._build_main_ui()
+        except tk.TclError as e:
+            print_fail(f"GUI 启动时抛出 TclError: {e}")
+            raise
+
+        print_ok(f"调度员主界面构建成功，无 TclError")
+        root.update()
+
+        tab_count = app.notebook.index("end")
+        assert tab_count == 5, f"调度员应有 5 个 Tab，实际 {tab_count}"
+        print_ok(f"调度员 Tab 数量正确: {tab_count} 个")
+
+        expected_tabs = ["工单列表", "历史记录", "调度派工", "排班管理", "导入导出"]
+        actual_tabs = [app.notebook.tab(i, "text") for i in range(tab_count)]
+        for t in expected_tabs:
+            assert t in actual_tabs, f"缺少 Tab: {t}"
+        print_ok(f"所有预期 Tab 存在: {actual_tabs}")
+
+        for i, tab_name in enumerate(actual_tabs):
+            app.notebook.select(i)
+            root.update()
+            print_ok(f"切换 Tab 成功: {tab_name}")
+
+        app.notebook.select(4)
+        root.update()
+        assert hasattr(app, "export_log"), "导入导出页缺少 export_log 控件"
+        assert hasattr(app, "export_dir_label"), "导入导出页缺少 export_dir_label 控件"
+        print_ok("导入导出页控件创建正常: export_log、export_dir_label 存在")
+
+        app._on_export_orders("json")
+        root.update()
+        assert len(captured["showinfo"]) >= 1, "导出 JSON 未弹出成功提示"
+        json_files = [f for f in os.listdir(gui_export_dir) if f.endswith(".json") and "work_orders" in f]
+        assert len(json_files) >= 1, "未找到导出的工单 JSON 文件"
+        print_ok(f"工单 JSON 导出成功: {json_files[-1]}")
+
+        app._on_export_techs("csv")
+        root.update()
+        csv_files = [f for f in os.listdir(gui_export_dir) if f.endswith(".csv") and "technicians" in f]
+        assert len(csv_files) >= 1, "未找到导出的维修员 CSV 文件"
+        print_ok(f"维修员 CSV 导出成功: {csv_files[-1]}")
+
+        bad_csv = os.path.join(gui_data_dir, "bad_techs.csv")
+        with open(bad_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["user_id", "skills", "max_parallel_orders", "time_slots"])
+            writer.writerow(["u002", "空调|空调", "2", "周一 18:00-09:00"])
+        before_skills = list(store.get_user("u002").skills)
+        before_max = store.get_user("u002").max_parallel_orders
+        before_slots = [s.to_dict() for s in store.get_user("u002").time_slots]
+        captured["showerror"].clear()
+        captured["showinfo"].clear()
+
+        import main as main_mod
+        orig_askopen = main_mod.filedialog.askopenfilename
+        try:
+            main_mod.filedialog.askopenfilename = lambda **kw: bad_csv
+            app._on_import_techs()
+            root.update()
+        finally:
+            main_mod.filedialog.askopenfilename = orig_askopen
+
+        after_skills = list(store.get_user("u002").skills)
+        after_max = store.get_user("u002").max_parallel_orders
+        after_slots = [s.to_dict() for s in store.get_user("u002").time_slots]
+        assert before_skills == after_skills, f"非法导入污染了技能: {before_skills} -> {after_skills}"
+        assert before_max == after_max, f"非法导入污染了最大并行数: {before_max} -> {after_max}"
+        assert before_slots == after_slots, f"非法导入污染了时段: {before_slots} -> {after_slots}"
+        assert len(captured["showinfo"]) >= 1 or len(captured["showerror"]) >= 1
+        last_msg = captured["showinfo"][-1][1] if captured["showinfo"] else captured["showerror"][-1][1]
+        assert "失败" in last_msg or "0 条" in last_msg, f"非法导入应报告失败，实际消息: {last_msg}"
+        print_ok(f"非法排班 CSV 导入被正确拒绝，未污染数据。提示: {last_msg[:60]}")
+
+        app.notebook.select(3)
+        root.update()
+        assert hasattr(app, "schedule_tech_combo"), "排班页缺少 schedule_tech_combo"
+        assert hasattr(app, "skills_listbox"), "排班页缺少 skills_listbox"
+        assert hasattr(app, "slots_listbox"), "排班页缺少 slots_listbox"
+        print_ok("排班管理页控件创建正常")
+
+        app.notebook.select(2)
+        root.update()
+        assert hasattr(app, "dispatch_order_tree"), "调度派工页缺少 dispatch_order_tree"
+        assert hasattr(app, "match_tree"), "调度派工页缺少 match_tree"
+        print_ok("调度派工页控件创建正常（匹配度表格存在）")
+
+        app.notebook.select(0)
+        root.update()
+        assert hasattr(app, "orders_tree"), "工单列表页缺少 orders_tree"
+        print_ok("工单列表页控件创建正常")
+
+        app.notebook.select(1)
+        root.update()
+        assert hasattr(app, "history_tree"), "历史记录页缺少 history_tree"
+        assert hasattr(app, "reassign_tree"), "历史记录页缺少 reassign_tree"
+        print_ok("历史记录页控件创建正常（含改派记录表）")
+
+        print_ok("GUI 全页面切换、导出、非法导入拒绝 全部验证通过，无 TclError")
+        return store
+
+    finally:
+        messagebox.showerror = orig_showerror
+        messagebox.showinfo = orig_showinfo
+        messagebox.showwarning = orig_showwarning
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        if os.path.exists(gui_data_dir):
+            shutil.rmtree(gui_data_dir)
+        if os.path.exists(gui_export_dir):
+            shutil.rmtree(gui_export_dir)
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -929,6 +1094,7 @@ def main():
         test_enhanced_exports(store)
         store = test_persistence(store)
         store = test_persistence_extended(store)
+        test_gui_startup_and_tabs()
 
         print_title("全部测试通过")
         print("""
@@ -948,6 +1114,7 @@ def main():
  13. 维修员排班CSV导入：合法数据导入成功，非法数据全部拒绝且不污染
  14. 增强导出：JSON/CSV含排班、负载、改派历史
  15. 扩展持久化：排班/技能/改派记录跨重启完全一致
+ 16. GUI 回归：调度员启动、5个Tab切换、导出JSON/CSV、非法导入拒绝、无TclError
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")
