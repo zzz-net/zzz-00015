@@ -38,9 +38,9 @@ REASSIGNABLE_STATUSES = {
 
 
 ROLE_PERMISSIONS = {
-    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule", "manage_spare_parts", "review_spare_part_requests", "import_spare_parts", "export_spare_parts"],
-    Role.TECHNICIAN: ["accept", "complete", "view_history", "request_spare_parts", "view_own_spare_part_requests", "view_spare_parts_stock"],
-    Role.INSPECTOR: ["approve", "reject", "view_history", "export"],
+    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule", "manage_spare_parts", "review_spare_part_requests", "import_spare_parts", "export_spare_parts", "create_reschedule", "cancel_reschedule", "view_reschedules", "import_reschedules", "export_reschedules", "confirm_arrival", "view_arrivals"],
+    Role.TECHNICIAN: ["accept", "complete", "view_history", "request_spare_parts", "view_own_spare_part_requests", "view_spare_parts_stock", "confirm_reschedule", "view_own_reschedules", "confirm_arrival", "view_own_arrivals"],
+    Role.INSPECTOR: ["approve", "reject", "view_history", "export", "view_reschedules"],
 }
 
 
@@ -337,6 +337,8 @@ class WorkOrder:
         exception_notes: Optional[List[str]] = None,
         reassignment_logs: Optional[List[ReassignmentLog]] = None,
         version: int = 0,
+        scheduled_start: Optional[str] = None,
+        scheduled_end: Optional[str] = None,
     ):
         self.order_id = order_id
         self.title = title
@@ -354,6 +356,8 @@ class WorkOrder:
         self.exception_notes = exception_notes or []
         self.reassignment_logs = reassignment_logs or []
         self.version = version
+        self.scheduled_start = scheduled_start
+        self.scheduled_end = scheduled_end
         self._lock = threading.Lock()
 
         if not self.history:
@@ -385,6 +389,8 @@ class WorkOrder:
             "exception_notes": self.exception_notes,
             "reassignment_logs": [r.to_dict() for r in self.reassignment_logs],
             "version": self.version,
+            "scheduled_start": self.scheduled_start,
+            "scheduled_end": self.scheduled_end,
         }
 
     @classmethod
@@ -406,6 +412,8 @@ class WorkOrder:
         order.exception_notes = data.get("exception_notes", [])
         order.reassignment_logs = [ReassignmentLog.from_dict(r) for r in data.get("reassignment_logs", [])]
         order.version = data.get("version", 0)
+        order.scheduled_start = data.get("scheduled_start")
+        order.scheduled_end = data.get("scheduled_end")
         order._lock = threading.Lock()
         return order
 
@@ -1290,3 +1298,279 @@ class SparePartAuditLog:
             stock_before=data.get("stock_before", 0),
             stock_after=data.get("stock_after", 0),
         )
+
+
+class RescheduleStatus(str, Enum):
+    PENDING = "待确认"
+    CONFIRMED = "已确认"
+    REJECTED = "已拒绝"
+    CANCELLED = "已取消"
+    EXPIRED = "已过期"
+
+
+class RescheduleCandidateSlot:
+    def __init__(self, start_time: str, end_time: str):
+        self.start_time = start_time
+        self.end_time = end_time
+
+    def to_dict(self) -> Dict:
+        return {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "RescheduleCandidateSlot":
+        return cls(
+            data["start_time"],
+            data["end_time"],
+        )
+
+    def is_valid(self) -> bool:
+        try:
+            s = datetime.strptime(self.start_time, "%Y-%m-%d %H:%M")
+            e = datetime.strptime(self.end_time, "%Y-%m-%d %H:%M")
+            return s < e
+        except (ValueError, TypeError):
+            return False
+
+    @property
+    def start_dt(self) -> Optional[datetime]:
+        try:
+            return datetime.strptime(self.start_time, "%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def end_dt(self) -> Optional[datetime]:
+        try:
+            return datetime.strptime(self.end_time, "%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return None
+
+    def overlaps_with(self, other: "RescheduleCandidateSlot") -> bool:
+        s1, e1 = self.start_dt, self.end_dt
+        s2, e2 = other.start_dt, other.end_dt
+        if not all([s1, e1, s2, e2]):
+            return False
+        return s1 < e2 and s2 < e1
+
+    def __repr__(self):
+        return f"{self.start_time} ~ {self.end_time}"
+
+
+class RescheduleRequest:
+    def __init__(
+        self,
+        reschedule_id: str,
+        order_id: str,
+        order_title: str,
+        dispatcher_id: str,
+        dispatcher_name: str,
+        reason: str,
+        candidate_slots: List[RescheduleCandidateSlot],
+        note: str = "",
+        status: RescheduleStatus = RescheduleStatus.PENDING,
+        created_at: Optional[str] = None,
+        version: int = 0,
+        original_scheduled_start: Optional[str] = None,
+        original_scheduled_end: Optional[str] = None,
+    ):
+        self.reschedule_id = reschedule_id
+        self.order_id = order_id
+        self.order_title = order_title
+        self.dispatcher_id = dispatcher_id
+        self.dispatcher_name = dispatcher_name
+        self.reason = reason
+        self.candidate_slots = candidate_slots
+        self.note = note
+        self.status = status
+        self.created_at = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        self.version = version
+        self.original_scheduled_start = original_scheduled_start
+        self.original_scheduled_end = original_scheduled_end
+
+    def to_dict(self) -> Dict:
+        return {
+            "reschedule_id": self.reschedule_id,
+            "order_id": self.order_id,
+            "order_title": self.order_title,
+            "dispatcher_id": self.dispatcher_id,
+            "dispatcher_name": self.dispatcher_name,
+            "reason": self.reason,
+            "candidate_slots": [s.to_dict() for s in self.candidate_slots],
+            "note": self.note,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "version": self.version,
+            "original_scheduled_start": self.original_scheduled_start,
+            "original_scheduled_end": self.original_scheduled_end,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "RescheduleRequest":
+        return cls(
+            reschedule_id=data["reschedule_id"],
+            order_id=data["order_id"],
+            order_title=data.get("order_title", ""),
+            dispatcher_id=data["dispatcher_id"],
+            dispatcher_name=data["dispatcher_name"],
+            reason=data["reason"],
+            candidate_slots=[RescheduleCandidateSlot.from_dict(s) for s in data.get("candidate_slots", [])],
+            note=data.get("note", ""),
+            status=RescheduleStatus(data.get("status", RescheduleStatus.PENDING.value)),
+            created_at=data.get("created_at"),
+            version=data.get("version", 0),
+            original_scheduled_start=data.get("original_scheduled_start"),
+            original_scheduled_end=data.get("original_scheduled_end"),
+        )
+
+    @property
+    def status_label(self) -> str:
+        return self.status.value
+
+    def bump_version(self) -> int:
+        self.version += 1
+        return self.version
+
+
+class RescheduleConfirmLog:
+    def __init__(
+        self,
+        log_id: str,
+        reschedule_id: str,
+        order_id: str,
+        confirmer_id: str,
+        confirmer_name: str,
+        confirmer_role: str,
+        decision: str,
+        selected_slot_start: Optional[str] = None,
+        selected_slot_end: Optional[str] = None,
+        reject_reason: str = "",
+        note: str = "",
+        timestamp: Optional[str] = None,
+    ):
+        self.log_id = log_id
+        self.reschedule_id = reschedule_id
+        self.order_id = order_id
+        self.confirmer_id = confirmer_id
+        self.confirmer_name = confirmer_name
+        self.confirmer_role = confirmer_role
+        self.decision = decision
+        self.selected_slot_start = selected_slot_start
+        self.selected_slot_end = selected_slot_end
+        self.reject_reason = reject_reason
+        self.note = note
+        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    def to_dict(self) -> Dict:
+        return {
+            "log_id": self.log_id,
+            "reschedule_id": self.reschedule_id,
+            "order_id": self.order_id,
+            "confirmer_id": self.confirmer_id,
+            "confirmer_name": self.confirmer_name,
+            "confirmer_role": self.confirmer_role,
+            "decision": self.decision,
+            "selected_slot_start": self.selected_slot_start,
+            "selected_slot_end": self.selected_slot_end,
+            "reject_reason": self.reject_reason,
+            "note": self.note,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "RescheduleConfirmLog":
+        return cls(
+            log_id=data["log_id"],
+            reschedule_id=data["reschedule_id"],
+            order_id=data["order_id"],
+            confirmer_id=data["confirmer_id"],
+            confirmer_name=data["confirmer_name"],
+            confirmer_role=data["confirmer_role"],
+            decision=data["decision"],
+            selected_slot_start=data.get("selected_slot_start"),
+            selected_slot_end=data.get("selected_slot_end"),
+            reject_reason=data.get("reject_reason", ""),
+            note=data.get("note", ""),
+            timestamp=data.get("timestamp"),
+        )
+
+    @property
+    def decision_label(self) -> str:
+        labels = {
+            "confirm": "确认改约",
+            "reject": "拒绝改约",
+        }
+        return labels.get(self.decision, self.decision)
+
+
+class ArrivalConfirmation:
+    def __init__(
+        self,
+        arrival_id: str,
+        order_id: str,
+        order_title: str,
+        confirmer_id: str,
+        confirmer_name: str,
+        confirmer_role: str,
+        scheduled_start: Optional[str] = None,
+        scheduled_end: Optional[str] = None,
+        actual_arrival_time: Optional[str] = None,
+        note: str = "",
+        status: str = "confirmed",
+        timestamp: Optional[str] = None,
+    ):
+        self.arrival_id = arrival_id
+        self.order_id = order_id
+        self.order_title = order_title
+        self.confirmer_id = confirmer_id
+        self.confirmer_name = confirmer_name
+        self.confirmer_role = confirmer_role
+        self.scheduled_start = scheduled_start
+        self.scheduled_end = scheduled_end
+        self.actual_arrival_time = actual_arrival_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.note = note
+        self.status = status
+        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    def to_dict(self) -> Dict:
+        return {
+            "arrival_id": self.arrival_id,
+            "order_id": self.order_id,
+            "order_title": self.order_title,
+            "confirmer_id": self.confirmer_id,
+            "confirmer_name": self.confirmer_name,
+            "confirmer_role": self.confirmer_role,
+            "scheduled_start": self.scheduled_start,
+            "scheduled_end": self.scheduled_end,
+            "actual_arrival_time": self.actual_arrival_time,
+            "note": self.note,
+            "status": self.status,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ArrivalConfirmation":
+        return cls(
+            arrival_id=data["arrival_id"],
+            order_id=data["order_id"],
+            order_title=data.get("order_title", ""),
+            confirmer_id=data["confirmer_id"],
+            confirmer_name=data["confirmer_name"],
+            confirmer_role=data["confirmer_role"],
+            scheduled_start=data.get("scheduled_start"),
+            scheduled_end=data.get("scheduled_end"),
+            actual_arrival_time=data.get("actual_arrival_time"),
+            note=data.get("note", ""),
+            status=data.get("status", "confirmed"),
+            timestamp=data.get("timestamp"),
+        )
+
+    @property
+    def status_label(self) -> str:
+        labels = {
+            "confirmed": "已到场",
+            "cancelled": "已取消",
+        }
+        return labels.get(self.status, self.status)

@@ -1,0 +1,166 @@
+[
+  {
+    "reschedule_id": "RS20260607183312036879C71E",
+    "order_id": "WO202606071833128DCB",
+    "order_title": "正常链路测试工单",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "客户临时改时间",
+    "candidate_slots": [
+      {
+        "start_time": "2026-06-11 14:00",
+        "end_time": "2026-06-11 16:00"
+      },
+      {
+        "start_time": "2026-06-12 09:00",
+        "end_time": "2026-06-12 11:00"
+      }
+    ],
+    "note": "请尽快确认",
+    "status": "已确认",
+    "created_at": "2026-06-07 18:33:12.036879",
+    "version": 1,
+    "original_scheduled_start": "2026-06-10 09:00",
+    "original_scheduled_end": "2026-06-10 11:00"
+  },
+  {
+    "reschedule_id": "RS202606071833120733375F9C",
+    "order_id": "WO202606071833121B89",
+    "order_title": "权限测试工单",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "权限测试",
+    "candidate_slots": [
+      {
+        "start_time": "2026-06-15 09:00",
+        "end_time": "2026-06-15 11:00"
+      }
+    ],
+    "note": "",
+    "status": "待确认",
+    "created_at": "2026-06-07 18:33:12.073337",
+    "version": 0,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  },
+  {
+    "reschedule_id": "RS2026060718331215797044D5",
+    "order_id": "WO202606071833123267",
+    "order_title": "冲突测试工单B",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "重复确认测试",
+    "candidate_slots": [
+      {
+        "start_time": "2026-06-26 09:00",
+        "end_time": "2026-06-26 11:00"
+      }
+    ],
+    "note": "",
+    "status": "已确认",
+    "created_at": "2026-06-07 18:33:12.157970",
+    "version": 1,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  },
+  {
+    "reschedule_id": "RS20260607183312190224CE29",
+    "order_id": "WO202606071833121550",
+    "order_title": "持久化测试工单A",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "持久化测试A",
+    "candidate_slots": [
+      {
+        "start_time": "2026-07-01 09:00",
+        "end_time": "2026-07-01 11:00"
+      }
+    ],
+    "note": "",
+    "status": "已确认",
+    "created_at": "2026-06-07 18:33:12.190224",
+    "version": 1,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  },
+  {
+    "reschedule_id": "RS20260607183312231321BD04",
+    "order_id": "WO202606071833122ECE",
+    "order_title": "持久化测试工单B",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "持久化测试B（待确认）",
+    "candidate_slots": [
+      {
+        "start_time": "2026-07-02 14:00",
+        "end_time": "2026-07-02 16:00"
+      }
+    ],
+    "note": "",
+    "status": "已确认",
+    "created_at": "2026-06-07 18:33:12.231321",
+    "version": 1,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  },
+  {
+    "reschedule_id": "RS202606071833122546545FB0",
+    "order_id": "WO20260607183312DC81",
+    "order_title": "持久化测试工单C",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "持久化测试C（已拒绝）",
+    "candidate_slots": [
+      {
+        "start_time": "2026-07-03 09:00",
+        "end_time": "2026-07-03 11:00"
+      }
+    ],
+    "note": "",
+    "status": "已拒绝",
+    "created_at": "2026-06-07 18:33:12.254654",
+    "version": 1,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  },
+  {
+    "reschedule_id": "RS202606071833123240356C35",
+    "order_id": "WO20260607183312E4B5",
+    "order_title": "导入测试工单1",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "客户改时间",
+    "candidate_slots": [
+      {
+        "start_time": "2026-08-01 09:00",
+        "end_time": "2026-08-01 11:00"
+      }
+    ],
+    "note": "合法行",
+    "status": "待确认",
+    "created_at": "2026-06-07 18:33:12.324035",
+    "version": 0,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  },
+  {
+    "reschedule_id": "RS20260607183312348391602B",
+    "order_id": "WO202606071833125A72",
+    "order_title": "导出一致性工单",
+    "dispatcher_id": "u001",
+    "dispatcher_name": "张调度",
+    "reason": "导出测试",
+    "candidate_slots": [
+      {
+        "start_time": "2026-09-01 09:00",
+        "end_time": "2026-09-01 11:00"
+      }
+    ],
+    "note": "导出备注",
+    "status": "已确认",
+    "created_at": "2026-06-07 18:33:12.348391",
+    "version": 1,
+    "original_scheduled_start": null,
+    "original_scheduled_end": null
+  }
+]

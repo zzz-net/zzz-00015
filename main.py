@@ -9,6 +9,8 @@ from models import (
     BatchDraftItem, BatchReassignmentDraft, BatchReassignmentResult,
     BatchItemResult, ConflictType, RevocationStatus, RevocationConflictType,
     SparePart, SparePartRequest, SparePartRequestStatus, SparePartAuditLog,
+    RescheduleStatus, RescheduleCandidateSlot, RescheduleRequest,
+    RescheduleConfirmLog, ArrivalConfirmation,
 )
 from datastore import (
     DataStore,
@@ -52,6 +54,17 @@ def get_status_color(status):
         Status.IN_PROGRESS: "#f39c12",
         Status.PENDING_INSPECTION: "#9b59b6",
         Status.COMPLETED: "#2ecc71",
+    }
+    return color_map.get(status, "#000000")
+
+
+def get_reschedule_status_color(status):
+    color_map = {
+        RescheduleStatus.PENDING: "#f39c12",
+        RescheduleStatus.CONFIRMED: "#2ecc71",
+        RescheduleStatus.REJECTED: "#e74c3c",
+        RescheduleStatus.CANCELLED: "#95a5a6",
+        RescheduleStatus.EXPIRED: "#7f8c8d",
     }
     return color_map.get(status, "#000000")
 
@@ -1373,8 +1386,8 @@ class MaintenanceApp:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         perms = {
-            Role.DISPATCHER: ["orders", "history", "dispatcher", "schedule", "spare_parts", "import_export"],
-            Role.TECHNICIAN: ["orders", "history", "technician", "spare_parts"],
+            Role.DISPATCHER: ["orders", "history", "dispatcher", "schedule", "spare_parts", "reschedule", "import_export"],
+            Role.TECHNICIAN: ["orders", "history", "technician", "spare_parts", "reschedule"],
             Role.INSPECTOR: ["orders", "history", "inspector", "import_export"],
         }
         tabs = perms.get(self.current_user.role, [])
@@ -1393,6 +1406,8 @@ class MaintenanceApp:
             self._build_inspector_tab()
         if "spare_parts" in tabs:
             self._build_spare_parts_tab()
+        if "reschedule" in tabs:
+            self._build_reschedule_tab()
         if "import_export" in tabs:
             self._build_import_export_tab()
 
@@ -1439,12 +1454,12 @@ class MaintenanceApp:
         tree_frame = tk.Frame(frame, bg="#f5f6fa")
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        columns = ("order_id", "title", "location", "category", "priority", "status", "assignee", "creator", "created_at")
+        columns = ("order_id", "title", "location", "category", "priority", "status", "assignee", "scheduled", "creator", "created_at")
         self.orders_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
         for c, text, w in [
-            ("order_id", "工单编号", 160), ("title", "标题", 200), ("location", "位置", 120),
-            ("category", "类别", 100), ("priority", "优先级", 70), ("status", "状态", 90),
-            ("assignee", "维修员", 90), ("creator", "创建人", 80), ("created_at", "创建时间", 150),
+            ("order_id", "工单编号", 150), ("title", "标题", 180), ("location", "位置", 100),
+            ("category", "类别", 90), ("priority", "优先级", 60), ("status", "状态", 80),
+            ("assignee", "维修员", 80), ("scheduled", "排程时间", 170), ("creator", "创建人", 70), ("created_at", "创建时间", 140),
         ]:
             self.orders_tree.heading(c, text=text)
             self.orders_tree.column(c, width=w, anchor="center")
@@ -1460,6 +1475,11 @@ class MaintenanceApp:
         if self.current_user.role == Role.DISPATCHER:
             tk.Button(btn_frame, text="改派", font=("Microsoft YaHei", 10), bg="#e67e22", fg="white",
                       width=12, command=self._on_reassign).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text="发起改约", font=("Microsoft YaHei", 10), bg="#16a085", fg="white",
+                      width=12, command=self._on_create_reschedule).pack(side=tk.LEFT, padx=5)
+        if self.current_user.role in (Role.DISPATCHER, Role.TECHNICIAN):
+            tk.Button(btn_frame, text="到场确认", font=("Microsoft YaHei", 10), bg="#27ae60", fg="white",
+                      width=12, command=self._on_confirm_arrival).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="刷新", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
                   width=12, command=self._refresh_orders).pack(side=tk.LEFT, padx=5)
 
@@ -1502,9 +1522,12 @@ class MaintenanceApp:
 
         for o in orders:
             tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            scheduled = ""
+            if o.scheduled_start and o.scheduled_end:
+                scheduled = f"{o.scheduled_start} ~ {o.scheduled_end.split(' ')[1] if ' ' in o.scheduled_end else o.scheduled_end}"
             self.orders_tree.insert("", tk.END, iid=o.order_id, values=(
                 o.order_id, o.title, o.location, o.category, o.priority,
-                o.status.value, o.assignee_name or "未指派", o.creator_name, o.created_at,
+                o.status.value, o.assignee_name or "未指派", scheduled, o.creator_name, o.created_at,
             ), tags=(tag,))
 
     def _on_reassign(self):
@@ -1528,6 +1551,256 @@ class MaintenanceApp:
                 self._refresh_orders()
         except WorkOrderError as e:
             messagebox.showerror("错误", str(e))
+
+    def _on_create_reschedule(self):
+        sel = self.orders_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择一个工单")
+            return
+        order_id = sel[0]
+        try:
+            order = self.store.get_order(order_id)
+            if not order:
+                messagebox.showerror("错误", "工单不存在")
+                return
+            dlg = CreateRescheduleDialog(self.root, self.store, self.current_user, order)
+            self.root.wait_window(dlg)
+            if dlg.result:
+                self._refresh_orders()
+                if hasattr(self, "reschedule_tree"):
+                    self._refresh_reschedules()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_confirm_arrival(self):
+        sel = self.orders_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择一个工单")
+            return
+        order_id = sel[0]
+        note = simpledialog.askstring("到场确认", "请输入到场备注（可选）:", parent=self.root)
+        if note is None:
+            return
+        try:
+            confirm = self.store.confirm_arrival(order_id, self.current_user, note.strip() or None)
+            messagebox.showinfo("成功", f"已记录到场确认\n时间: {confirm.confirmed_at}\n工单: {confirm.order_id}")
+            self._refresh_orders()
+            if hasattr(self, "arrival_tree"):
+                self._refresh_arrivals()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+
+    # ==================== 上门改约 Tab ====================
+    def _build_reschedule_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="上门改约")
+
+        top = tk.Frame(frame, bg="#f5f6fa")
+        top.pack(fill=tk.X, padx=10, pady=8)
+        tk.Label(top, text="工单编号:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=0, padx=3)
+        self.filter_rs_order = tk.Entry(top, width=16, font=("Microsoft YaHei", 10))
+        self.filter_rs_order.grid(row=0, column=1, padx=3)
+        tk.Label(top, text="状态:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=2, padx=3)
+        self.filter_rs_status = ttk.Combobox(top, values=["全部", "待确认", "已确认", "已拒绝", "已取消", "已过期"],
+                                             state="readonly", width=10, font=("Microsoft YaHei", 10))
+        self.filter_rs_status.grid(row=0, column=3, padx=3)
+        self.filter_rs_status.set("全部")
+        tk.Button(top, text="查询", bg="#3498db", fg="white", width=8,
+                  font=("Microsoft YaHei", 10), command=self._refresh_reschedules).grid(row=0, column=4, padx=6)
+        tk.Button(top, text="重置", bg="#95a5a6", fg="white", width=8,
+                  font=("Microsoft YaHei", 10), command=self._reset_reschedule_filters).grid(row=0, column=5, padx=3)
+
+        left_pane = tk.Frame(frame, bg="#f5f6fa")
+        left_pane.pack(fill=tk.BOTH, expand=True, side=tk.LEFT, padx=(10, 5), pady=5)
+        tk.Label(left_pane, text="改约申请列表", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").pack(anchor="w")
+        rs_cols = ("reschedule_id", "order_id", "order_title", "reason", "status", "creator", "created_at")
+        self.reschedule_tree = ttk.Treeview(left_pane, columns=rs_cols, show="headings", height=10)
+        for c, t, w in [("reschedule_id", "改约编号", 150), ("order_id", "工单编号", 140),
+                        ("order_title", "工单标题", 160), ("reason", "原因", 180),
+                        ("status", "状态", 80), ("creator", "创建人", 80), ("created_at", "创建时间", 150)]:
+            self.reschedule_tree.heading(c, text=t)
+            self.reschedule_tree.column(c, width=w, anchor="center")
+        self.reschedule_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb1 = ttk.Scrollbar(left_pane, orient=tk.VERTICAL, command=self.reschedule_tree.yview)
+        sb1.pack(side=tk.RIGHT, fill=tk.Y)
+        self.reschedule_tree.configure(yscrollcommand=sb1.set)
+        self.reschedule_tree.tag_configure("status待确认", background="#fef9e7")
+        self.reschedule_tree.tag_configure("status已确认", background="#eafaf1")
+        self.reschedule_tree.tag_configure("status已拒绝", background="#fdedec")
+        self.reschedule_tree.tag_configure("status已取消", background="#f4f6f7")
+        self.reschedule_tree.tag_configure("status已过期", background="#f4f6f7")
+        self.reschedule_tree.bind("<<TreeviewSelect>>", lambda e: self._on_reschedule_select())
+
+        right_pane = tk.Frame(frame, bg="#f5f6fa")
+        right_pane.pack(fill=tk.BOTH, expand=True, side=tk.LEFT, padx=(5, 10), pady=5)
+
+        tk.Label(right_pane, text="改约详情与候选时间窗", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").pack(anchor="w")
+        self.rs_detail = tk.Text(right_pane, height=8, font=("Microsoft YaHei", 10), state=tk.DISABLED,
+                                 bg="white", wrap=tk.WORD)
+        self.rs_detail.pack(fill=tk.X, pady=3)
+
+        tk.Label(right_pane, text="确认日志", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", pady=(5, 0))
+        log_cols = ("log_id", "confirmer", "decision", "selected_slot", "reject_reason", "confirmed_at")
+        self.confirm_log_tree = ttk.Treeview(right_pane, columns=log_cols, show="headings", height=6)
+        for c, t, w in [("log_id", "日志ID", 60), ("confirmer", "确认人", 80),
+                        ("decision", "决定", 70), ("selected_slot", "选中时间窗", 200),
+                        ("reject_reason", "拒绝原因", 160), ("confirmed_at", "确认时间", 150)]:
+            self.confirm_log_tree.heading(c, text=t)
+            self.confirm_log_tree.column(c, width=w, anchor="center")
+        self.confirm_log_tree.pack(fill=tk.BOTH, expand=True)
+
+        btn_frame = tk.Frame(frame, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=10, pady=8)
+        if self.current_user.role == Role.DISPATCHER:
+            tk.Button(btn_frame, text="撤销改约", bg="#e67e22", fg="white", width=12,
+                      font=("Microsoft YaHei", 10), command=self._on_cancel_reschedule).pack(side=tk.LEFT, padx=5)
+        if self.current_user.role in (Role.DISPATCHER, Role.TECHNICIAN):
+            tk.Button(btn_frame, text="确认/拒绝", bg="#16a085", fg="white", width=12,
+                      font=("Microsoft YaHei", 10), command=self._on_confirm_reschedule).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="刷新", bg="#3498db", fg="white", width=10,
+                  font=("Microsoft YaHei", 10), command=self._refresh_reschedules).pack(side=tk.LEFT, padx=5)
+
+        sep = tk.Frame(frame, height=2, bg="#bdc3c7")
+        sep.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Label(frame, text="到场确认记录", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=10)
+        arrival_cols = ("arrival_id", "order_id", "confirmer", "note", "confirmed_at")
+        self.arrival_tree = ttk.Treeview(frame, columns=arrival_cols, show="headings", height=6)
+        for c, t, w in [("arrival_id", "确认ID", 80), ("order_id", "工单编号", 150),
+                        ("confirmer", "确认人", 80), ("note", "备注", 250),
+                        ("confirmed_at", "确认时间", 160)]:
+            self.arrival_tree.heading(c, text=t)
+            self.arrival_tree.column(c, width=w, anchor="center")
+        self.arrival_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        tk.Button(frame, text="刷新到场记录", bg="#3498db", fg="white", width=12,
+                  font=("Microsoft YaHei", 10), command=self._refresh_arrivals).pack(anchor="e", padx=10, pady=5)
+
+        self._refresh_reschedules()
+        self._refresh_arrivals()
+
+    def _reset_reschedule_filters(self):
+        self.filter_rs_order.delete(0, tk.END)
+        self.filter_rs_status.set("全部")
+        self._refresh_reschedules()
+
+    def _refresh_reschedules(self):
+        for i in self.reschedule_tree.get_children():
+            self.reschedule_tree.delete(i)
+        order_id = self.filter_rs_order.get().strip() or None
+        status_val = self.filter_rs_status.get()
+        status = None
+        if status_val and status_val != "全部":
+            for s in RescheduleStatus:
+                if s.value == status_val:
+                    status = s
+                    break
+        try:
+            reqs = self.store.get_reschedule_requests(order_id=order_id, status=status, viewer=self.current_user)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+            return
+        for r in reqs:
+            self.reschedule_tree.insert("", tk.END, iid=r.reschedule_id, values=(
+                r.reschedule_id, r.order_id, r.order_title, r.reason, r.status.value,
+                r.dispatcher_name, r.created_at,
+            ), tags=(f"status{r.status.value}",))
+
+    def _on_reschedule_select(self):
+        sel = self.reschedule_tree.selection()
+        self.rs_detail.configure(state=tk.NORMAL)
+        self.rs_detail.delete("1.0", tk.END)
+        for i in self.confirm_log_tree.get_children():
+            self.confirm_log_tree.delete(i)
+        if not sel:
+            self.rs_detail.configure(state=tk.DISABLED)
+            return
+        reschedule_id = sel[0]
+        try:
+            req = self.store.get_reschedule_request(reschedule_id)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+            self.rs_detail.configure(state=tk.DISABLED)
+            return
+        if not req:
+            self.rs_detail.configure(state=tk.DISABLED)
+            return
+        info = f"改约编号: {req.reschedule_id}\n工单: {req.order_id}  {req.order_title}\n"
+        info += f"创建人: {req.dispatcher_name}    创建时间: {req.created_at}\n"
+        info += f"原因: {req.reason}\n"
+        if req.note:
+            info += f"备注: {req.note}\n"
+        info += f"原排程: {req.original_scheduled_start or '(无)'} ~ {req.original_scheduled_end or '(无)'}\n"
+        info += f"当前状态: {req.status.value}    版本: v{req.version}\n"
+        info += "候选时间窗:\n"
+        for i, slot in enumerate(req.candidate_slots):
+            info += f"  [{i+1}] {slot.start_time} ~ {slot.end_time}\n"
+        self.rs_detail.insert("1.0", info)
+        self.rs_detail.configure(state=tk.DISABLED)
+        try:
+            logs = self.store.get_reschedule_confirm_logs(reschedule_id=req.reschedule_id)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+            return
+        for log in logs:
+            self.confirm_log_tree.insert("", tk.END, values=(
+                log.log_id, log.confirmer_name, log.decision,
+                f"{log.selected_slot_start or ''} ~ {log.selected_slot_end or ''}".strip(" ~"),
+                log.reject_reason or "", log.confirmed_at,
+            ))
+
+    def _on_cancel_reschedule(self):
+        sel = self.reschedule_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要撤销的改约申请")
+            return
+        reschedule_id = sel[0]
+        if not messagebox.askyesno("确认撤销", f"确认要撤销改约申请 {reschedule_id}?"):
+            return
+        try:
+            req = self.store.cancel_reschedule_request(reschedule_id, self.current_user)
+            messagebox.showinfo("成功", f"已撤销: {req.reschedule_id}")
+            self._refresh_reschedules()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_confirm_reschedule(self):
+        sel = self.reschedule_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要处理的改约申请")
+            return
+        reschedule_id = sel[0]
+        try:
+            req = self.store.get_reschedule_request(reschedule_id)
+            if not req:
+                messagebox.showerror("错误", "改约申请不存在")
+                return
+            dlg = ConfirmRescheduleDialog(self.root, self.store, self.current_user, req)
+            self.root.wait_window(dlg)
+            if dlg.result:
+                self._refresh_reschedules()
+                self._on_reschedule_select()
+                self._refresh_orders()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+
+    def _refresh_arrivals(self):
+        if not hasattr(self, "arrival_tree"):
+            return
+        for i in self.arrival_tree.get_children():
+            self.arrival_tree.delete(i)
+        try:
+            items = self.store.get_arrival_confirmations(viewer=self.current_user)
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("错误", str(e))
+            return
+        for a in items:
+            self.arrival_tree.insert("", tk.END, values=(
+                a.arrival_id, a.order_id, a.confirmer_name, a.note or "", a.confirmed_at,
+            ))
 
     # ==================== 历史记录 Tab ====================
     def _build_history_tab(self):
@@ -2444,6 +2717,11 @@ class MaintenanceApp:
         tk.Button(import_frame, text="选择文件并导入", font=("Microsoft YaHei", 10),
                   bg="#27ae60", fg="white", width=18, command=self._on_import_techs).grid(row=1, column=1, padx=5, pady=8)
 
+        tk.Label(import_frame, text="改约申请CSV导入:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=2, column=0, sticky="w", padx=10, pady=8)
+        tk.Button(import_frame, text="选择文件并导入", font=("Microsoft YaHei", 10),
+                  bg="#27ae60", fg="white", width=18, command=self._on_import_reschedules).grid(row=2, column=1, padx=5, pady=8)
+
         if self.current_user.role != Role.DISPATCHER:
             for w in import_frame.winfo_children():
                 try:
@@ -2498,6 +2776,22 @@ class MaintenanceApp:
                   bg="#e67e22", fg="white", width=15, command=lambda: self._on_export_reassign("json")).grid(row=row, column=0, padx=10, pady=4)
         tk.Button(export_frame, text="导出 CSV", font=("Microsoft YaHei", 10),
                   bg="#e67e22", fg="white", width=15, command=lambda: self._on_export_reassign("csv")).grid(row=row, column=1, padx=10, pady=4)
+        row += 1
+        tk.Label(export_frame, text="改约申请:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=5, columnspan=2)
+        row += 1
+        tk.Button(export_frame, text="导出 JSON", font=("Microsoft YaHei", 10),
+                  bg="#16a085", fg="white", width=15, command=lambda: self._on_export_reschedules("json")).grid(row=row, column=0, padx=10, pady=4)
+        tk.Button(export_frame, text="导出 CSV", font=("Microsoft YaHei", 10),
+                  bg="#16a085", fg="white", width=15, command=lambda: self._on_export_reschedules("csv")).grid(row=row, column=1, padx=10, pady=4)
+        row += 1
+        tk.Label(export_frame, text="改约确认日志:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=5, columnspan=2)
+        row += 1
+        tk.Button(export_frame, text="导出 JSON", font=("Microsoft YaHei", 10),
+                  bg="#8e44ad", fg="white", width=15, command=lambda: self._on_export_reschedule_logs("json")).grid(row=row, column=0, padx=10, pady=4)
+        tk.Button(export_frame, text="导出 CSV", font=("Microsoft YaHei", 10),
+                  bg="#8e44ad", fg="white", width=15, command=lambda: self._on_export_reschedule_logs("csv")).grid(row=row, column=1, padx=10, pady=4)
 
         self.export_log = tk.Text(export_frame, height=8, font=("Microsoft YaHei", 9), state=tk.DISABLED,
                                    bg="#ffffff", wrap=tk.WORD)
@@ -2644,6 +2938,54 @@ class MaintenanceApp:
             self._append_export_log(f"改派记录导出失败: {e}")
         except WorkOrderError as e:
             messagebox.showerror("错误", str(e))
+
+    def _on_import_reschedules(self):
+        path = filedialog.askopenfilename(title="选择改约申请CSV", filetypes=[("CSV文件", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                result = self.store.import_reschedule_requests_csv(f, self.current_user)
+            imported = len(result.imported)
+            failed = len(result.errors)
+            msg = f"成功导入 {imported} 条改约申请"
+            if failed:
+                msg += f"，跳过 {failed} 条非法行"
+                detail = "\n".join(f"第 {e.line_no} 行: {e.reason}" for e in result.errors[:10])
+                msg += "\n\n跳过明细:\n" + detail
+            messagebox.showinfo("导入完成", msg)
+            self._append_export_log(f"改约申请CSV导入完成: 成功{imported}, 失败{failed}")
+            if hasattr(self, "reschedule_tree"):
+                self._refresh_reschedules()
+        except (WorkOrderError, PermissionError, ExportError) as e:
+            messagebox.showerror("导入失败", str(e))
+            self._append_export_log(f"改约申请CSV导入失败: {e}")
+
+    def _on_export_reschedules(self, fmt):
+        try:
+            if fmt == "json":
+                path = self.store.export_reschedule_requests_json()
+            else:
+                path = self.store.export_reschedule_requests_csv()
+            msg = f"改约申请已导出到: {path}"
+            messagebox.showinfo("导出成功", msg)
+            self._append_export_log(msg)
+        except ExportError as e:
+            messagebox.showerror("导出失败", str(e))
+            self._append_export_log(f"改约申请导出失败: {e}")
+
+    def _on_export_reschedule_logs(self, fmt):
+        try:
+            if fmt == "json":
+                path = self.store.export_reschedule_confirm_logs_json()
+            else:
+                path = self.store.export_reschedule_confirm_logs_csv()
+            msg = f"改约确认日志已导出到: {path}"
+            messagebox.showinfo("导出成功", msg)
+            self._append_export_log(msg)
+        except ExportError as e:
+            messagebox.showerror("导出失败", str(e))
+            self._append_export_log(f"改约确认日志导出失败: {e}")
 
     # ==================== 备件库存 & 领用核销 Tab ====================
     def _build_spare_parts_tab(self):
@@ -3261,6 +3603,211 @@ class SparePartRequestDialog(tk.Toplevel):
             self.destroy()
         except (WorkOrderError, PermissionError) as e:
             messagebox.showerror("提交失败", str(e), parent=self)
+
+
+class CreateRescheduleDialog(tk.Toplevel):
+    def __init__(self, parent, store, dispatcher, order):
+        super().__init__(parent)
+        self.store = store
+        self.dispatcher = dispatcher
+        self.order = order
+        self.result = None
+        self.title("发起上门改约")
+        self.geometry("640x560")
+        self.configure(bg="#f5f6fa")
+        self.grab_set()
+        self.transient(parent)
+        self._slots: List[RescheduleCandidateSlot] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        info = tk.Frame(self, bg="#f5f6fa")
+        info.pack(fill=tk.X, padx=15, pady=10)
+        tk.Label(info, text=f"工单: {self.order.order_id}  {self.order.title}",
+                 font=("Microsoft YaHei", 12, "bold"), bg="#f5f6fa").grid(row=0, column=0, sticky="w")
+        cur = f"{self.order.scheduled_start or '(未排程)'} ~ {self.order.scheduled_end or ''}"
+        tk.Label(info, text=f"当前排程: {cur.strip()}", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa", fg="#555").grid(row=1, column=0, sticky="w", pady=3)
+        tk.Label(info, text=f"维修员: {self.order.assignee_name or '未指派'}",
+                 font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=2, column=0, sticky="w")
+
+        tk.Label(self, text="改约原因（必填）:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15, pady=(8, 2))
+        self.reason_text = tk.Text(self, height=3, font=("Microsoft YaHei", 10))
+        self.reason_text.pack(fill=tk.X, padx=15, pady=2)
+
+        slots_frame = tk.LabelFrame(self, text="候选时间窗（至少1个，格式 YYYY-MM-DD HH:MM）",
+                                    font=("Microsoft YaHei", 10, "bold"), bg="#f5f6fa", fg="#2c3e50")
+        slots_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=8)
+
+        entry_frame = tk.Frame(slots_frame, bg="#f5f6fa")
+        entry_frame.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(entry_frame, text="开始:", bg="#f5f6fa", font=("Microsoft YaHei", 10)).grid(row=0, column=0, padx=2)
+        self.slot_start = tk.Entry(entry_frame, width=18, font=("Microsoft YaHei", 10))
+        self.slot_start.grid(row=0, column=1, padx=2)
+        self.slot_start.insert(0, "2026-06-15 09:00")
+        tk.Label(entry_frame, text="结束:", bg="#f5f6fa", font=("Microsoft YaHei", 10)).grid(row=0, column=2, padx=2)
+        self.slot_end = tk.Entry(entry_frame, width=18, font=("Microsoft YaHei", 10))
+        self.slot_end.grid(row=0, column=3, padx=2)
+        self.slot_end.insert(0, "2026-06-15 11:00")
+        tk.Button(entry_frame, text="添加", bg="#3498db", fg="white", width=8,
+                  font=("Microsoft YaHei", 10), command=self._on_add_slot).grid(row=0, column=4, padx=6)
+        tk.Button(entry_frame, text="删除选中", bg="#e74c3c", fg="white", width=10,
+                  font=("Microsoft YaHei", 10), command=self._on_remove_slot).grid(row=0, column=5, padx=2)
+
+        list_frame = tk.Frame(slots_frame, bg="#f5f6fa")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        self.slot_list = tk.Listbox(list_frame, font=("Microsoft YaHei", 10), height=6)
+        self.slot_list.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.slot_list.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.slot_list.configure(yscrollcommand=sb.set)
+
+        tk.Label(self, text="备注:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15, pady=(4, 2))
+        self.note_entry = tk.Entry(self, font=("Microsoft YaHei", 10))
+        self.note_entry.pack(fill=tk.X, padx=15, pady=2)
+
+        btn_frame = tk.Frame(self, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=15, pady=12)
+        tk.Button(btn_frame, text="提交改约申请", bg="#16a085", fg="white", width=14,
+                  font=("Microsoft YaHei", 10), command=self._on_submit).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="取消", bg="#7f8c8d", fg="white", width=10,
+                  font=("Microsoft YaHei", 10), command=self.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def _on_add_slot(self):
+        s = self.slot_start.get().strip()
+        e = self.slot_end.get().strip()
+        slot = RescheduleCandidateSlot(s, e)
+        if not slot.is_valid():
+            messagebox.showwarning("提示", "时间窗格式非法或结束时间不晚于开始时间", parent=self)
+            return
+        self._slots.append(slot)
+        self.slot_list.insert(tk.END, f"{s} ~ {e}")
+
+    def _on_remove_slot(self):
+        sel = self.slot_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.slot_list.delete(idx)
+        del self._slots[idx]
+
+    def _on_submit(self):
+        reason = self.reason_text.get("1.0", tk.END).strip()
+        note = self.note_entry.get().strip()
+        if not reason:
+            messagebox.showwarning("提示", "请填写改约原因", parent=self)
+            return
+        if not self._slots:
+            messagebox.showwarning("提示", "请至少添加一个候选时间窗", parent=self)
+            return
+        try:
+            req = self.store.create_reschedule_request(
+                self.order.order_id, self.dispatcher, reason, list(self._slots), note
+            )
+            self.result = req
+            messagebox.showinfo("成功", f"改约申请已提交: {req.reschedule_id}", parent=self)
+            self.destroy()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("提交失败", str(e), parent=self)
+
+
+class ConfirmRescheduleDialog(tk.Toplevel):
+    def __init__(self, parent, store, confirmer, request: RescheduleRequest):
+        super().__init__(parent)
+        self.store = store
+        self.confirmer = confirmer
+        self.request = request
+        self.result = None
+        self.title("确认/拒绝改约申请")
+        self.geometry("600x540")
+        self.configure(bg="#f5f6fa")
+        self.grab_set()
+        self.transient(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        info = tk.Frame(self, bg="#f5f6fa")
+        info.pack(fill=tk.X, padx=15, pady=10)
+        tk.Label(info, text=f"改约编号: {self.request.reschedule_id}",
+                 font=("Microsoft YaHei", 11, "bold"), bg="#f5f6fa").grid(row=0, column=0, sticky="w")
+        tk.Label(info, text=f"工单: {self.request.order_id}  {self.request.order_title}",
+                 font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=1, column=0, sticky="w", pady=2)
+        tk.Label(info, text=f"改约原因: {self.request.reason}",
+                 font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=2, column=0, sticky="w", pady=2)
+        tk.Label(info, text=f"备注: {self.request.note or '(无)'}",
+                 font=("Microsoft YaHei", 10), bg="#f5f6fa", fg="#555").grid(row=3, column=0, sticky="w", pady=2)
+
+        tk.Label(self, text="请选择一个候选时间窗确认:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15, pady=(6, 2))
+
+        self.slot_var = tk.StringVar()
+        slots_frame = tk.Frame(self, bg="#f5f6fa")
+        slots_frame.pack(fill=tk.X, padx=15, pady=4)
+        for i, slot in enumerate(self.request.candidate_slots):
+            text = f"{slot.start_time} ~ {slot.end_time}"
+            rb = tk.Radiobutton(slots_frame, text=text, variable=self.slot_var,
+                                value=f"{slot.start_time}|{slot.end_time}",
+                                font=("Microsoft YaHei", 10), bg="#f5f6fa", anchor="w")
+            rb.pack(fill=tk.X, padx=4, pady=2)
+            if i == 0:
+                rb.select()
+
+        tk.Label(self, text="确认备注:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15, pady=(8, 2))
+        self.note_entry = tk.Entry(self, font=("Microsoft YaHei", 10))
+        self.note_entry.pack(fill=tk.X, padx=15, pady=2)
+
+        tk.Label(self, text="若拒绝，请填写拒绝原因:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15, pady=(8, 2))
+        self.reject_text = tk.Text(self, height=3, font=("Microsoft YaHei", 10))
+        self.reject_text.pack(fill=tk.X, padx=15, pady=2)
+
+        btn_frame = tk.Frame(self, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=15, pady=15)
+        tk.Button(btn_frame, text="确认改约", bg="#27ae60", fg="white", width=12,
+                  font=("Microsoft YaHei", 10), command=self._on_confirm).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="拒绝改约", bg="#e74c3c", fg="white", width=12,
+                  font=("Microsoft YaHei", 10), command=self._on_reject).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="取消", bg="#7f8c8d", fg="white", width=10,
+                  font=("Microsoft YaHei", 10), command=self.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def _on_confirm(self):
+        val = self.slot_var.get()
+        if not val:
+            messagebox.showwarning("提示", "请选择一个时间窗", parent=self)
+            return
+        s, e = val.split("|")
+        slot = RescheduleCandidateSlot(s, e)
+        note = self.note_entry.get().strip()
+        try:
+            req, log = self.store.confirm_reschedule_request(
+                self.request.reschedule_id, self.confirmer, "confirm",
+                selected_slot=slot, note=note
+            )
+            self.result = (req, log)
+            messagebox.showinfo("成功", f"改约已确认，工单日程已更新为: {s} ~ {e}", parent=self)
+            self.destroy()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("操作失败", str(e), parent=self)
+
+    def _on_reject(self):
+        reason = self.reject_text.get("1.0", tk.END).strip()
+        if not reason:
+            messagebox.showwarning("提示", "请填写拒绝原因", parent=self)
+            return
+        note = self.note_entry.get().strip()
+        try:
+            req, log = self.store.confirm_reschedule_request(
+                self.request.reschedule_id, self.confirmer, "reject",
+                reject_reason=reason, note=note
+            )
+            self.result = (req, log)
+            messagebox.showinfo("成功", "改约已拒绝", parent=self)
+            self.destroy()
+        except (WorkOrderError, PermissionError) as e:
+            messagebox.showerror("操作失败", str(e), parent=self)
 
 
 def main():

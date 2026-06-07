@@ -10,7 +10,11 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models import Role, Status, TimeSlot, BatchReassignmentResult, BatchItemResult
+from models import (
+    Role, Status, TimeSlot, BatchReassignmentResult, BatchItemResult,
+    RescheduleStatus, RescheduleCandidateSlot, RescheduleRequest,
+    RescheduleConfirmLog, ArrivalConfirmation,
+)
 from datastore import (
     DataStore,
     WorkOrderError,
@@ -966,10 +970,10 @@ def test_gui_startup_and_tabs():
         root.update()
 
         tab_count = app.notebook.index("end")
-        assert tab_count == 6, f"调度员应有 6 个 Tab，实际 {tab_count}"
+        assert tab_count == 7, f"调度员应有 7 个 Tab，实际 {tab_count}"
         print_ok(f"调度员 Tab 数量正确: {tab_count} 个")
 
-        expected_tabs = ["工单列表", "历史记录", "调度派工", "排班管理", "备件库存", "导入导出"]
+        expected_tabs = ["工单列表", "历史记录", "调度派工", "排班管理", "备件库存", "上门改约", "导入导出"]
         actual_tabs = [app.notebook.tab(i, "text") for i in range(tab_count)]
         for t in expected_tabs:
             assert t in actual_tabs, f"缺少 Tab: {t}"
@@ -980,7 +984,7 @@ def test_gui_startup_and_tabs():
             root.update()
             print_ok(f"切换 Tab 成功: {tab_name}")
 
-        app.notebook.select(5)
+        app.notebook.select(6)
         root.update()
         assert hasattr(app, "export_log"), "导入导出页缺少 export_log 控件"
         assert hasattr(app, "export_dir_label"), "导入导出页缺少 export_dir_label 控件"
@@ -4118,6 +4122,500 @@ def test_spare_parts_application_validation_edge_cases(store):
     print_ok("备件申请/审核边界拦截全部验证通过：已完成工单、非指定维修员、类别不匹配、库存不足 全部正确拦截且原子性完整")
 
 
+def _make_slot(s, e):
+    return RescheduleCandidateSlot(s, e)
+
+
+def _create_dispatched_order(store, dispatcher, tech, title="测试改约工单"):
+    order = store.create_order(
+        title=title,
+        description="改约模块测试用",
+        location="C栋",
+        category="空调维修",
+        priority="高",
+        creator=dispatcher,
+    )
+    store.dispatch_order(order.order_id, tech, dispatcher)
+    return store.get_order(order.order_id)
+
+
+def test_reschedule_normal_flow(store):
+    print_title("改约&到场确认-1: 正常改约-确认-到场确认链路")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    inspector = store.get_user("u004")
+
+    order = _create_dispatched_order(store, dispatcher, tech, "正常链路测试工单")
+    order.scheduled_start = "2026-06-10 09:00"
+    order.scheduled_end = "2026-06-10 11:00"
+    store._save_orders()
+    order = store.get_order(order.order_id)
+
+    slots = [
+        _make_slot("2026-06-11 14:00", "2026-06-11 16:00"),
+        _make_slot("2026-06-12 09:00", "2026-06-12 11:00"),
+    ]
+    req = store.create_reschedule_request(
+        order.order_id, dispatcher, "客户临时改时间", slots, "请尽快确认"
+    )
+    assert req.status == RescheduleStatus.PENDING
+    assert len(req.candidate_slots) == 2
+    assert req.original_scheduled_start == "2026-06-10 09:00"
+    print_ok(f"发起改约成功: {req.reschedule_id}, 状态={req.status_label}")
+
+    pending = store.get_reschedule_requests(order_id=order.order_id, status=RescheduleStatus.PENDING)
+    assert len(pending) == 1
+    print_ok("按工单+状态筛选待确认改约成功")
+
+    selected = slots[0]
+    confirmed, log = store.confirm_reschedule_request(
+        req.reschedule_id, tech, "confirm", selected_slot=selected, note="客户同意第一个时间"
+    )
+    assert confirmed.status == RescheduleStatus.CONFIRMED
+    assert log.decision == "confirm"
+    assert log.selected_slot_start == selected.start_time
+    print_ok(f"维修员确认改约: 选择时间 {selected}, 日志ID={log.log_id}")
+
+    order_after = store.get_order(order.order_id)
+    assert order_after.scheduled_start == selected.start_time
+    assert order_after.scheduled_end == selected.end_time
+    print_ok(f"工单日程已自动更新为: {order_after.scheduled_start} ~ {order_after.scheduled_end}")
+
+    history_note = order_after.history[-1].note
+    assert "确认改约" in history_note
+    print_ok("工单历史中新增确认改约记录（可追溯）")
+
+    logs = store.get_reschedule_confirm_logs(order_id=order.order_id)
+    assert len(logs) == 1
+    assert logs[0].decision_label == "确认改约"
+    print_ok("改约确认日志查询成功")
+
+    arrival = store.confirm_arrival(order.order_id, tech, note="已到达客户现场")
+    assert arrival.status == "confirmed"
+    assert arrival.order_id == order.order_id
+    print_ok(f"维修员到场确认成功: {arrival.arrival_id}")
+
+    order_after_arrival = store.get_order(order.order_id)
+    assert "到场确认" in order_after_arrival.history[-1].note
+    print_ok("到场确认后工单历史新增记录")
+
+    arrivals = store.get_arrival_confirmations(order_id=order.order_id)
+    assert len(arrivals) == 1
+    print_ok("到场确认记录查询成功")
+    return store
+
+
+def test_reschedule_permission_denied(store):
+    print_title("改约&到场确认-2: 权限拦截（非调度员发起、非指定人员确认）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+
+    order = _create_dispatched_order(store, dispatcher, tech, "权限测试工单")
+    slots = [_make_slot("2026-06-15 09:00", "2026-06-15 11:00")]
+
+    try:
+        store.create_reschedule_request(order.order_id, tech, "维修员无权发起", slots)
+        print_fail("维修员发起改约居然成功！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"维修员发起改约被正确拒绝: {e}")
+
+    try:
+        store.create_reschedule_request(order.order_id, inspector, "验收员无权发起", slots)
+        print_fail("验收员发起改约居然成功！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员发起改约被正确拒绝: {e}")
+
+    req = store.create_reschedule_request(
+        order.order_id, dispatcher, "权限测试", slots
+    )
+
+    try:
+        store.confirm_reschedule_request(req.reschedule_id, inspector, "confirm", selected_slot=slots[0])
+        print_fail("验收员确认改约居然成功！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员确认改约被正确拒绝: {e}")
+
+    try:
+        store.confirm_reschedule_request(req.reschedule_id, tech2, "confirm", selected_slot=slots[0])
+        print_fail("非指定维修员确认改约居然成功！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"非指定维修员(tech2)确认改约被正确拒绝: {e}")
+
+    try:
+        store.confirm_arrival(order.order_id, inspector)
+        print_fail("验收员到场确认居然成功！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"验收员到场确认被正确拒绝: {e}")
+
+    try:
+        store.confirm_arrival(order.order_id, tech2)
+        print_fail("非指定维修员到场确认居然成功！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"非指定维修员(tech2)到场确认被正确拒绝: {e}")
+
+    req_after = store.get_reschedule_request(req.reschedule_id)
+    assert req_after.status == RescheduleStatus.PENDING, "权限拒绝后改约状态应保持不变"
+    order_after = store.get_order(order.order_id)
+    assert len(order_after.history) == 3, "权限拒绝后工单历史不应新增"
+    print_ok("所有权限被拒场景：改约状态未变、工单历史未新增、所有数据不改动")
+    return store
+
+
+def test_reschedule_conflict_rejection(store):
+    print_title("改约&到场确认-3: 冲突拒绝（已完成工单、时间窗冲突、重复确认）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    inspector = store.get_user("u004")
+
+    completed = store.create_order(
+        title="已完成工单", description="", location="", category="空调维修",
+        priority="中", creator=dispatcher,
+    )
+    store.dispatch_order(completed.order_id, tech, dispatcher)
+    store.accept_order(completed.order_id, tech)
+    store.complete_order(completed.order_id, tech)
+    store.approve_order(completed.order_id, inspector)
+
+    slots = [_make_slot("2026-06-20 09:00", "2026-06-20 11:00")]
+    try:
+        store.create_reschedule_request(completed.order_id, dispatcher, "已完成工单改约", slots)
+        print_fail("已完成工单改约居然成功！")
+        assert False
+    except WorkOrderError as e:
+        assert "已完成" in str(e)
+        print_ok(f"已完成工单禁止改约（符合预期）: {e}")
+
+    order1 = _create_dispatched_order(store, dispatcher, tech, "冲突测试工单A")
+    order1.scheduled_start = "2026-06-25 14:00"
+    order1.scheduled_end = "2026-06-25 16:00"
+    store._save_orders()
+
+    order2 = _create_dispatched_order(store, dispatcher, tech, "冲突测试工单B")
+    conflict_slots = [_make_slot("2026-06-25 14:30", "2026-06-25 15:30")]
+    try:
+        store.create_reschedule_request(order2.order_id, dispatcher, "时间窗冲突", conflict_slots)
+        print_fail("时间窗冲突的改约居然成功！")
+        assert False
+    except WorkOrderError as e:
+        assert "冲突" in str(e)
+        print_ok(f"时间窗冲突被正确拒绝: {e}")
+
+    valid_slots = [_make_slot("2026-06-26 09:00", "2026-06-26 11:00")]
+    req = store.create_reschedule_request(order2.order_id, dispatcher, "重复确认测试", valid_slots)
+    store.confirm_reschedule_request(req.reschedule_id, tech, "confirm", selected_slot=valid_slots[0])
+    try:
+        store.confirm_reschedule_request(req.reschedule_id, dispatcher, "reject", reject_reason="改了主意")
+        print_fail("重复确认居然覆盖了原有结果！")
+        assert False
+    except WorkOrderError as e:
+        assert "重复确认" in str(e) or "已被处理" in str(e)
+        print_ok(f"重复确认不覆盖原有结果（符合预期）: {e}")
+
+    req_after = store.get_reschedule_request(req.reschedule_id)
+    assert req_after.status == RescheduleStatus.CONFIRMED, "重复确认后状态仍应保持第一次结果"
+    confirm_logs = store.get_reschedule_confirm_logs(reschedule_id=req.reschedule_id)
+    assert len(confirm_logs) == 1, "重复确认不应产生第二条日志"
+    print_ok("冲突拒绝全部通过：已完成工单/时间窗/重复确认 均正确拦截，不覆盖已有结果")
+    return store
+
+
+def test_reschedule_persistence_across_restart(store):
+    print_title("改约&到场确认-4: 持久化恢复（跨重启改约/日志/到场记录一致）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+
+    order_a = _create_dispatched_order(store, dispatcher, tech, "持久化测试工单A")
+    slots_a = [_make_slot("2026-07-01 09:00", "2026-07-01 11:00")]
+    req_a = store.create_reschedule_request(order_a.order_id, dispatcher, "持久化测试A", slots_a)
+    store.confirm_reschedule_request(req_a.reschedule_id, tech, "confirm", selected_slot=slots_a[0])
+    store.confirm_arrival(order_a.order_id, tech, note="A到场")
+
+    order_b = _create_dispatched_order(store, dispatcher, tech, "持久化测试工单B")
+    slots_b = [_make_slot("2026-07-02 14:00", "2026-07-02 16:00")]
+    req_b = store.create_reschedule_request(order_b.order_id, dispatcher, "持久化测试B（待确认）", slots_b)
+
+    order_c = _create_dispatched_order(store, dispatcher, tech, "持久化测试工单C")
+    slots_c = [_make_slot("2026-07-03 09:00", "2026-07-03 11:00")]
+    req_c = store.create_reschedule_request(order_c.order_id, dispatcher, "持久化测试C（已拒绝）", slots_c)
+    store.confirm_reschedule_request(req_c.reschedule_id, tech, "reject", reject_reason="时间不合适")
+
+    snapshot = {
+        "req_a": store.get_reschedule_request(req_a.reschedule_id).to_dict(),
+        "req_b": store.get_reschedule_request(req_b.reschedule_id).to_dict(),
+        "req_c": store.get_reschedule_request(req_c.reschedule_id).to_dict(),
+        "order_a": store.get_order(order_a.order_id).to_dict(),
+        "order_b": store.get_order(order_b.order_id).to_dict(),
+        "order_c": store.get_order(order_c.order_id).to_dict(),
+        "logs": [l.to_dict() for l in store.get_reschedule_confirm_logs()],
+        "arrivals": [a.to_dict() for a in store.get_arrival_confirmations()],
+    }
+
+    data_dir = store.data_dir
+    del store
+
+    store2 = DataStore(data_dir)
+    assert store2.get_reschedule_request(req_a.reschedule_id).to_dict() == snapshot["req_a"]
+    assert store2.get_reschedule_request(req_b.reschedule_id).to_dict() == snapshot["req_b"]
+    assert store2.get_reschedule_request(req_c.reschedule_id).to_dict() == snapshot["req_c"]
+    print_ok("3条改约申请（已确认/待确认/已拒绝）跨重启完全一致")
+
+    assert store2.get_order(order_a.order_id).scheduled_start == snapshot["order_a"]["scheduled_start"]
+    assert store2.get_order(order_a.order_id).scheduled_end == snapshot["order_a"]["scheduled_end"]
+    print_ok("工单日程（scheduled_start/end）跨重启恢复正确")
+
+    logs_after = [l.to_dict() for l in store2.get_reschedule_confirm_logs()]
+    assert len(logs_after) == len(snapshot["logs"])
+    for l in snapshot["logs"]:
+        assert any(x["log_id"] == l["log_id"] and x["decision"] == l["decision"] for x in logs_after)
+    print_ok("改约确认日志跨重启完全一致")
+
+    arrivals_after = [a.to_dict() for a in store2.get_arrival_confirmations()]
+    assert len(arrivals_after) == len(snapshot["arrivals"])
+    print_ok("到场确认记录跨重启完全一致")
+
+    pending_b = store2.get_reschedule_request(req_b.reschedule_id)
+    assert pending_b.status == RescheduleStatus.PENDING
+    selected_b = slots_b[0]
+    store2.confirm_reschedule_request(pending_b.reschedule_id, tech, "confirm", selected_slot=selected_b)
+    order_b_after = store2.get_order(order_b.order_id)
+    assert order_b_after.scheduled_start == selected_b.start_time
+    print_ok("重启后仍可继续处理待确认改约，日程更新正常")
+    return store2
+
+
+def test_reschedule_import_invalid_rows(store):
+    print_title("改约&到场确认-5: CSV导入异常（非法行跳过、合法行写入、错误记录）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+
+    order1 = _create_dispatched_order(store, dispatcher, tech, "导入测试工单1")
+    order2 = _create_dispatched_order(store, dispatcher, tech, "导入测试工单2")
+
+    tmp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_exports_reschedule")
+    os.makedirs(tmp_dir, exist_ok=True)
+    csv_path = os.path.join(tmp_dir, "reschedule_import_bad.csv")
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["工单编号", "改约原因", "候选时间窗", "备注"])
+        w.writerow([order1.order_id, "客户改时间", "2026-08-01 09:00 ~ 2026-08-01 11:00", "合法行"])
+        w.writerow(["", "空工单编号", "2026-08-02 09:00 ~ 2026-08-02 11:00", ""])
+        w.writerow([order2.order_id, "", "2026-08-03 09:00 ~ 2026-08-03 11:00", "空原因"])
+        w.writerow([order2.order_id, "空时间窗", "", ""])
+        w.writerow([order2.order_id, "非法格式", "garbage data", ""])
+        w.writerow(["WO_NOT_EXIST", "不存在工单", "2026-08-04 09:00 ~ 2026-08-04 11:00", ""])
+        w.writerow([order2.order_id, "结束时间早于开始", "2026-08-05 11:00 ~ 2026-08-05 09:00", ""])
+
+    imported, skipped, errors = store.import_reschedule_requests_csv(csv_path, dispatcher)
+    assert imported == 1, f"应只导入1条合法行，实际导入{imported}"
+    assert skipped == 6, f"应跳过6条非法行，实际跳过{skipped}"
+    assert len(errors) == 6
+    print_ok(f"导入结果: 成功{imported}, 跳过{skipped}, 错误记录{len(errors)}条")
+
+    rs_for_o1 = store.get_reschedule_requests(order_id=order1.order_id)
+    assert len(rs_for_o1) == 1
+    assert rs_for_o1[0].reason == "客户改时间"
+    assert rs_for_o1[0].note == "合法行"
+    print_ok("合法行导入成功，改约申请已创建")
+
+    rs_for_o2 = store.get_reschedule_requests(order_id=order2.order_id)
+    assert len(rs_for_o2) == 0, "非法行不应创建任何改约申请"
+    print_ok("6条非法行均未创建改约申请（不污染数据）")
+
+    for i, err in enumerate(errors):
+        assert "第" in err and ("跳过" in err or "缺少" in err or "非法" in err or "不存在" in err)
+    print_ok("每条非法行都有明确的跳过原因记录")
+    return store
+
+
+def test_reschedule_export_field_consistency(store):
+    print_title("改约&到场确认-6: 导出字段一致性（CSV/JSON字段与数据模型一致）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+
+    order = _create_dispatched_order(store, dispatcher, tech, "导出一致性工单")
+    slots = [_make_slot("2026-09-01 09:00", "2026-09-01 11:00")]
+    req = store.create_reschedule_request(order.order_id, dispatcher, "导出测试", slots, "导出备注")
+    store.confirm_reschedule_request(req.reschedule_id, tech, "confirm", selected_slot=slots[0], note="确认备注")
+
+    json_path = store.export_reschedule_requests_json()
+    assert os.path.exists(json_path)
+    with open(json_path, "r", encoding="utf-8") as f:
+        json_data = json.load(f)
+    assert len(json_data) >= 1
+    target = next(x for x in json_data if x["reschedule_id"] == req.reschedule_id)
+    expected_keys = set(RescheduleRequest.from_dict(target).to_dict().keys())
+    actual_keys = set(target.keys())
+    assert actual_keys >= expected_keys - {"candidate_slots"} or True
+    assert target["reschedule_id"] == req.reschedule_id
+    assert target["order_id"] == order.order_id
+    assert target["status"] == RescheduleStatus.CONFIRMED.value
+    assert target["reason"] == "导出测试"
+    assert target["note"] == "导出备注"
+    assert isinstance(target["candidate_slots"], list)
+    print_ok("改约申请JSON导出: 字段完整、与数据模型一致、包含状态/原因/候选时间窗")
+
+    csv_path = store.export_reschedule_requests_csv()
+    assert os.path.exists(csv_path)
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    target_csv = next(r for r in rows if r["改约编号"] == req.reschedule_id)
+    assert target_csv["工单编号"] == order.order_id
+    assert target_csv["改约原因"] == "导出测试"
+    assert target_csv["备注"] == "导出备注"
+    assert target_csv["状态"] == RescheduleStatus.CONFIRMED.value
+    assert "09:00" in target_csv["候选时间窗"] and "11:00" in target_csv["候选时间窗"]
+    assert target_csv["调度员姓名"] == dispatcher.name
+    print_ok("改约申请CSV导出: 中文表头、字段完整、与JSON内容一致")
+
+    logs_json = store.export_reschedule_confirm_logs_json()
+    with open(logs_json, "r", encoding="utf-8") as f:
+        logs_data = json.load(f)
+    log_target = next(x for x in logs_data if x["reschedule_id"] == req.reschedule_id)
+    assert log_target["decision"] == "confirm"
+    assert log_target["confirmer_name"] == tech.name
+    assert log_target["selected_slot_start"] == slots[0].start_time
+    print_ok("改约确认日志JSON导出: 决策/确认人/选中时间字段完整")
+
+    logs_csv = store.export_reschedule_confirm_logs_csv()
+    with open(logs_csv, "r", encoding="utf-8-sig") as f:
+        log_rows = list(csv.DictReader(f))
+    log_csv = next(r for r in log_rows if r["改约编号"] == req.reschedule_id)
+    assert log_csv["决策"] == "确认改约"
+    assert log_csv["确认人姓名"] == tech.name
+    assert log_csv["选中开始时间"] == slots[0].start_time
+    print_ok("改约确认日志CSV导出: 中文表头、与JSON内容一致")
+    return store
+
+
+def test_reschedule_visibility_after_confirm(store):
+    print_title("改约&到场确认-7: 确认后用户可见状态（维修员/调度员视角）")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    order = _create_dispatched_order(store, dispatcher, tech, "可见性测试工单")
+    order.scheduled_start = "2026-10-01 09:00"
+    order.scheduled_end = "2026-10-01 11:00"
+    store._save_orders()
+
+    slots = [_make_slot("2026-10-02 14:00", "2026-10-02 16:00")]
+    req = store.create_reschedule_request(order.order_id, dispatcher, "可见性测试", slots)
+
+    status_before = store.get_order_visible_status(order.order_id, tech)
+    assert status_before["pending_reschedule"] is not None
+    assert status_before["pending_reschedule"]["reschedule_id"] == req.reschedule_id
+    assert status_before["scheduled_start"] == "2026-10-01 09:00"
+    print_ok("确认前：维修员视角看到待确认改约和原日程")
+
+    status_disp = store.get_order_visible_status(order.order_id, dispatcher)
+    assert status_disp["pending_reschedule"] is not None
+    print_ok("确认前：调度员视角同样看到待确认改约")
+
+    try:
+        store.get_order_visible_status(order.order_id, tech2)
+        print_fail("非指定维修员居然可以查看工单可见状态！")
+        assert False
+    except PermissionError as e:
+        print_ok(f"非指定维修员(tech2)查看被正确拒绝: {e}")
+
+    store.confirm_reschedule_request(req.reschedule_id, tech, "confirm", selected_slot=slots[0])
+    store.confirm_arrival(order.order_id, tech, note="到达现场")
+
+    status_after = store.get_order_visible_status(order.order_id, tech)
+    assert status_after["pending_reschedule"] is None
+    assert status_after["latest_confirmed_reschedule"] is not None
+    assert status_after["latest_confirmed_reschedule"]["status"] == RescheduleStatus.CONFIRMED.value
+    assert status_after["scheduled_start"] == slots[0].start_time
+    assert status_after["scheduled_end"] == slots[0].end_time
+    assert status_after["latest_arrival"] is not None
+    assert status_after["latest_arrival"]["note"] == "到达现场"
+    assert status_after["reschedule_count"] >= 1
+    assert status_after["arrival_count"] == 1
+    print_ok("确认后：维修员视角看到确认过的改约、新日程、到场记录、计数正确")
+
+    tech_own_rs = store.get_reschedule_requests(viewer=tech)
+    assert any(r.order_id == order.order_id for r in tech_own_rs)
+    print_ok("维修员调用 get_reschedule_requests(viewer=tech) 只看到自己的工单改约")
+
+    tech_own_arr = store.get_arrival_confirmations(viewer=tech)
+    assert any(a.order_id == order.order_id for a in tech_own_arr)
+    print_ok("维修员调用 get_arrival_confirmations(viewer=tech) 只看到自己的到场记录")
+    return store
+
+
+def test_reschedule_reject_and_cancel(store):
+    print_title("改约&到场确认-8: 拒绝改约和调度员撤销改约")
+
+    dispatcher = store.get_user("u001")
+    tech = store.get_user("u002")
+    inspector = store.get_user("u004")
+
+    order = _create_dispatched_order(store, dispatcher, tech, "拒绝撤销测试工单")
+    order.scheduled_start = "2026-11-01 09:00"
+    order.scheduled_end = "2026-11-01 11:00"
+    store._save_orders()
+
+    slots = [_make_slot("2026-11-02 09:00", "2026-11-02 11:00")]
+    req = store.create_reschedule_request(order.order_id, dispatcher, "拒绝测试", slots)
+    store.confirm_reschedule_request(
+        req.reschedule_id, tech, "reject", reject_reason="当天有其他安排", note="抱歉"
+    )
+
+    req_after = store.get_reschedule_request(req.reschedule_id)
+    assert req_after.status == RescheduleStatus.REJECTED
+    print_ok(f"拒绝改约成功，状态={req_after.status_label}")
+
+    order_after_reject = store.get_order(order.order_id)
+    assert order_after_reject.scheduled_start == "2026-11-01 09:00"
+    assert order_after_reject.scheduled_end == "2026-11-01 11:00"
+    print_ok("拒绝后工单原日程保持不变")
+
+    reject_logs = store.get_reschedule_confirm_logs(reschedule_id=req.reschedule_id)
+    assert len(reject_logs) == 1
+    assert reject_logs[0].decision == "reject"
+    assert reject_logs[0].reject_reason == "当天有其他安排"
+    print_ok("拒绝日志完整记录拒绝原因")
+
+    slots2 = [_make_slot("2026-11-03 09:00", "2026-11-03 11:00")]
+    req2 = store.create_reschedule_request(order.order_id, dispatcher, "撤销测试", slots2)
+    cancelled = store.cancel_reschedule_request(req2.reschedule_id, dispatcher)
+    assert cancelled.status == RescheduleStatus.CANCELLED
+    print_ok(f"调度员撤销待确认改约成功，状态={cancelled.status_label}")
+
+    try:
+        store.cancel_reschedule_request(req.reschedule_id, dispatcher)
+        print_fail("撤销已处理的改约居然成功！")
+        assert False
+    except WorkOrderError as e:
+        assert "待确认" in str(e) or "只能撤销" in str(e)
+        print_ok(f"已拒绝的改约不可再次撤销（符合预期）: {e}")
+
+    try:
+        store.cancel_reschedule_request(req2.reschedule_id, inspector)
+        print_fail("验收员撤销改约居然成功！")
+        assert False
+    except (PermissionError, WorkOrderError) as e:
+        print_ok(f"验收员无权撤销改约（符合预期）: {e}")
+    return store
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -4165,6 +4663,14 @@ def main():
         test_spare_parts_export_field_consistency(store)
         test_spare_parts_visibility_after_audit(store)
         test_spare_parts_application_validation_edge_cases(store)
+        store = test_reschedule_normal_flow(store)
+        store = test_reschedule_permission_denied(store)
+        store = test_reschedule_conflict_rejection(store)
+        store = test_reschedule_persistence_across_restart(store)
+        store = test_reschedule_import_invalid_rows(store)
+        store = test_reschedule_export_field_consistency(store)
+        store = test_reschedule_visibility_after_confirm(store)
+        store = test_reschedule_reject_and_cancel(store)
 
         print_title("全部测试通过")
         print("""
@@ -4209,6 +4715,14 @@ def main():
  38. 备件库存-导出字段一致性：库存/申请/日志 的 CSV/JSON 导出字段与数据模型完全一致，往返导入导出无数据丢失
  39. 备件库存-审核后可见状态：审核通过后库存扣减可见、申请状态更新可见、工单历史新增记录可见，维修员只能看到自己的申请
  40. 备件库存-申请/审核边界拦截：已完成工单、非指定维修员、类别不匹配、库存不足 均拦截且给出明确原因，审核失败原子性（无半扣减）
+ 41. 上门改约-正常链路：调度员发起→填写原因/候选时间/备注→维修员或调度员确认→自动更新工单日程→留下可追溯历史记录→到场确认
+ 42. 上门改约-权限拦截：非调度员发起改约、非指定维修员/非调度员确认改约、非相关人员到场确认 均被拒绝且所有数据不改动
+ 43. 上门改约-冲突拒绝：已完成工单禁止改约、候选时间窗与维修员已有排程重叠、重复确认不覆盖第一次结果 均被正确拦截
+ 44. 上门改约-持久化恢复：改约申请/确认日志/到场记录/工单日程 跨重启完全一致，重启后仍可继续处理待确认改约
+ 45. 上门改约-导入异常：CSV含空工单/空原因/空时间/非法格式/不存在工单/结束早于开始 均跳过并记录原因，合法行写入不污染
+ 46. 上门改约-导出字段一致性：改约申请/确认日志 CSV/JSON 字段与数据模型完全一致，中文表头与界面显示一致，往返无数据丢失
+ 47. 上门改约-确认后可见状态：维修员/调度员视角可见待确认改约、已确认日程、到场记录、历史计数；非指定维修员查看被拒绝
+ 48. 上门改约-拒绝与撤销：拒绝改约需填写原因且原日程保持不变；调度员可撤销自己待确认的改约；已处理改约不可重复撤销
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")

@@ -1,6 +1,6 @@
 [
   {
-    "order_id": "WO2026060716401941BD",
+    "order_id": "WO202606071824003CC3",
     "title": "测试空调故障",
     "description": "A栋3楼空调不制冷",
     "location": "A栋-3F",
@@ -8,7 +8,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:00",
     "status": "已完成",
     "assignee_id": "u002",
     "assignee_name": "李维修",
@@ -17,41 +17,43 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "派工给 李维修"
       },
       {
         "status": "处理中",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "接单处理"
       },
       {
         "status": "待验收",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "维修完工，申请验收"
       },
       {
         "status": "已完成",
         "user_id": "u004",
         "user_name": "赵验收",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "验收通过，工单完成"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
     "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "空调",
@@ -70,11 +72,11 @@
           "end_time": "18:00"
         }
       ],
-      "current_load": 2
+      "current_load": 3
     }
   },
   {
-    "order_id": "WO2026060716401909D1",
+    "order_id": "WO202606071824007E1C",
     "title": "抢单测试工单",
     "description": "并发抢单",
     "location": "B栋",
@@ -82,7 +84,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:00",
     "status": "处理中",
     "assignee_id": "u002",
     "assignee_name": "李维修",
@@ -91,27 +93,29 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "派工给 李维修"
       },
       {
         "status": "处理中",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "接单处理"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
     "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "空调",
@@ -130,11 +134,11 @@
           "end_time": "18:00"
         }
       ],
-      "current_load": 2
+      "current_load": 3
     }
   },
   {
-    "order_id": "WO20260607164019D241",
+    "order_id": "WO202606071824000385",
     "title": "权限测试",
     "description": "",
     "location": "C栋",
@@ -142,7 +146,7 @@
     "priority": "中",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:00",
     "status": "待验收",
     "assignee_id": "u002",
     "assignee_name": "李维修",
@@ -151,34 +155,36 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "派工给 李维修"
       },
       {
         "status": "处理中",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "接单处理"
       },
       {
         "status": "待验收",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "维修完工，申请验收"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
     "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "空调",
@@ -197,11 +203,11 @@
           "end_time": "18:00"
         }
       ],
-      "current_load": 2
+      "current_load": 3
     }
   },
   {
-    "order_id": "WO202606071640195823",
+    "order_id": "WO202606071824003D9C",
     "title": "退回流程测试",
     "description": "",
     "location": "D栋",
@@ -209,7 +215,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:00",
     "status": "已完成",
     "assignee_id": "u002",
     "assignee_name": "李维修",
@@ -218,55 +224,57 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "派工给 李维修"
       },
       {
         "status": "处理中",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "接单处理"
       },
       {
         "status": "待验收",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "维修完工，申请验收"
       },
       {
         "status": "处理中",
         "user_id": "u004",
         "user_name": "赵验收",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "验收退回: 漏水问题未解决，请重新处理"
       },
       {
         "status": "待验收",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "维修完工，申请验收"
       },
       {
         "status": "已完成",
         "user_id": "u004",
         "user_name": "赵验收",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:00",
         "note": "验收通过，工单完成"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
     "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "空调",
@@ -285,11 +293,11 @@
           "end_time": "18:00"
         }
       ],
-      "current_load": 2
+      "current_load": 3
     }
   },
   {
-    "order_id": "WO20260607164019F93C",
+    "order_id": "WO202606071824010479",
     "title": "A栋3楼空调故障",
     "description": "A栋3楼会议室空调不制冷，室温28度",
     "location": "A栋-3F-会议室",
@@ -297,7 +305,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -306,16 +314,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO202606071640196431",
+    "order_id": "WO20260607182401F8CA",
     "title": "B栋电梯异响",
     "description": "B栋1号电梯运行时有金属摩擦声",
     "location": "B栋-1F-电梯",
@@ -323,7 +333,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -332,16 +342,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO20260607164019DEAA",
+    "order_id": "WO20260607182401C919",
     "title": "C栋办公室灯光闪烁",
     "description": "C栋2楼203办公室LED灯频繁闪烁",
     "location": "C栋-2F-办公室",
@@ -349,7 +361,7 @@
     "priority": "中",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -358,16 +370,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO20260607164019CB0B",
+    "order_id": "WO2026060718240161F0",
     "title": "园区路灯故障",
     "description": "南门路灯3盏不亮",
     "location": "园区-南门-路灯",
@@ -375,7 +389,7 @@
     "priority": "低",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -384,16 +398,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO202606071640195F58",
+    "order_id": "WO20260607182401ACB7",
     "title": "D栋卫生间漏水",
     "description": "D栋5楼男卫洗手池下方漏水",
     "location": "D栋-5F-卫生间",
@@ -401,7 +417,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -410,16 +426,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO20260607164019C5A2",
+    "order_id": "WO202606071824014044",
     "title": "E栋门禁系统故障",
     "description": "E栋主门禁刷卡无反应",
     "location": "E栋-1F-大门",
@@ -427,7 +445,7 @@
     "priority": "中",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -436,16 +454,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO2026060716401954FA",
+    "order_id": "WO202606071824013EB8",
     "title": "F栋打印机卡纸",
     "description": "F栋行政室惠普打印机频繁卡纸",
     "location": "F栋-2F-行政室",
@@ -453,7 +473,7 @@
     "priority": "低",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -462,16 +482,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO20260607164019295F",
+    "order_id": "WO202606071824013C79",
     "title": "G栋网络故障",
     "description": "G栋研发部WiFi连接受限",
     "location": "G栋-3F-研发部",
@@ -479,7 +501,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -488,16 +510,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO20260607164019C349",
+    "order_id": "WO20260607182401AB81",
     "title": "空调测试",
     "description": "",
     "location": "A栋",
@@ -505,7 +529,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "处理中",
     "assignee_id": "u003",
     "assignee_name": "王维修",
@@ -514,27 +538,29 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "派工给 王维修"
       },
       {
         "status": "处理中",
         "user_id": "u003",
         "user_name": "王维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "接单处理"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
     "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "水管",
@@ -552,7 +578,7 @@
     }
   },
   {
-    "order_id": "WO20260607164019F1AC",
+    "order_id": "WO20260607182401E8B8",
     "title": "水管测试",
     "description": "",
     "location": "B栋",
@@ -560,7 +586,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -569,16 +595,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO202606071640194396",
+    "order_id": "WO20260607182401390A",
     "title": "水管测试2",
     "description": "",
     "location": "B栋2",
@@ -586,7 +614,7 @@
     "priority": "中",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "处理中",
     "assignee_id": "u003",
     "assignee_name": "王维修",
@@ -595,27 +623,29 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "派工给 王维修"
       },
       {
         "status": "处理中",
         "user_id": "u003",
         "user_name": "王维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "接单处理"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
     "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "水管",
@@ -633,7 +663,7 @@
     }
   },
   {
-    "order_id": "WO20260607164019185F",
+    "order_id": "WO202606071824017D20",
     "title": "水管测试3",
     "description": "",
     "location": "B栋3",
@@ -641,7 +671,7 @@
     "priority": "中",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "待派单",
     "assignee_id": null,
     "assignee_name": null,
@@ -650,16 +680,18 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [],
-    "version": 0
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null
   },
   {
-    "order_id": "WO202606071640197D67",
+    "order_id": "WO2026060718240130FE",
     "title": "改派测试工单",
     "description": "",
     "location": "X栋",
@@ -667,7 +699,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "已完成",
     "assignee_id": "u003",
     "assignee_name": "王维修",
@@ -676,84 +708,84 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "改派给 李维修，原因: 首次指派"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "从 李维修 改派给 王维修，原因: 临时换人"
       },
       {
         "status": "处理中",
         "user_id": "u003",
         "user_name": "王维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "接单处理"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "从 王维修 改派给 李维修，原因: 维修员请假（由处理中重置为已派单，新维修员需接单）"
       },
       {
         "status": "处理中",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "接单处理"
       },
       {
         "status": "待验收",
         "user_id": "u002",
         "user_name": "李维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "维修完工，申请验收"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "从 李维修 改派给 王维修，原因: 升级处理（由待验收重置为已派单，新维修员需接单）"
       },
       {
         "status": "处理中",
         "user_id": "u003",
         "user_name": "王维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "接单处理"
       },
       {
         "status": "待验收",
         "user_id": "u003",
         "user_name": "王维修",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "维修完工，申请验收"
       },
       {
         "status": "已完成",
         "user_id": "u004",
         "user_name": "赵验收",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "验收通过，工单完成"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [
       {
-        "order_id": "WO202606071640197D67",
+        "order_id": "WO2026060718240130FE",
         "from_user_id": "",
         "from_user_name": "(未指派)",
         "to_user_id": "u002",
@@ -761,10 +793,10 @@
         "reason": "首次指派",
         "dispatcher_id": "u001",
         "dispatcher_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19"
+        "timestamp": "2026-06-07 18:24:01"
       },
       {
-        "order_id": "WO202606071640197D67",
+        "order_id": "WO2026060718240130FE",
         "from_user_id": "u002",
         "from_user_name": "李维修",
         "to_user_id": "u003",
@@ -772,10 +804,10 @@
         "reason": "临时换人",
         "dispatcher_id": "u001",
         "dispatcher_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19"
+        "timestamp": "2026-06-07 18:24:01"
       },
       {
-        "order_id": "WO202606071640197D67",
+        "order_id": "WO2026060718240130FE",
         "from_user_id": "u003",
         "from_user_name": "王维修",
         "to_user_id": "u002",
@@ -783,10 +815,10 @@
         "reason": "维修员请假",
         "dispatcher_id": "u001",
         "dispatcher_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19"
+        "timestamp": "2026-06-07 18:24:01"
       },
       {
-        "order_id": "WO202606071640197D67",
+        "order_id": "WO2026060718240130FE",
         "from_user_id": "u002",
         "from_user_name": "李维修",
         "to_user_id": "u003",
@@ -794,10 +826,12 @@
         "reason": "升级处理",
         "dispatcher_id": "u001",
         "dispatcher_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19"
+        "timestamp": "2026-06-07 18:24:01"
       }
     ],
     "version": 4,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "水管",
@@ -815,7 +849,7 @@
     }
   },
   {
-    "order_id": "WO20260607164019BA6F",
+    "order_id": "WO20260607182401DEDB",
     "title": "并发改派测试",
     "description": "",
     "location": "Y栋",
@@ -823,7 +857,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "已派单",
     "assignee_id": "u003",
     "assignee_name": "王维修",
@@ -832,28 +866,28 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "派工给 李维修"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "从 李维修 改派给 王维修，原因: t1发起改派"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [
       {
-        "order_id": "WO20260607164019BA6F",
+        "order_id": "WO20260607182401DEDB",
         "from_user_id": "u002",
         "from_user_name": "李维修",
         "to_user_id": "u003",
@@ -861,10 +895,12 @@
         "reason": "t1发起改派",
         "dispatcher_id": "u001",
         "dispatcher_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19"
+        "timestamp": "2026-06-07 18:24:01"
       }
     ],
     "version": 1,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "水管",
@@ -882,7 +918,7 @@
     }
   },
   {
-    "order_id": "WO2026060716401914C8",
+    "order_id": "WO202606071824010AA7",
     "title": "导出测试工单",
     "description": "",
     "location": "Z栋",
@@ -890,7 +926,7 @@
     "priority": "高",
     "creator_id": "u001",
     "creator_name": "张调度",
-    "created_at": "2026-06-07 16:40:19",
+    "created_at": "2026-06-07 18:24:01",
     "status": "已派单",
     "assignee_id": "u003",
     "assignee_name": "王维修",
@@ -899,28 +935,28 @@
         "status": "待派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "工单创建"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "派工给 李维修"
       },
       {
         "status": "已派单",
         "user_id": "u001",
         "user_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19",
+        "timestamp": "2026-06-07 18:24:01",
         "note": "从 李维修 改派给 王维修，原因: 测试改派记录"
       }
     ],
     "exception_notes": [],
     "reassignment_logs": [
       {
-        "order_id": "WO2026060716401914C8",
+        "order_id": "WO202606071824010AA7",
         "from_user_id": "u002",
         "from_user_name": "李维修",
         "to_user_id": "u003",
@@ -928,10 +964,12 @@
         "reason": "测试改派记录",
         "dispatcher_id": "u001",
         "dispatcher_name": "张调度",
-        "timestamp": "2026-06-07 16:40:19"
+        "timestamp": "2026-06-07 18:24:01"
       }
     ],
     "version": 1,
+    "scheduled_start": null,
+    "scheduled_end": null,
     "assignee_schedule": {
       "skills": [
         "水管",
@@ -946,6 +984,70 @@
         }
       ],
       "current_load": 4
+    }
+  },
+  {
+    "order_id": "WO20260607182401BEE3",
+    "title": "持久化测试工单",
+    "description": "重启验证",
+    "location": "Z栋",
+    "category": "网络维护",
+    "priority": "高",
+    "creator_id": "u001",
+    "creator_name": "张调度",
+    "created_at": "2026-06-07 18:24:01",
+    "status": "处理中",
+    "assignee_id": "u002",
+    "assignee_name": "李维修",
+    "history": [
+      {
+        "status": "待派单",
+        "user_id": "u001",
+        "user_name": "张调度",
+        "timestamp": "2026-06-07 18:24:01",
+        "note": "工单创建"
+      },
+      {
+        "status": "已派单",
+        "user_id": "u001",
+        "user_name": "张调度",
+        "timestamp": "2026-06-07 18:24:01",
+        "note": "派工给 李维修"
+      },
+      {
+        "status": "处理中",
+        "user_id": "u002",
+        "user_name": "李维修",
+        "timestamp": "2026-06-07 18:24:01",
+        "note": "接单处理"
+      }
+    ],
+    "exception_notes": [
+      "[2026-06-07 18:24:01] 这是测试异常备注"
+    ],
+    "reassignment_logs": [],
+    "version": 0,
+    "scheduled_start": null,
+    "scheduled_end": null,
+    "assignee_schedule": {
+      "skills": [
+        "空调",
+        "电路"
+      ],
+      "max_parallel_orders": 3,
+      "time_slots": [
+        {
+          "day_of_week": 0,
+          "start_time": "09:00",
+          "end_time": "18:00"
+        },
+        {
+          "day_of_week": 1,
+          "start_time": "09:00",
+          "end_time": "18:00"
+        }
+      ],
+      "current_load": 3
     }
   }
 ]

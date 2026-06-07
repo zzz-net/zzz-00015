@@ -33,6 +33,11 @@ from models import (
     SparePartRequest,
     SparePartRequestStatus,
     SparePartAuditLog,
+    RescheduleStatus,
+    RescheduleCandidateSlot,
+    RescheduleRequest,
+    RescheduleConfirmLog,
+    ArrivalConfirmation,
 )
 
 
@@ -69,6 +74,9 @@ class DataStore:
         self.spare_parts_file = os.path.join(data_dir, "spare_parts.json")
         self.spare_part_requests_file = os.path.join(data_dir, "spare_part_requests.json")
         self.spare_part_audit_logs_file = os.path.join(data_dir, "spare_part_audit_logs.json")
+        self.reschedule_requests_file = os.path.join(data_dir, "reschedule_requests.json")
+        self.reschedule_confirm_logs_file = os.path.join(data_dir, "reschedule_confirm_logs.json")
+        self.arrival_confirmations_file = os.path.join(data_dir, "arrival_confirmations.json")
         self._lock = threading.RLock()
         self._orders: Dict[str, WorkOrder] = {}
         self._users: Dict[str, User] = {}
@@ -80,6 +88,9 @@ class DataStore:
         self._spare_parts: Dict[str, SparePart] = {}
         self._spare_part_requests: Dict[str, SparePartRequest] = {}
         self._spare_part_audit_logs: Dict[str, SparePartAuditLog] = {}
+        self._reschedule_requests: Dict[str, RescheduleRequest] = {}
+        self._reschedule_confirm_logs: Dict[str, RescheduleConfirmLog] = {}
+        self._arrival_confirmations: Dict[str, ArrivalConfirmation] = {}
         self._ensure_data_dir()
         self._load_all()
 
@@ -98,6 +109,9 @@ class DataStore:
         self._load_spare_parts()
         self._load_spare_part_requests()
         self._load_spare_part_audit_logs()
+        self._load_reschedule_requests()
+        self._load_reschedule_confirm_logs()
+        self._load_arrival_confirmations()
         self._sync_revocation_statuses()
         if not self._users:
             self._init_default_users()
@@ -2439,3 +2453,555 @@ class DataStore:
             result = [l for l in result if l.part_id == part_id]
         result.sort(key=lambda l: l.timestamp, reverse=True)
         return result
+
+    # ----- Reschedule & Arrival Confirmation: Load/Save -----
+
+    def _load_reschedule_requests(self):
+        if os.path.exists(self.reschedule_requests_file):
+            try:
+                with open(self.reschedule_requests_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._reschedule_requests = {
+                        r["reschedule_id"]: RescheduleRequest.from_dict(r) for r in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._reschedule_requests = {}
+
+    def _save_reschedule_requests(self):
+        with open(self.reschedule_requests_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [r.to_dict() for r in self._reschedule_requests.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def _load_reschedule_confirm_logs(self):
+        if os.path.exists(self.reschedule_confirm_logs_file):
+            try:
+                with open(self.reschedule_confirm_logs_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._reschedule_confirm_logs = {
+                        l["log_id"]: RescheduleConfirmLog.from_dict(l) for l in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._reschedule_confirm_logs = {}
+
+    def _save_reschedule_confirm_logs(self):
+        with open(self.reschedule_confirm_logs_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [l.to_dict() for l in self._reschedule_confirm_logs.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def _load_arrival_confirmations(self):
+        if os.path.exists(self.arrival_confirmations_file):
+            try:
+                with open(self.arrival_confirmations_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._arrival_confirmations = {
+                        a["arrival_id"]: ArrivalConfirmation.from_dict(a) for a in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._arrival_confirmations = {}
+
+    def _save_arrival_confirmations(self):
+        with open(self.arrival_confirmations_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [a.to_dict() for a in self._arrival_confirmations.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    # ----- Reschedule: Core Operations -----
+
+    def _check_technician_schedule_conflict(
+        self,
+        technician_id: str,
+        new_slot: RescheduleCandidateSlot,
+        exclude_order_id: Optional[str] = None,
+    ) -> Optional[WorkOrder]:
+        for order in self._orders.values():
+            if exclude_order_id and order.order_id == exclude_order_id:
+                continue
+            if order.assignee_id != technician_id:
+                continue
+            if order.status in (Status.COMPLETED,):
+                continue
+            if not (order.scheduled_start and order.scheduled_end):
+                continue
+            order_slot = RescheduleCandidateSlot(order.scheduled_start, order.scheduled_end)
+            if order_slot.overlaps_with(new_slot):
+                return order
+        return None
+
+    def create_reschedule_request(
+        self,
+        order_id: str,
+        dispatcher: User,
+        reason: str,
+        candidate_slots: List[RescheduleCandidateSlot],
+        note: str = "",
+    ) -> RescheduleRequest:
+        self._check_permission(dispatcher, "create_reschedule")
+        if not reason or not reason.strip():
+            raise WorkOrderError("改约原因不能为空")
+        if not candidate_slots:
+            raise WorkOrderError("至少需要提供一个候选时间窗")
+        for slot in candidate_slots:
+            if not slot.is_valid():
+                raise WorkOrderError(f"非法时间窗: {slot}")
+
+        with self._lock:
+            order = self._orders.get(order_id)
+            if not order:
+                raise WorkOrderError(f"工单不存在: {order_id}")
+            if order.status == Status.COMPLETED:
+                raise WorkOrderError("已完成工单禁止改约")
+            if not order.assignee_id:
+                raise WorkOrderError("未派单的工单不能发起改约")
+
+            for pending in self._reschedule_requests.values():
+                if pending.order_id == order_id and pending.status == RescheduleStatus.PENDING:
+                    raise WorkOrderError("该工单已有待确认的改约申请，请先处理")
+
+            for slot in candidate_slots:
+                conflict_order = self._check_technician_schedule_conflict(
+                    order.assignee_id, slot, exclude_order_id=order_id
+                )
+                if conflict_order:
+                    raise WorkOrderError(
+                        f"时间窗冲突：候选时间 {slot} 与工单 {conflict_order.order_id} "
+                        f"({conflict_order.title}) 的已排程时间重叠"
+                    )
+
+            reschedule_id = "RS" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+            request = RescheduleRequest(
+                reschedule_id=reschedule_id,
+                order_id=order_id,
+                order_title=order.title,
+                dispatcher_id=dispatcher.user_id,
+                dispatcher_name=dispatcher.name,
+                reason=reason.strip(),
+                candidate_slots=candidate_slots,
+                note=note,
+                original_scheduled_start=order.scheduled_start,
+                original_scheduled_end=order.scheduled_end,
+            )
+            self._reschedule_requests[reschedule_id] = request
+            self._save_reschedule_requests()
+
+            self._add_history(
+                order, order.status, dispatcher,
+                f"发起改约申请[{reschedule_id}]，原因: {reason.strip()}，候选时间: "
+                + "; ".join(str(s) for s in candidate_slots)
+            )
+            order.bump_version()
+            self._save_orders()
+            return request
+
+    def cancel_reschedule_request(
+        self,
+        reschedule_id: str,
+        dispatcher: User,
+    ) -> RescheduleRequest:
+        self._check_permission(dispatcher, "cancel_reschedule")
+        with self._lock:
+            request = self._reschedule_requests.get(reschedule_id)
+            if not request:
+                raise WorkOrderError(f"改约申请不存在: {reschedule_id}")
+            if request.status != RescheduleStatus.PENDING:
+                raise WorkOrderError(f"只能撤销待确认状态的改约申请，当前状态: {request.status_label}")
+            if request.dispatcher_id != dispatcher.user_id:
+                raise PermissionError(f"只有发起人【{request.dispatcher_name}】可以撤销此改约申请")
+
+            request.status = RescheduleStatus.CANCELLED
+            request.bump_version()
+            self._save_reschedule_requests()
+
+            order = self._orders.get(request.order_id)
+            if order:
+                self._add_history(
+                    order, order.status, dispatcher,
+                    f"撤销改约申请[{reschedule_id}]"
+                )
+                order.bump_version()
+                self._save_orders()
+            return request
+
+    def confirm_reschedule_request(
+        self,
+        reschedule_id: str,
+        confirmer: User,
+        decision: str,
+        selected_slot: Optional[RescheduleCandidateSlot] = None,
+        reject_reason: str = "",
+        note: str = "",
+    ) -> Tuple[RescheduleRequest, RescheduleConfirmLog]:
+        if decision not in ("confirm", "reject"):
+            raise WorkOrderError(f"非法决策值: {decision}")
+
+        with self._lock:
+            request = self._reschedule_requests.get(reschedule_id)
+            if not request:
+                raise WorkOrderError(f"改约申请不存在: {reschedule_id}")
+            if request.status != RescheduleStatus.PENDING:
+                raise WorkOrderError(
+                    f"改约申请已被处理，当前状态: {request.status_label}，重复确认不覆盖原有结果"
+                )
+
+            order = self._orders.get(request.order_id)
+            if not order:
+                raise WorkOrderError(f"关联工单不存在: {request.order_id}")
+
+            is_assigned_tech = (
+                confirmer.role == Role.TECHNICIAN and
+                order.assignee_id == confirmer.user_id
+            )
+            is_dispatcher = confirmer.role == Role.DISPATCHER
+            if not (is_assigned_tech or is_dispatcher):
+                raise PermissionError(
+                    f"只有工单指定维修员或调度员可以确认此改约申请，"
+                    f"您【{confirmer.name}】无权操作"
+                )
+
+            self._check_permission(confirmer, "confirm_reschedule")
+
+            if decision == "confirm":
+                if not selected_slot:
+                    raise WorkOrderError("确认改约必须选择一个时间窗")
+                slot_valid = any(
+                    s.start_time == selected_slot.start_time and s.end_time == selected_slot.end_time
+                    for s in request.candidate_slots
+                )
+                if not slot_valid:
+                    raise WorkOrderError("选择的时间窗不在候选列表中")
+
+                if order.status == Status.COMPLETED:
+                    raise WorkOrderError("工单已完成，无法确认改约")
+
+                if order.assignee_id:
+                    conflict_order = self._check_technician_schedule_conflict(
+                        order.assignee_id, selected_slot, exclude_order_id=order.order_id
+                    )
+                    if conflict_order:
+                        raise WorkOrderError(
+                            f"时间窗冲突：选中时间 {selected_slot} 与工单 "
+                            f"{conflict_order.order_id} ({conflict_order.title}) 的已排程重叠"
+                        )
+
+                order.scheduled_start = selected_slot.start_time
+                order.scheduled_end = selected_slot.end_time
+                request.status = RescheduleStatus.CONFIRMED
+
+                self._add_history(
+                    order, order.status, confirmer,
+                    f"确认改约[{reschedule_id}]，新时间: {selected_slot}"
+                )
+            else:
+                if not reject_reason or not reject_reason.strip():
+                    raise WorkOrderError("拒绝改约必须填写原因")
+                request.status = RescheduleStatus.REJECTED
+                self._add_history(
+                    order, order.status, confirmer,
+                    f"拒绝改约[{reschedule_id}]，原因: {reject_reason.strip()}"
+                )
+
+            request.bump_version()
+            order.bump_version()
+
+            log_id = "RCL" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+            log = RescheduleConfirmLog(
+                log_id=log_id,
+                reschedule_id=reschedule_id,
+                order_id=request.order_id,
+                confirmer_id=confirmer.user_id,
+                confirmer_name=confirmer.name,
+                confirmer_role=confirmer.role.value,
+                decision=decision,
+                selected_slot_start=selected_slot.start_time if (decision == "confirm" and selected_slot) else None,
+                selected_slot_end=selected_slot.end_time if (decision == "confirm" and selected_slot) else None,
+                reject_reason=reject_reason.strip() if decision == "reject" else "",
+                note=note,
+            )
+            self._reschedule_confirm_logs[log_id] = log
+            self._save_reschedule_requests()
+            self._save_reschedule_confirm_logs()
+            self._save_orders()
+            return request, log
+
+    # ----- Reschedule: Queries -----
+
+    def get_reschedule_request(self, reschedule_id: str) -> Optional[RescheduleRequest]:
+        return self._reschedule_requests.get(reschedule_id)
+
+    def get_reschedule_requests(
+        self,
+        order_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[RescheduleStatus] = None,
+        viewer: Optional[User] = None,
+    ) -> List[RescheduleRequest]:
+        if viewer:
+            if viewer.role == Role.TECHNICIAN:
+                self._check_permission(viewer, "view_own_reschedules")
+            else:
+                self._check_permission(viewer, "view_reschedules")
+        result = list(self._reschedule_requests.values())
+        if viewer and viewer.role == Role.TECHNICIAN:
+            result = [r for r in result if self._orders.get(r.order_id) and
+                      self._orders.get(r.order_id).assignee_id == viewer.user_id]
+        if order_id:
+            result = [r for r in result if r.order_id == order_id]
+        if user_id:
+            result = [r for r in result if r.dispatcher_id == user_id]
+        if status:
+            result = [r for r in result if r.status == status]
+        result.sort(key=lambda r: r.created_at, reverse=True)
+        return result
+
+    def get_reschedule_confirm_logs(
+        self,
+        reschedule_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+    ) -> List[RescheduleConfirmLog]:
+        result = list(self._reschedule_confirm_logs.values())
+        if reschedule_id:
+            result = [l for l in result if l.reschedule_id == reschedule_id]
+        if order_id:
+            result = [l for l in result if l.order_id == order_id]
+        result.sort(key=lambda l: l.timestamp)
+        return result
+
+    # ----- Arrival Confirmation -----
+
+    def confirm_arrival(
+        self,
+        order_id: str,
+        confirmer: User,
+        note: str = "",
+    ) -> ArrivalConfirmation:
+        self._check_permission(confirmer, "confirm_arrival")
+        with self._lock:
+            order = self._orders.get(order_id)
+            if not order:
+                raise WorkOrderError(f"工单不存在: {order_id}")
+            if order.status == Status.COMPLETED:
+                raise WorkOrderError("工单已完成，无需到场确认")
+            if order.status not in (Status.DISPATCHED, Status.IN_PROGRESS, Status.PENDING_INSPECTION):
+                raise WorkOrderError(f"工单当前状态【{order.status.value}】不支持到场确认")
+
+            is_assigned_tech = (
+                confirmer.role == Role.TECHNICIAN and
+                order.assignee_id == confirmer.user_id
+            )
+            is_dispatcher = confirmer.role == Role.DISPATCHER
+            if not (is_assigned_tech or is_dispatcher):
+                raise PermissionError(
+                    f"只有工单指定维修员或调度员可以到场确认，"
+                    f"您【{confirmer.name}】无权操作"
+                )
+
+            arrival_id = "ARR" + datetime.now().strftime("%Y%m%d%H%M%S%f") + uuid.uuid4().hex[:4].upper()
+            arrival = ArrivalConfirmation(
+                arrival_id=arrival_id,
+                order_id=order_id,
+                order_title=order.title,
+                confirmer_id=confirmer.user_id,
+                confirmer_name=confirmer.name,
+                confirmer_role=confirmer.role.value,
+                scheduled_start=order.scheduled_start,
+                scheduled_end=order.scheduled_end,
+                note=note,
+            )
+            self._arrival_confirmations[arrival_id] = arrival
+            self._save_arrival_confirmations()
+
+            self._add_history(
+                order, order.status, confirmer,
+                f"到场确认[{arrival_id}]，备注: {note or '无'}"
+            )
+            order.bump_version()
+            self._save_orders()
+            return arrival
+
+    def get_arrival_confirmations(
+        self,
+        order_id: Optional[str] = None,
+        confirmer_id: Optional[str] = None,
+        viewer: Optional[User] = None,
+    ) -> List[ArrivalConfirmation]:
+        if viewer:
+            if viewer.role == Role.TECHNICIAN:
+                self._check_permission(viewer, "view_own_arrivals")
+            else:
+                self._check_permission(viewer, "view_arrivals")
+        result = list(self._arrival_confirmations.values())
+        if viewer and viewer.role == Role.TECHNICIAN:
+            result = [a for a in result if a.confirmer_id == viewer.user_id]
+        if order_id:
+            result = [a for a in result if a.order_id == order_id]
+        if confirmer_id:
+            result = [a for a in result if a.confirmer_id == confirmer_id]
+        result.sort(key=lambda a: a.timestamp, reverse=True)
+        return result
+
+    def get_order_visible_status(self, order_id: str, viewer: User) -> Dict:
+        order = self._orders.get(order_id)
+        if not order:
+            raise WorkOrderError(f"工单不存在: {order_id}")
+        if viewer.role == Role.TECHNICIAN and order.assignee_id != viewer.user_id:
+            raise PermissionError(f"您【{viewer.name}】不是该工单的维修员")
+
+        reschedules = self.get_reschedule_requests(order_id=order_id)
+        arrivals = self.get_arrival_confirmations(order_id=order_id)
+        pending_reschedule = next(
+            (r for r in reschedules if r.status == RescheduleStatus.PENDING), None
+        )
+        latest_confirmed = next(
+            (r for r in reschedules if r.status == RescheduleStatus.CONFIRMED), None
+        )
+        latest_arrival = arrivals[0] if arrivals else None
+
+        return {
+            "order_id": order.order_id,
+            "title": order.title,
+            "status": order.status.value,
+            "scheduled_start": order.scheduled_start,
+            "scheduled_end": order.scheduled_end,
+            "pending_reschedule": pending_reschedule.to_dict() if pending_reschedule else None,
+            "latest_confirmed_reschedule": latest_confirmed.to_dict() if latest_confirmed else None,
+            "latest_arrival": latest_arrival.to_dict() if latest_arrival else None,
+            "reschedule_count": len(reschedules),
+            "arrival_count": len(arrivals),
+        }
+
+    # ----- Reschedule: Import/Export -----
+
+    def export_reschedule_requests_json(
+        self,
+        requests: Optional[List[RescheduleRequest]] = None,
+    ) -> str:
+        filepath = self._get_export_path(f"reschedule_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        data = requests or list(self._reschedule_requests.values())
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump([r.to_dict() for r in data], f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            raise ExportError(f"写入JSON文件失败: {str(e)}")
+        return filepath
+
+    def export_reschedule_requests_csv(
+        self,
+        requests: Optional[List[RescheduleRequest]] = None,
+    ) -> str:
+        filepath = self._get_export_path(f"reschedule_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        data = requests or list(self._reschedule_requests.values())
+        try:
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "改约编号", "工单编号", "工单标题", "调度员ID", "调度员姓名",
+                    "改约原因", "候选时间窗", "备注", "状态", "创建时间", "版本",
+                    "原排程开始", "原排程结束",
+                ])
+                for r in data:
+                    writer.writerow([
+                        r.reschedule_id, r.order_id, r.order_title,
+                        r.dispatcher_id, r.dispatcher_name,
+                        r.reason,
+                        "; ".join(str(s) for s in r.candidate_slots),
+                        r.note, r.status_label, r.created_at, r.version,
+                        r.original_scheduled_start or "", r.original_scheduled_end or "",
+                    ])
+        except OSError as e:
+            raise ExportError(f"写入CSV文件失败: {str(e)}")
+        return filepath
+
+    def export_reschedule_confirm_logs_json(
+        self,
+        logs: Optional[List[RescheduleConfirmLog]] = None,
+    ) -> str:
+        filepath = self._get_export_path(f"reschedule_confirm_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        data = logs or list(self._reschedule_confirm_logs.values())
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump([l.to_dict() for l in data], f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            raise ExportError(f"写入JSON文件失败: {str(e)}")
+        return filepath
+
+    def export_reschedule_confirm_logs_csv(
+        self,
+        logs: Optional[List[RescheduleConfirmLog]] = None,
+    ) -> str:
+        filepath = self._get_export_path(f"reschedule_confirm_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        data = logs or list(self._reschedule_confirm_logs.values())
+        try:
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "日志编号", "改约编号", "工单编号",
+                    "确认人ID", "确认人姓名", "确认人角色",
+                    "决策", "选中开始时间", "选中结束时间",
+                    "拒绝原因", "备注", "时间戳",
+                ])
+                for l in data:
+                    writer.writerow([
+                        l.log_id, l.reschedule_id, l.order_id,
+                        l.confirmer_id, l.confirmer_name, l.confirmer_role,
+                        l.decision_label, l.selected_slot_start or "", l.selected_slot_end or "",
+                        l.reject_reason, l.note, l.timestamp,
+                    ])
+        except OSError as e:
+            raise ExportError(f"写入CSV文件失败: {str(e)}")
+        return filepath
+
+    def import_reschedule_requests_csv(
+        self,
+        filepath: str,
+        dispatcher: User,
+    ) -> Tuple[int, int, List[str]]:
+        self._check_permission(dispatcher, "import_reschedules")
+        imported = 0
+        skipped = 0
+        errors: List[str] = []
+        try:
+            with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader, start=2):
+                    try:
+                        order_id = (row.get("工单编号") or "").strip()
+                        reason = (row.get("改约原因") or "").strip()
+                        slots_raw = (row.get("候选时间窗") or "").strip()
+                        note = (row.get("备注") or "").strip()
+                        if not order_id:
+                            raise WorkOrderError("缺少工单编号")
+                        if not reason:
+                            raise WorkOrderError("缺少改约原因")
+                        if not slots_raw:
+                            raise WorkOrderError("缺少候选时间窗")
+                        slots: List[RescheduleCandidateSlot] = []
+                        for part in slots_raw.split(";"):
+                            part = part.strip()
+                            if not part:
+                                continue
+                            if "~" in part:
+                                s, e = [x.strip() for x in part.split("~", 1)]
+                            elif "-" in part and part.count(" ") >= 3:
+                                parts = part.split()
+                                s = " ".join(parts[:2])
+                                e = " ".join(parts[3:5]) if len(parts) >= 5 else ""
+                            else:
+                                raise WorkOrderError(f"无法解析时间窗: {part}")
+                            slot = RescheduleCandidateSlot(s, e)
+                            if not slot.is_valid():
+                                raise WorkOrderError(f"非法时间窗: {part}")
+                            slots.append(slot)
+                        if not slots:
+                            raise WorkOrderError("未解析出有效候选时间窗")
+                        self.create_reschedule_request(order_id, dispatcher, reason, slots, note)
+                        imported += 1
+                    except Exception as e:
+                        skipped += 1
+                        errors.append(f"第{i}行跳过: {str(e)}")
+        except (OSError, csv.Error) as e:
+            raise WorkOrderError(f"读取CSV文件失败: {str(e)}")
+        return imported, skipped, errors
