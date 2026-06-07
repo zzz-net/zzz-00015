@@ -12,10 +12,9 @@
     "name": "李维修",
     "role": "technician",
     "skills": [
-      "空调",
       "电路"
     ],
-    "max_parallel_orders": 5,
+    "max_parallel_orders": 100,
     "time_slots": [
       {
         "day_of_week": 0,
@@ -34,9 +33,10 @@
     "name": "王维修",
     "role": "technician",
     "skills": [
-      "水管"
+      "水管",
+      "空调"
     ],
-    "max_parallel_orders": 1,
+    "max_parallel_orders": 13,
     "time_slots": [
       {
         "day_of_week": 2,

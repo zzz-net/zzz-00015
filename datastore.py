@@ -1206,10 +1206,34 @@ class DataStore:
                     continue
 
                 current_match = self.calculate_match(order, tech)
+                realtime_conflicts: List[str] = []
+                skip_reasons: List[str] = []
                 if not current_match.skill_match:
-                    conflict_types.append(ConflictType.TECHNICIAN_SKILLS_CHANGED.value)
+                    realtime_conflicts.append(ConflictType.TECHNICIAN_SKILLS_CHANGED.value)
+                    required = CATEGORY_SKILL_MAP.get(order.category, "通用")
+                    skip_reasons.append(f"目标维修员【{tech.name}】缺少所需技能: {required}")
                 if not current_match.within_capacity:
-                    conflict_types.append(ConflictType.TECHNICIAN_CAPACITY_CHANGED.value)
+                    realtime_conflicts.append(ConflictType.TECHNICIAN_CAPACITY_CHANGED.value)
+                    skip_reasons.append(
+                        f"目标维修员【{tech.name}】已达负载上限 {current_match.current_load}/{current_match.max_parallel}"
+                    )
+                if not current_match.available_now:
+                    realtime_conflicts.append(ConflictType.TECHNICIAN_SCHEDULE_CHANGED.value)
+
+                if skip_reasons:
+                    result.results.append(BatchItemResult(
+                        order_id=item.order_id,
+                        success=False,
+                        skipped=True,
+                        target_technician_id=tech.user_id,
+                        target_technician_name=tech.name,
+                        reason=item.reason,
+                        error_message="；".join(skip_reasons),
+                        conflict_types=realtime_conflicts,
+                    ))
+                    continue
+
+                conflict_types.extend(realtime_conflicts)
 
                 try:
                     self.reassign_order(

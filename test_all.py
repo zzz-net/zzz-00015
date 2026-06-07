@@ -1614,6 +1614,12 @@ def test_batch_reassignment_datastore(store):
     order3_v = store.get_order(order3.order_id).version
 
     order_ids = [order1.order_id, order2.order_id, order3.order_id]
+
+    if "空调" not in tech2.skills:
+        tech2.skills.append("空调")
+        store._save_users()
+    print_ok(f"测试20: 确保 tech2【{tech2.name}】包含空调技能: {tech2.skills}")
+
     items = store.generate_batch_recommendations(order_ids, dispatcher)
     assert len(items) == 3, f"应为3条推荐，实际{len(items)}"
     for it in items:
@@ -1701,6 +1707,13 @@ def test_batch_reassignment_datastore(store):
     conflicts_more = store2.detect_batch_conflicts(restored)
     assert order3.order_id in conflicts_more
     print_ok(f"冲突检测: 工单3（已完成）检测到状态变更冲突")
+
+    tech2_ensure = store2.get_user("u003")
+    current_load_t2 = store2.get_technician_load("u003")
+    tech2_ensure.max_parallel_orders = max(current_load_t2 + 5, 50)
+    store2._save_users()
+    load_t2 = store2.get_technician_load("u003")
+    print_ok(f"测试20: 确保 tech2 容量充足，当前负载 {load_t2}/{tech2_ensure.max_parallel_orders}")
 
     result = store2.execute_batch_reassignment(restored, dispatcher2)
     assert result.dispatcher_id == dispatcher2.user_id
@@ -1837,6 +1850,11 @@ def test_gui_batch_reassignment():
         store.dispatch_order(order_b.order_id, tech1, dispatcher)
         order_c = store.create_order("GUI批量C", "", "GUIBTC", "电路维修", "低", dispatcher)
 
+        if "空调" not in tech2.skills:
+            tech2.skills.append("空调")
+            store._save_users()
+        print_ok(f"GUI测试21: 确保 tech2【{tech2.name}】包含空调技能: {tech2.skills}")
+
         items = store.generate_batch_recommendations([order_a.order_id, order_b.order_id, order_c.order_id], dispatcher)
         pre_draft = store.save_batch_reassignment_draft(dispatcher, items)
         print_ok(f"GUI测试: 预保存批量草稿 {pre_draft.draft_id}")
@@ -1898,6 +1916,11 @@ def test_gui_batch_reassignment():
             assert tags is not None
         print_ok("GUI冲突行样式配置正常（conflict 标记）")
 
+        if "空调" not in tech2.skills:
+            tech2.skills.append("空调")
+            store._save_users()
+        print_ok(f"GUI测试21: 确保 tech2【{tech2.name}】包含空调技能: {tech2.skills}")
+
         for it in dlg.draft_items:
             if it.order_id == order_a.order_id:
                 it.target_technician_id = tech2.user_id
@@ -1906,6 +1929,11 @@ def test_gui_batch_reassignment():
                 it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
                 it.tech_max_parallel_snapshot = tech2.max_parallel_orders
                 break
+        current_load_t2_gui = store.get_technician_load("u003")
+        tech2.max_parallel_orders = max(current_load_t2_gui + 5, 50)
+        store._save_users()
+        load_t2_gui = store.get_technician_load("u003")
+        print_ok(f"GUI测试21: 确保 tech2 容量充足，当前负载 {load_t2_gui}/{tech2.max_parallel_orders}")
         dlg._refresh_detail_view()
         root.update()
         print_ok("GUI测试: 修改工单A的目标维修员为王维修（tech2）")
@@ -1996,6 +2024,290 @@ def test_gui_batch_reassignment():
             shutil.rmtree(gui_export_dir)
 
 
+def test_batch_realtime_validation_datastore(store):
+    print_title("测试22: 批量改派实时校验 - 技能/容量失效时正确跳过、不误写日志、导出字段完整")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+    inspector = store.get_user("u004")
+
+    rt_export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_exports_batch_rt")
+    if os.path.exists(rt_export_dir):
+        shutil.rmtree(rt_export_dir)
+    os.makedirs(rt_export_dir, exist_ok=True)
+    store.set_export_dir(rt_export_dir)
+
+    order_s = store.create_order("RT技能场景", "", "RTS栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_s.order_id, tech2, dispatcher)
+    order_l = store.create_order("RT容量场景", "", "RTL栋", "水管维修", "中", dispatcher)
+    store.dispatch_order(order_l.order_id, tech1, dispatcher)
+    order_o = store.create_order("RT正常场景", "", "RTO栋", "电路维修", "低", dispatcher)
+    store.dispatch_order(order_o.order_id, tech2, dispatcher)
+
+    items = store.generate_batch_recommendations(
+        [order_s.order_id, order_l.order_id, order_o.order_id], dispatcher
+    )
+
+    for it in items:
+        if it.order_id == order_s.order_id:
+            it.target_technician_id = tech1.user_id
+            it.reason = "技能将被删除测试"
+            it.tech_skills_snapshot = list(tech1.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech1.time_slots]
+            it.tech_max_parallel_snapshot = tech1.max_parallel_orders
+        elif it.order_id == order_l.order_id:
+            it.target_technician_id = tech2.user_id
+            it.reason = "容量将满测试"
+            it.tech_skills_snapshot = list(tech2.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+            it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+        elif it.order_id == order_o.order_id:
+            it.target_technician_id = tech1.user_id
+            it.reason = "正常改派测试"
+            it.tech_skills_snapshot = list(tech1.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech1.time_slots]
+            it.tech_max_parallel_snapshot = tech1.max_parallel_orders
+
+    rt_draft = store.save_batch_reassignment_draft(dispatcher, items)
+    print_ok(f"实时校验测试: 草稿保存成功，共 {len(rt_draft.items)} 条")
+
+    load_t1_before = store.get_technician_load("u002")
+    tech1.max_parallel_orders = max(load_t1_before + 10, 100)
+    store._save_users()
+    print_ok(f"实时校验测试: tech1【{tech1.name}】容量放大到 {tech1.max_parallel_orders}（当前负载 {load_t1_before}）")
+
+    if "空调" in tech1.skills:
+        tech1.skills.remove("空调")
+    store._save_users()
+    print_ok(f"实时校验测试: 移除 tech1【{tech1.name}】的空调技能")
+
+    load_t2 = store.get_technician_load("u003")
+    tech2.max_parallel_orders = max(load_t2, 1)
+    store._save_users()
+    filler_count = 0
+    while store.get_technician_load("u003") < tech2.max_parallel_orders:
+        try:
+            f_order = store.create_order(f"RT填充{filler_count}", "", f"FL{filler_count}栋", "水管维修", "低", dispatcher)
+            store.dispatch_order(f_order.order_id, tech2, dispatcher)
+            store.accept_order(f_order.order_id, tech2)
+            filler_count += 1
+            if filler_count > 20:
+                break
+        except Exception:
+            break
+    load_t2_after = store.get_technician_load("u003")
+    print_ok(
+        f"实时校验测试: tech2【{tech2.name}】塞满负载，当前 {load_t2_after}/{tech2.max_parallel_orders}"
+    )
+
+    result = store.execute_batch_reassignment(rt_draft, dispatcher)
+    assert result.success_count == 1, f"应只有1条成功，实际成功={result.success_count}"
+    assert result.skipped_count == 2, f"应有2条跳过，实际跳过={result.skipped_count}"
+    print_ok(f"实时校验测试: 批量执行结果 成功={result.success_count}, 跳过={result.skipped_count}")
+
+    for r in result.results:
+        if r.order_id == order_s.order_id:
+            assert not r.success
+            assert r.skipped
+            assert r.error_message is not None and "缺少所需技能" in r.error_message
+            assert any("skills_changed" in c for c in (r.conflict_types or []))
+            print_ok(f"实时校验测试: 技能失效工单正确跳过 - {r.error_message}")
+        elif r.order_id == order_l.order_id:
+            assert not r.success
+            assert r.skipped
+            assert r.error_message is not None and "已达负载上限" in r.error_message
+            assert any("capacity_changed" in c for c in (r.conflict_types or []))
+            print_ok(f"实时校验测试: 容量已满工单正确跳过 - {r.error_message}")
+        elif r.order_id == order_o.order_id:
+            assert r.success
+            assert r.target_technician_id == tech1.user_id
+            print_ok(f"实时校验测试: 正常工单改派成功 - 目标={r.target_technician_name}")
+
+    logs_s = store.get_reassignment_logs(order_s.order_id)
+    logs_l = store.get_reassignment_logs(order_l.order_id)
+    logs_o = store.get_reassignment_logs(order_o.order_id)
+    assert len(logs_s) == 0, "技能失效工单不应写入改派日志"
+    assert len(logs_l) == 0, "容量已满工单不应写入改派日志"
+    assert len(logs_o) >= 1, "正常工单应写入改派日志"
+    print_ok("实时校验测试: 仅成功工单写入改派日志，被跳过工单无误写")
+
+    order_o_final = store.get_order(order_o.order_id)
+    assert order_o_final.assignee_id == tech1.user_id
+    order_s_final = store.get_order(order_s.order_id)
+    assert order_s_final.assignee_id == tech2.user_id
+    order_l_final = store.get_order(order_l.order_id)
+    assert order_l_final.assignee_id == tech1.user_id
+    print_ok("实时校验测试: 被跳过工单的维修员未被改动")
+
+    remaining_draft = store.get_batch_reassignment_draft(rt_draft.draft_id, dispatcher)
+    remaining_ids = {it.order_id for it in remaining_draft.items}
+    assert order_o.order_id not in remaining_ids
+    assert order_s.order_id in remaining_ids
+    assert order_l.order_id in remaining_ids
+    print_ok("实时校验测试: 成功项从草稿移除，跳过项保留供调度员调整")
+
+    csv_path = store.export_batch_result_csv(result)
+    json_path = store.export_batch_result_json(result)
+    assert os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    assert os.path.exists(json_path) and os.path.getsize(json_path) > 0
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        assert "提交人" in header
+        rows = list(reader)
+        content_joined = ",".join(header) + "\n" + "\n".join([",".join(r) for r in rows])
+        assert dispatcher.name in content_joined
+        assert "缺少所需技能" in content_joined
+        assert "已达负载上限" in content_joined
+        assert "成功" in content_joined and "跳过" in content_joined
+    with open(json_path, "r", encoding="utf-8") as f:
+        json_content = f.read()
+        jdata = json.loads(json_content)
+    assert jdata["dispatcher_name"] == dispatcher.name
+    assert json_content.count("缺少所需技能") >= 1
+    assert json_content.count("已达负载上限") >= 1
+    assert jdata["success_count"] == 1
+    assert jdata["skipped_count"] == 2
+    print_ok("实时校验测试: CSV/JSON 导出字段正确（含提交人、成功/跳过原因）")
+
+    print_ok("批量改派实时校验（DataStore层）全部验证通过")
+    return store
+
+
+def test_gui_batch_realtime_validation():
+    print_title("测试23: GUI 批量改派实时校验 - 技能/容量失效时用户可见跳过提示")
+
+    import tkinter as tk
+    from tkinter import messagebox
+
+    gui_rt_data = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_batch_rt_data")
+    gui_rt_export = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_batch_rt_export")
+    if os.path.exists(gui_rt_data):
+        shutil.rmtree(gui_rt_data)
+    if os.path.exists(gui_rt_export):
+        shutil.rmtree(gui_rt_export)
+
+    captured = {"showerror": [], "showinfo": [], "showwarning": [], "askyesno": []}
+
+    def fake_showerror(title, msg, **kw):
+        captured["showerror"].append((title, msg))
+
+    def fake_showinfo(title, msg, **kw):
+        captured["showinfo"].append((title, msg))
+
+    def fake_showwarning(title, msg, **kw):
+        captured["showwarning"].append((title, msg))
+
+    def fake_askyesno(title, msg, **kw):
+        captured["askyesno"].append((title, msg))
+        return True
+
+    orig_showerror = messagebox.showerror
+    orig_showinfo = messagebox.showinfo
+    orig_showwarning = messagebox.showwarning
+    orig_askyesno = messagebox.askyesno
+    messagebox.showerror = fake_showerror
+    messagebox.showinfo = fake_showinfo
+    messagebox.showwarning = fake_showwarning
+    messagebox.askyesno = fake_askyesno
+
+    root = None
+    try:
+        store = DataStore(gui_rt_data)
+        store.set_export_dir(gui_rt_export)
+        dispatcher = store.get_user("u001")
+        tech1 = store.get_user("u002")
+        tech2 = store.get_user("u003")
+
+        order_s = store.create_order("GUIRT技能", "", "GRTS", "空调维修", "高", dispatcher)
+        store.dispatch_order(order_s.order_id, tech2, dispatcher)
+        order_o = store.create_order("GUIRT正常", "", "GRTO", "电路维修", "低", dispatcher)
+        store.dispatch_order(order_o.order_id, tech2, dispatcher)
+
+        items = store.generate_batch_recommendations([order_s.order_id, order_o.order_id], dispatcher)
+        for it in items:
+            if it.order_id == order_s.order_id:
+                it.target_technician_id = tech1.user_id
+                it.reason = "GUI技能失效"
+                it.tech_skills_snapshot = list(tech1.skills)
+                it.tech_schedule_snapshot = [ts.to_dict() for ts in tech1.time_slots]
+                it.tech_max_parallel_snapshot = tech1.max_parallel_orders
+            elif it.order_id == order_o.order_id:
+                it.target_technician_id = tech1.user_id
+                it.reason = "GUI正常改派"
+                it.tech_skills_snapshot = list(tech1.skills)
+                it.tech_schedule_snapshot = [ts.to_dict() for ts in tech1.time_slots]
+                it.tech_max_parallel_snapshot = tech1.max_parallel_orders
+        gui_rt_draft = store.save_batch_reassignment_draft(dispatcher, items)
+
+        load_t1_gui_rt = store.get_technician_load("u002")
+        tech1.max_parallel_orders = max(load_t1_gui_rt + 5, 50)
+        store._save_users()
+
+        if "空调" in tech1.skills:
+            tech1.skills.remove("空调")
+        store._save_users()
+        print_ok(f"GUI实时校验测试: 移除 tech1 空调技能，保留电路技能；容量放大到 {tech1.max_parallel_orders}")
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+
+        from main import MaintenanceApp, BatchReassignDialog
+        app = MaintenanceApp.__new__(MaintenanceApp)
+        app.root = root
+        app.store = store
+        app.current_user = dispatcher
+        app._configure_styles()
+
+        dlg = BatchReassignDialog(root, store, dispatcher, gui_rt_draft)
+        root.update()
+
+        captured["showinfo"].clear()
+        captured["askyesno"].clear()
+        dlg._on_submit_batch()
+        root.update()
+
+        assert dlg.last_result is not None
+        result = dlg.last_result
+        assert result.success_count == 1
+        assert result.skipped_count == 1
+        print_ok(f"GUI实时校验: 批量提交结果 成功={result.success_count}, 跳过={result.skipped_count}")
+
+        result_text = dlg.result_text.get("1.0", tk.END)
+        assert "缺少所需技能" in result_text or "技能" in result_text
+        assert "跳过" in result_text and "成功" in result_text
+        assert dispatcher.name in result_text
+        print_ok("GUI实时校验: 结果文本框可见跳过原因、成功计数和提交人")
+
+        logs_s = store.get_reassignment_logs(order_s.order_id)
+        logs_o = store.get_reassignment_logs(order_o.order_id)
+        assert len(logs_s) == 0, "GUI技能失效工单不应写入改派日志"
+        assert len(logs_o) >= 1, "GUI正常工单应写入改派日志"
+        print_ok("GUI实时校验: 仅成功工单写入改派日志，跳过项无误写")
+
+        dlg.destroy()
+        root.update()
+        print_ok("GUI 批量改派实时校验全部验证通过")
+
+    finally:
+        messagebox.showerror = orig_showerror
+        messagebox.showinfo = orig_showinfo
+        messagebox.showwarning = orig_showwarning
+        messagebox.askyesno = orig_askyesno
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        if os.path.exists(gui_rt_data):
+            shutil.rmtree(gui_rt_data)
+        if os.path.exists(gui_rt_export):
+            shutil.rmtree(gui_rt_export)
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -2024,6 +2336,8 @@ def main():
         test_gui_reassign_drafts()
         store = test_batch_reassignment_datastore(store)
         test_gui_batch_reassignment()
+        store = test_batch_realtime_validation_datastore(store)
+        test_gui_batch_realtime_validation()
 
         print_title("全部测试通过")
         print("""
@@ -2049,6 +2363,8 @@ def main():
  19. GUI 改派草稿：弹窗自动载入草稿、一键清除、冲突时提示且保留草稿
  20. 批量改派 DataStore：多工单推荐、草稿跨重启、冲突检测(版本/状态/维修员)、部分成功部分跳过、日志写入、CSV/JSON结果导出、权限拒绝
  21. GUI 批量改派：草稿自动载入+冲突标记、部分成功结果展示、导出功能、恢复草稿对话框
+ 22. 批量改派实时校验：技能/容量/排班失效时正确跳过、不误写改派日志、不改动被跳过工单、成功项移除草稿保留跳过项、CSV/JSON导出含跳过原因
+ 23. GUI 批量改派实时校验：结果文本框可见技能失效跳过原因、成功/跳过计数、仅成功工单写入日志
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")
