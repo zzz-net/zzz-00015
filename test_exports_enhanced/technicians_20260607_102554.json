@@ -1,0 +1,43 @@
+[
+  {
+    "user_id": "u002",
+    "name": "李维修",
+    "role": "technician",
+    "skills": [
+      "空调",
+      "电路"
+    ],
+    "max_parallel_orders": 3,
+    "time_slots": [
+      {
+        "day_of_week": 0,
+        "start_time": "09:00",
+        "end_time": "18:00"
+      },
+      {
+        "day_of_week": 1,
+        "start_time": "09:00",
+        "end_time": "18:00"
+      }
+    ],
+    "current_load": 2
+  },
+  {
+    "user_id": "u003",
+    "name": "王维修",
+    "role": "technician",
+    "skills": [
+      "水管",
+      "电梯"
+    ],
+    "max_parallel_orders": 2,
+    "time_slots": [
+      {
+        "day_of_week": 2,
+        "start_time": "08:00",
+        "end_time": "17:00"
+      }
+    ],
+    "current_load": 4
+  }
+]

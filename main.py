@@ -3,7 +3,7 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import os
 import sys
 from datetime import datetime
-from models import Role, Status, WorkOrder, User
+from models import Role, Status, WorkOrder, User, TimeSlot, CATEGORY_SKILL_MAP
 from datastore import (
     DataStore,
     WorkOrderError,
@@ -16,690 +16,1492 @@ from datastore import (
 
 PRIORITY_OPTIONS = ["高", "中", "低"]
 CATEGORY_OPTIONS = ["空调维修", "电梯维修", "电路维修", "照明维修", "水管维修", "门禁维修", "办公设备", "网络维护", "其他"]
+DAY_OPTIONS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+SKILL_OPTIONS = ["空调", "电梯", "电路", "水管", "门禁", "办公设备", "网络", "通用"]
+DAY_MAP = {d: i for i, d in enumerate(DAY_OPTIONS)}
 
 
-class MaintenanceApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("维修派工管理系统")
-        self.root.geometry("1200x750")
-        self.root.minsize(1000, 600)
+def get_score_color(score):
+    if score >= 80:
+        return "#2ecc71"
+    elif score >= 50:
+        return "#f39c12"
+    else:
+        return "#e74c3c"
 
-        try:
-            self.store = DataStore()
-        except Exception as e:
-            messagebox.showerror("初始化失败", f"数据存储初始化失败: {str(e)}")
-            sys.exit(1)
 
-        self.current_user: User = None
+def get_priority_color(priority):
+    if priority == "高":
+        return "#e74c3c"
+    elif priority == "中":
+        return "#f39c12"
+    else:
+        return "#3498db"
+
+
+def get_status_color(status):
+    color_map = {
+        Status.PENDING_DISPATCH: "#95a5a6",
+        Status.DISPATCHED: "#3498db",
+        Status.IN_PROGRESS: "#f39c12",
+        Status.PENDING_INSPECTION: "#9b59b6",
+        Status.COMPLETED: "#2ecc71",
+    }
+    return color_map.get(status, "#000000")
+
+
+class ReassignDialog(tk.Toplevel):
+    def __init__(self, parent, store, dispatcher, order):
+        super().__init__(parent)
+        self.store = store
+        self.dispatcher = dispatcher
+        self.order = order
+        self.expected_version = order.version
+        self.result = None
+        self.title("改派工单")
+        self.geometry("600x500")
+        self.configure(bg="#f5f6fa")
+        self.grab_set()
+        self.transient(parent)
         self._build_ui()
-        self._show_login()
 
     def _build_ui(self):
         style = ttk.Style()
+        style.configure("Reassign.Treeview", rowheight=28, font=("Microsoft YaHei", 9))
+        style.configure("Reassign.Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
+
+        info_frame = tk.Frame(self, bg="#f5f6fa")
+        info_frame.pack(fill=tk.X, padx=15, pady=10)
+        tk.Label(info_frame, text=f"工单: {self.order.order_id}", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").grid(row=0, column=0, sticky="w")
+        tk.Label(info_frame, text=f"标题: {self.order.title}", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=1, column=0, sticky="w", pady=2)
+        tk.Label(info_frame, text=f"类别: {self.order.category}  优先级: {self.order.priority}",
+                 font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=2, column=0, sticky="w", pady=2)
+        current = self.order.assignee_name or "(未指派)"
+        tk.Label(info_frame, text=f"当前维修员: {current}", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=3, column=0, sticky="w", pady=2)
+
+        tk.Label(self, text="选择新维修员（按匹配度排序）:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15)
+
+        tree_frame = tk.Frame(self, bg="#f5f6fa")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+        columns = ("tech_id", "name", "score", "skill", "available", "capacity", "warnings")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", style="Reassign.Treeview")
+        self.tree.heading("tech_id", text="工号")
+        self.tree.heading("name", text="姓名")
+        self.tree.heading("score", text="匹配分")
+        self.tree.heading("skill", text="技能")
+        self.tree.heading("available", text="时间")
+        self.tree.heading("capacity", text="负载")
+        self.tree.heading("warnings", text="备注")
+        self.tree.column("tech_id", width=70, anchor="center")
+        self.tree.column("name", width=80, anchor="center")
+        self.tree.column("score", width=70, anchor="center")
+        self.tree.column("skill", width=60, anchor="center")
+        self.tree.column("available", width=60, anchor="center")
+        self.tree.column("capacity", width=70, anchor="center")
+        self.tree.column("warnings", width=180, anchor="w")
+        self.tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.configure(yscrollcommand=sb.set)
+
+        self.tree.tag_configure("good", background="#eafaf1")
+        self.tree.tag_configure("partial", background="#fef9e7")
+        self.tree.tag_configure("bad", background="#fdedec")
+
+        self._load_technicians()
+
+        tk.Label(self, text="改派原因（必填）:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=15, pady=(10, 2))
+        self.reason_text = tk.Text(self, height=3, font=("Microsoft YaHei", 10))
+        self.reason_text.pack(fill=tk.X, padx=15, pady=2)
+
+        btn_frame = tk.Frame(self, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=15, pady=15)
+        tk.Button(btn_frame, text="确认改派", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=12, command=self._on_confirm).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="取消", font=("Microsoft YaHei", 10), bg="#95a5a6", fg="white",
+                  width=12, command=self.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def _load_technicians(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        ranked = self.store.rank_technicians_for_order(self.order)
+        for tech, match in ranked:
+            if tech.user_id == self.order.assignee_id:
+                continue
+            score = match.score
+            if score >= 80:
+                tag = "good"
+            elif score >= 50:
+                tag = "partial"
+            else:
+                tag = "bad"
+            self.tree.insert("", tk.END, iid=tech.user_id, values=(
+                tech.user_id, tech.name, score,
+                "是" if match.skill_match else "否",
+                "是" if match.available_now else "否",
+                f"{match.current_load}/{match.max_parallel}",
+                "; ".join(match.warnings) if match.warnings else "推荐",
+            ), tags=(tag,))
+
+    def _on_confirm(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("提示", "请选择新维修员", parent=self)
+            return
+        new_tech_id = selection[0]
+        reason = self.reason_text.get("1.0", tk.END).strip()
+        if not reason:
+            messagebox.showwarning("提示", "请填写改派原因", parent=self)
+            return
         try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("Treeview", rowheight=28, font=("Microsoft YaHei", 10))
+            new_tech = self.store.get_user(new_tech_id)
+            self.store.reassign_order(self.order.order_id, new_tech, self.dispatcher,
+                                       reason, self.expected_version)
+            self.result = True
+            messagebox.showinfo("成功", f"工单已改派给 {new_tech.name}", parent=self)
+            self.destroy()
+        except ConcurrentOperationError as e:
+            messagebox.showerror("并发冲突", str(e), parent=self)
+            self.destroy()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e), parent=self)
+
+
+class LoginDialog(tk.Toplevel):
+    def __init__(self, parent, store):
+        super().__init__(parent)
+        self.store = store
+        self.user = None
+        self.title("维修派工系统 - 登录")
+        self.geometry("400x350")
+        self.configure(bg="#ecf0f1")
+        self.resizable(False, False)
+        self.grab_set()
+        self.transient(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        tk.Label(self, text="维修派工管理系统", font=("Microsoft YaHei", 20, "bold"),
+                 bg="#ecf0f1", fg="#2c3e50").pack(pady=(30, 10))
+        tk.Label(self, text="Maintenance Dispatch System", font=("Microsoft YaHei", 9),
+                 bg="#ecf0f1", fg="#7f8c8d").pack(pady=(0, 20))
+
+        tk.Label(self, text="请选择用户登录:", font=("Microsoft YaHei", 11),
+                 bg="#ecf0f1").pack(pady=(0, 8))
+
+        frame = tk.Frame(self, bg="#ecf0f1")
+        frame.pack(padx=40, fill=tk.X, pady=5)
+
+        self.user_listbox = tk.Listbox(frame, height=8, font=("Microsoft YaHei", 11),
+                                        selectmode=tk.SINGLE, activestyle="none")
+        self.user_listbox.pack(fill=tk.X, pady=5)
+        self.users = self.store.get_all_users()
+        role_labels = {Role.DISPATCHER: "调度员", Role.TECHNICIAN: "维修员", Role.INSPECTOR: "验收员"}
+        for u in self.users:
+            self.user_listbox.insert(tk.END, f"{u.name}  ({role_labels.get(u.role, u.role.value)})")
+        if self.users:
+            self.user_listbox.selection_set(0)
+
+        btn_frame = tk.Frame(self, bg="#ecf0f1")
+        btn_frame.pack(pady=20)
+        tk.Button(btn_frame, text="登录", font=("Microsoft YaHei", 12, "bold"),
+                  bg="#3498db", fg="white", width=15, height=1,
+                  command=self._on_login).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_frame, text="退出", font=("Microsoft YaHei", 12),
+                  bg="#95a5a6", fg="white", width=15, height=1,
+                  command=self._on_cancel).pack(side=tk.LEFT, padx=8)
+
+    def _on_login(self):
+        sel = self.user_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择用户", parent=self)
+            return
+        self.user = self.users[sel[0]]
+        self.destroy()
+
+    def _on_cancel(self):
+        self.user = None
+        self.destroy()
+
+
+class MaintenanceApp:
+    def __init__(self, root):
+        self.root = root
+        self.store = DataStore()
+        self.current_user = None
+        self.root.title("维修派工管理系统")
+        self.root.geometry("1280x800")
+        self.root.configure(bg="#ecf0f1")
+
+        self._configure_styles()
+        self._show_login()
+
+    def _configure_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", rowheight=28, font=("Microsoft YaHei", 9))
         style.configure("Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
-        style.configure("Title.TLabel", font=("Microsoft YaHei", 16, "bold"))
-        style.configure("Info.TLabel", font=("Microsoft YaHei", 11))
-        style.configure("Bold.TLabel", font=("Microsoft YaHei", 11, "bold"))
-
-        self.top_frame = ttk.Frame(self.root, padding=10)
-        self.top_frame.pack(side=tk.TOP, fill=tk.X)
-
-        self.content_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
-        self.content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self.status_bar = ttk.Frame(self.root, padding=(10, 5))
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.status_label = ttk.Label(self.status_bar, text="", style="Info.TLabel")
-        self.status_label.pack(side=tk.LEFT)
+        style.configure("TNotebook", background="#ecf0f1", borderwidth=0)
+        style.configure("TNotebook.Tab", font=("Microsoft YaHei", 11, "bold"),
+                        padding=(15, 8))
+        style.map("TNotebook.Tab",
+                  background=[("selected", "#3498db")],
+                  foreground=[("selected", "white")])
 
     def _show_login(self):
-        for w in self.content_frame.winfo_children():
+        for w in self.root.winfo_children():
             w.destroy()
-        for w in self.top_frame.winfo_children():
-            w.destroy()
+        login = LoginDialog(self.root, self.store)
+        self.root.wait_window(login)
+        if login.user:
+            self.current_user = login.user
+            self._build_main_ui()
+        else:
+            self.root.destroy()
 
-        ttk.Label(self.top_frame, text="维修派工管理系统", style="Title.TLabel").pack(side=tk.LEFT)
-
-        login_frame = ttk.Frame(self.content_frame)
-        login_frame.pack(expand=True)
-
-        ttk.Label(login_frame, text="请选择用户登录", style="Title.TLabel").grid(row=0, column=0, columnspan=2, pady=(0, 30))
-        ttk.Label(login_frame, text="用户:", style="Bold.TLabel").grid(row=1, column=0, sticky=tk.E, padx=5, pady=10)
-
-        users = self.store.get_all_users()
-        user_display = [f"{u.name} ({self._role_cn(u.role)})" for u in users]
-        self.user_var = tk.StringVar()
-        user_cb = ttk.Combobox(login_frame, textvariable=self.user_var, values=user_display, state="readonly", width=30, font=("Microsoft YaHei", 11))
-        user_cb.grid(row=1, column=1, padx=5, pady=10)
-        if user_display:
-            user_cb.current(0)
-
-        ttk.Button(login_frame, text="登录", width=20, command=self._do_login).grid(row=2, column=0, columnspan=2, pady=20)
-
-    def _role_cn(self, role: Role) -> str:
-        mapping = {Role.DISPATCHER: "调度员", Role.TECHNICIAN: "维修员", Role.INSPECTOR: "验收人"}
-        return mapping.get(role, role.value)
-
-    def _do_login(self):
-        idx = None
-        try:
-            users = self.store.get_all_users()
-            display = [f"{u.name} ({self._role_cn(u.role)})" for u in users]
-            idx = display.index(self.user_var.get())
-        except (ValueError, IndexError):
-            pass
-        if idx is None:
-            messagebox.showwarning("提示", "请选择用户")
-            return
-        self.current_user = users[idx]
-        self._show_main_view()
-
-    def _show_main_view(self):
-        for w in self.top_frame.winfo_children():
-            w.destroy()
-        for w in self.content_frame.winfo_children():
+    def _build_main_ui(self):
+        for w in self.root.winfo_children():
             w.destroy()
 
-        ttk.Label(self.top_frame, text="维修派工管理系统", style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(self.top_frame, text=f"   当前用户: {self.current_user.name} ({self._role_cn(self.current_user.role)})", style="Info.TLabel").pack(side=tk.LEFT, padx=20)
-        ttk.Button(self.top_frame, text="切换用户", command=self._show_login).pack(side=tk.RIGHT)
-        ttk.Button(self.top_frame, text="导出目录设置", command=self._config_export_dir).pack(side=tk.RIGHT, padx=5)
+        role_labels = {Role.DISPATCHER: "调度员", Role.TECHNICIAN: "维修员", Role.INSPECTOR: "验收员"}
 
-        self.notebook = ttk.Notebook(self.content_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
+        header = tk.Frame(self.root, bg="#2c3e50", height=60)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="维修派工管理系统", font=("Microsoft YaHei", 16, "bold"),
+                 bg="#2c3e50", fg="white").pack(side=tk.LEFT, padx=20)
+        user_info = f"当前用户: {self.current_user.name}  ({role_labels.get(self.current_user.role, '')})"
+        tk.Label(header, text=user_info, font=("Microsoft YaHei", 11),
+                 bg="#2c3e50", fg="#bdc3c7").pack(side=tk.RIGHT, padx=20)
+        tk.Button(header, text="切换用户", font=("Microsoft YaHei", 10),
+                  bg="#e74c3c", fg="white", relief=tk.FLAT, width=10,
+                  command=self._show_login).pack(side=tk.RIGHT, padx=10)
 
-        self._build_order_list_tab()
-        self._build_history_tab()
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        perms = {
+            Role.DISPATCHER: ["orders", "history", "dispatcher", "schedule", "import_export"],
+            Role.TECHNICIAN: ["orders", "history", "technician"],
+            Role.INSPECTOR: ["orders", "history", "inspector", "import_export"],
+        }
+        tabs = perms.get(self.current_user.role, [])
+
+        if "orders" in tabs:
+            self._build_orders_tab()
+        if "history" in tabs:
+            self._build_history_tab()
+        if "dispatcher" in tabs:
+            self._build_dispatcher_tab()
+        if "schedule" in tabs:
+            self._build_schedule_tab()
+        if "technician" in tabs:
+            self._build_technician_tab()
+        if "inspector" in tabs:
+            self._build_inspector_tab()
+        if "import_export" in tabs:
+            self._build_import_export_tab()
+
+    def _configure_tree_tags(self, tree):
+        tree.tag_configure("priority_high", background="#fdedec")
+        tree.tag_configure("priority_mid", background="#fef9e7")
+        tree.tag_configure("priority_low", background="#eaf2f8")
+        tree.tag_configure("good", background="#eafaf1")
+        tree.tag_configure("partial", background="#fef9e7")
+        tree.tag_configure("bad", background="#fdedec")
+
+    # ==================== 工单列表 Tab ====================
+    def _build_orders_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="工单列表")
+
+        filter_frame = tk.Frame(frame, bg="#f5f6fa")
+        filter_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        tk.Label(filter_frame, text="状态:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.filter_status = ttk.Combobox(filter_frame, values=["全部"] + [s.value for s in Status], state="readonly", width=12, font=("Microsoft YaHei", 10))
+        self.filter_status.set("全部")
+        self.filter_status.grid(row=0, column=1, padx=5, pady=5)
+
+        tk.Label(filter_frame, text="位置:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.filter_location = tk.Entry(filter_frame, width=15, font=("Microsoft YaHei", 10))
+        self.filter_location.grid(row=0, column=3, padx=5, pady=5)
+
+        tk.Label(filter_frame, text="类别:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=4, padx=5, pady=5, sticky="e")
+        self.filter_category = ttk.Combobox(filter_frame, values=["全部"] + CATEGORY_OPTIONS, state="readonly", width=12, font=("Microsoft YaHei", 10))
+        self.filter_category.set("全部")
+        self.filter_category.grid(row=0, column=5, padx=5, pady=5)
+
+        tk.Label(filter_frame, text="优先级:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=6, padx=5, pady=5, sticky="e")
+        self.filter_priority = ttk.Combobox(filter_frame, values=["全部"] + PRIORITY_OPTIONS, state="readonly", width=8, font=("Microsoft YaHei", 10))
+        self.filter_priority.set("全部")
+        self.filter_priority.grid(row=0, column=7, padx=5, pady=5)
+
+        tk.Button(filter_frame, text="查询", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=8, command=self._refresh_orders).grid(row=0, column=8, padx=10, pady=5)
+        tk.Button(filter_frame, text="重置", font=("Microsoft YaHei", 10), bg="#95a5a6", fg="white",
+                  width=8, command=self._reset_filters).grid(row=0, column=9, padx=5, pady=5)
+
+        tree_frame = tk.Frame(frame, bg="#f5f6fa")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        columns = ("order_id", "title", "location", "category", "priority", "status", "assignee", "creator", "created_at")
+        self.orders_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+        for c, text, w in [
+            ("order_id", "工单编号", 160), ("title", "标题", 200), ("location", "位置", 120),
+            ("category", "类别", 100), ("priority", "优先级", 70), ("status", "状态", 90),
+            ("assignee", "维修员", 90), ("creator", "创建人", 80), ("created_at", "创建时间", 150),
+        ]:
+            self.orders_tree.heading(c, text=text)
+            self.orders_tree.column(c, width=w, anchor="center")
+        self.orders_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.orders_tree.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.orders_tree.configure(yscrollcommand=sb.set)
+        self._configure_tree_tags(self.orders_tree)
+
+        btn_frame = tk.Frame(frame, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
 
         if self.current_user.role == Role.DISPATCHER:
-            self._build_dispatcher_tab()
-            self._build_import_export_tab()
-        elif self.current_user.role == Role.TECHNICIAN:
-            self._build_technician_tab()
-        elif self.current_user.role == Role.INSPECTOR:
-            self._build_inspector_tab()
-            self._build_import_export_tab()
+            tk.Button(btn_frame, text="改派", font=("Microsoft YaHei", 10), bg="#e67e22", fg="white",
+                      width=12, command=self._on_reassign).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="刷新", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=12, command=self._refresh_orders).pack(side=tk.LEFT, padx=5)
 
-        self._update_status(f"就绪 | 导出目录: {self.store.get_config().export_dir or '(未设置)'}")
-        self._refresh_order_tree()
-
-    def _build_order_list_tab(self):
-        frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="工单总览")
-
-        filter_frame = ttk.LabelFrame(frame, text="筛选条件", padding=10)
-        filter_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(filter_frame, text="状态:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.E)
-        self.f_status_var = tk.StringVar(value="全部")
-        status_values = ["全部"] + [s.value for s in Status]
-        ttk.Combobox(filter_frame, textvariable=self.f_status_var, values=status_values, state="readonly", width=12).grid(row=0, column=1, padx=5, pady=5)
-
-        ttk.Label(filter_frame, text="位置:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.E)
-        self.f_location_var = tk.StringVar()
-        ttk.Entry(filter_frame, textvariable=self.f_location_var, width=15).grid(row=0, column=3, padx=5, pady=5)
-
-        ttk.Label(filter_frame, text="类别:").grid(row=0, column=4, padx=5, pady=5, sticky=tk.E)
-        self.f_category_var = tk.StringVar(value="全部")
-        cat_values = ["全部"] + CATEGORY_OPTIONS
-        ttk.Combobox(filter_frame, textvariable=self.f_category_var, values=cat_values, state="readonly", width=12).grid(row=0, column=5, padx=5, pady=5)
-
-        ttk.Label(filter_frame, text="优先级:").grid(row=0, column=6, padx=5, pady=5, sticky=tk.E)
-        self.f_priority_var = tk.StringVar(value="全部")
-        ttk.Combobox(filter_frame, textvariable=self.f_priority_var, values=["全部"] + PRIORITY_OPTIONS, state="readonly", width=8).grid(row=0, column=7, padx=5, pady=5)
-
-        ttk.Button(filter_frame, text="查询", command=self._refresh_order_tree).grid(row=0, column=8, padx=10, pady=5)
-        ttk.Button(filter_frame, text="重置", command=self._reset_filters).grid(row=0, column=9, padx=5, pady=5)
-
-        tree_frame = ttk.Frame(frame)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-
-        columns = ("order_id", "title", "location", "category", "priority", "status", "assignee", "created_at")
-        self.order_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
-        self.order_tree.heading("order_id", text="工单编号")
-        self.order_tree.heading("title", text="标题")
-        self.order_tree.heading("location", text="位置")
-        self.order_tree.heading("category", text="类别")
-        self.order_tree.heading("priority", text="优先级")
-        self.order_tree.heading("status", text="状态")
-        self.order_tree.heading("assignee", text="维修员")
-        self.order_tree.heading("created_at", text="创建时间")
-
-        self.order_tree.column("order_id", width=160, anchor=tk.W)
-        self.order_tree.column("title", width=220, anchor=tk.W)
-        self.order_tree.column("location", width=140, anchor=tk.W)
-        self.order_tree.column("category", width=100, anchor=tk.W)
-        self.order_tree.column("priority", width=70, anchor=tk.CENTER)
-        self.order_tree.column("status", width=80, anchor=tk.CENTER)
-        self.order_tree.column("assignee", width=90, anchor=tk.W)
-        self.order_tree.column("created_at", width=150, anchor=tk.W)
-
-        self.order_tree.tag_configure("high", background="#ffe5e5")
-        self.order_tree.tag_configure("completed", background="#e5ffe5")
-
-        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.order_tree.yview)
-        self.order_tree.configure(yscrollcommand=vsb.set)
-        self.order_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.order_tree.bind("<<TreeviewSelect>>", self._on_order_select)
-        self.order_tree.bind("<Double-1>", lambda e: self._show_order_detail())
-
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
-        ttk.Button(btn_frame, text="查看详情 / 历史", command=self._show_order_detail).pack(side=tk.LEFT, padx=5)
+        self._refresh_orders()
 
     def _reset_filters(self):
-        self.f_status_var.set("全部")
-        self.f_location_var.set("")
-        self.f_category_var.set("全部")
-        self.f_priority_var.set("全部")
-        self._refresh_order_tree()
+        self.filter_status.set("全部")
+        self.filter_location.delete(0, tk.END)
+        self.filter_category.set("全部")
+        self.filter_priority.set("全部")
+        self._refresh_orders()
 
-    def _build_history_tab(self):
-        frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="状态历史")
+    def _refresh_orders(self):
+        for i in self.orders_tree.get_children():
+            self.orders_tree.delete(i)
+        status_val = self.filter_status.get()
+        status = None
+        if status_val and status_val != "全部":
+            for s in Status:
+                if s.value == status_val:
+                    status = s
+                    break
+        location = self.filter_location.get().strip() or None
+        category_val = self.filter_category.get()
+        category = category_val if category_val and category_val != "全部" else None
+        priority_val = self.filter_priority.get()
+        priority = priority_val if priority_val and priority_val != "全部" else None
 
-        info_frame = ttk.Frame(frame)
-        info_frame.pack(fill=tk.X, pady=(0, 10))
-        self.history_order_label = ttk.Label(info_frame, text="请先选择一个工单", style="Bold.TLabel")
-        self.history_order_label.pack(side=tk.LEFT)
+        assignee_id = None
+        if self.current_user.role == Role.TECHNICIAN:
+            assignee_id = self.current_user.user_id
 
-        cols = ("timestamp", "status", "user", "note")
-        self.history_tree = ttk.Treeview(frame, columns=cols, show="headings", height=15)
-        self.history_tree.heading("timestamp", text="时间")
-        self.history_tree.heading("status", text="状态")
-        self.history_tree.heading("user", text="操作人")
-        self.history_tree.heading("note", text="备注")
-        self.history_tree.column("timestamp", width=170, anchor=tk.W)
-        self.history_tree.column("status", width=100, anchor=tk.CENTER)
-        self.history_tree.column("user", width=120, anchor=tk.W)
-        self.history_tree.column("note", width=600, anchor=tk.W)
-        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.history_tree.yview)
-        self.history_tree.configure(yscrollcommand=vsb.set)
-        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        exc_frame = ttk.LabelFrame(frame, text="异常备注", padding=10)
-        exc_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
-        self.exception_text = tk.Text(exc_frame, height=6, font=("Microsoft YaHei", 10), state=tk.DISABLED)
-        self.exception_text.pack(fill=tk.X)
-
-    def _build_dispatcher_tab(self):
-        frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="调度员操作")
-
-        create_frame = ttk.LabelFrame(frame, text="登记报修单", padding=10)
-        create_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(create_frame, text="标题*:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.E)
-        self.c_title_var = tk.StringVar()
-        ttk.Entry(create_frame, textvariable=self.c_title_var, width=40).grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(create_frame, text="位置*:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.E)
-        self.c_location_var = tk.StringVar()
-        ttk.Entry(create_frame, textvariable=self.c_location_var, width=30).grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(create_frame, text="类别:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.E)
-        self.c_category_var = tk.StringVar(value="其他")
-        ttk.Combobox(create_frame, textvariable=self.c_category_var, values=CATEGORY_OPTIONS, state="readonly", width=20).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(create_frame, text="优先级:").grid(row=1, column=2, padx=5, pady=5, sticky=tk.E)
-        self.c_priority_var = tk.StringVar(value="中")
-        ttk.Combobox(create_frame, textvariable=self.c_priority_var, values=PRIORITY_OPTIONS, state="readonly", width=10).grid(row=1, column=3, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(create_frame, text="描述:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.NE)
-        self.c_desc_text = tk.Text(create_frame, height=3, width=60, font=("Microsoft YaHei", 10))
-        self.c_desc_text.grid(row=2, column=1, columnspan=3, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Button(create_frame, text=" 提交登记 ", command=self._create_order).grid(row=3, column=0, columnspan=4, pady=10)
-
-        dispatch_frame = ttk.LabelFrame(frame, text="派工（选择待派单工单）", padding=10)
-        dispatch_frame.pack(fill=tk.BOTH, expand=True)
-
-        disp_tree_frame = ttk.Frame(dispatch_frame)
-        disp_tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        dcols = ("order_id", "title", "location", "category", "priority", "created_at")
-        self.dispatch_tree = ttk.Treeview(disp_tree_frame, columns=dcols, show="headings", selectmode="browse", height=8)
-        for c in dcols:
-            self.dispatch_tree.heading(c, text={"order_id": "工单编号", "title": "标题", "location": "位置", "category": "类别", "priority": "优先级", "created_at": "创建时间"}[c])
-        self.dispatch_tree.column("order_id", width=160)
-        self.dispatch_tree.column("title", width=280)
-        self.dispatch_tree.column("location", width=140)
-        self.dispatch_tree.column("category", width=100)
-        self.dispatch_tree.column("priority", width=70, anchor=tk.CENTER)
-        self.dispatch_tree.column("created_at", width=150)
-        self.dispatch_tree.tag_configure("high", background="#ffe5e5")
-        vsb2 = ttk.Scrollbar(disp_tree_frame, orient=tk.VERTICAL, command=self.dispatch_tree.yview)
-        self.dispatch_tree.configure(yscrollcommand=vsb2.set)
-        self.dispatch_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb2.pack(side=tk.RIGHT, fill=tk.Y)
-
-        assign_frame = ttk.Frame(dispatch_frame)
-        assign_frame.pack(fill=tk.X)
-        ttk.Label(assign_frame, text="派给维修员:").pack(side=tk.LEFT, padx=5)
-        techs = self.store.get_users_by_role(Role.TECHNICIAN)
-        self.dispatch_tech_var = tk.StringVar()
-        tech_display = [f"{t.name}" for t in techs]
-        ttk.Combobox(assign_frame, textvariable=self.dispatch_tech_var, values=tech_display, state="readonly", width=15).pack(side=tk.LEFT, padx=5)
-        if tech_display:
-            self.dispatch_tech_var.set(tech_display[0])
-        ttk.Button(assign_frame, text=" 派工 ", command=self._dispatch_order).pack(side=tk.LEFT, padx=10)
-        ttk.Button(assign_frame, text=" 刷新列表 ", command=self._refresh_dispatch_tree).pack(side=tk.LEFT, padx=5)
-
-    def _build_technician_tab(self):
-        frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="维修员操作")
-
-        ttk.Label(frame, text="可接工单（已派单）", style="Bold.TLabel").pack(anchor=tk.W)
-        accept_frame = ttk.Frame(frame)
-        accept_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        acols = ("order_id", "title", "location", "category", "priority", "assignee", "created_at")
-        self.accept_tree = ttk.Treeview(accept_frame, columns=acols, show="headings", selectmode="browse", height=8)
-        for c in acols:
-            self.accept_tree.heading(c, text={"order_id": "工单编号", "title": "标题", "location": "位置", "category": "类别", "priority": "优先级", "assignee": "指派给", "created_at": "创建时间"}[c])
-        self.accept_tree.column("order_id", width=160)
-        self.accept_tree.column("title", width=260)
-        self.accept_tree.column("location", width=130)
-        self.accept_tree.column("category", width=90)
-        self.accept_tree.column("priority", width=70, anchor=tk.CENTER)
-        self.accept_tree.column("assignee", width=90)
-        self.accept_tree.column("created_at", width=150)
-        self.accept_tree.tag_configure("high", background="#ffe5e5")
-        vsb_a = ttk.Scrollbar(accept_frame, orient=tk.VERTICAL, command=self.accept_tree.yview)
-        self.accept_tree.configure(yscrollcommand=vsb_a.set)
-        self.accept_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb_a.pack(side=tk.RIGHT, fill=tk.Y)
-
-        btn1 = ttk.Frame(frame)
-        btn1.pack(fill=tk.X, pady=5)
-        ttk.Button(btn1, text=" 接单 ", command=self._accept_order).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn1, text=" 刷新 ", command=self._refresh_technician_trees).pack(side=tk.LEFT, padx=5)
-
-        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=15)
-
-        ttk.Label(frame, text="我处理中的工单（可完工）", style="Bold.TLabel").pack(anchor=tk.W)
-        progress_frame = ttk.Frame(frame)
-        progress_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        pcols = ("order_id", "title", "location", "category", "priority", "created_at")
-        self.progress_tree = ttk.Treeview(progress_frame, columns=pcols, show="headings", selectmode="browse", height=8)
-        for c in pcols:
-            self.progress_tree.heading(c, text={"order_id": "工单编号", "title": "标题", "location": "位置", "category": "类别", "priority": "优先级", "created_at": "创建时间"}[c])
-        self.progress_tree.column("order_id", width=160)
-        self.progress_tree.column("title", width=280)
-        self.progress_tree.column("location", width=140)
-        self.progress_tree.column("category", width=100)
-        self.progress_tree.column("priority", width=70, anchor=tk.CENTER)
-        self.progress_tree.column("created_at", width=150)
-        self.progress_tree.tag_configure("high", background="#ffe5e5")
-        vsb_p = ttk.Scrollbar(progress_frame, orient=tk.VERTICAL, command=self.progress_tree.yview)
-        self.progress_tree.configure(yscrollcommand=vsb_p.set)
-        self.progress_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb_p.pack(side=tk.RIGHT, fill=tk.Y)
-
-        btn2 = ttk.Frame(frame)
-        btn2.pack(fill=tk.X, pady=5)
-        ttk.Button(btn2, text=" 完工（申请验收） ", command=self._complete_order).pack(side=tk.LEFT, padx=5)
-
-        self._refresh_technician_trees()
-
-    def _build_inspector_tab(self):
-        frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="验收人操作")
-
-        ttk.Label(frame, text="待验收工单", style="Bold.TLabel").pack(anchor=tk.W)
-        ins_frame = ttk.Frame(frame)
-        ins_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        icols = ("order_id", "title", "location", "category", "priority", "assignee", "created_at")
-        self.inspect_tree = ttk.Treeview(ins_frame, columns=icols, show="headings", selectmode="browse", height=12)
-        for c in icols:
-            self.inspect_tree.heading(c, text={"order_id": "工单编号", "title": "标题", "location": "位置", "category": "类别", "priority": "优先级", "assignee": "维修员", "created_at": "创建时间"}[c])
-        self.inspect_tree.column("order_id", width=160)
-        self.inspect_tree.column("title", width=260)
-        self.inspect_tree.column("location", width=130)
-        self.inspect_tree.column("category", width=90)
-        self.inspect_tree.column("priority", width=70, anchor=tk.CENTER)
-        self.inspect_tree.column("assignee", width=90)
-        self.inspect_tree.column("created_at", width=150)
-        self.inspect_tree.tag_configure("high", background="#ffe5e5")
-        vsb_i = ttk.Scrollbar(ins_frame, orient=tk.VERTICAL, command=self.inspect_tree.yview)
-        self.inspect_tree.configure(yscrollcommand=vsb_i.set)
-        self.inspect_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb_i.pack(side=tk.RIGHT, fill=tk.Y)
-
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, pady=10)
-        ttk.Button(btn_frame, text=" 验收通过（完成） ", command=self._approve_order).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text=" 验收退回（需重新处理） ", command=self._reject_order).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text=" 刷新 ", command=self._refresh_inspect_tree).pack(side=tk.LEFT, padx=5)
-
-        self._refresh_inspect_tree()
-
-    def _build_import_export_tab(self):
-        frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="导入 / 导出")
-
-        imp_frame = ttk.LabelFrame(frame, text="导入报修单 (CSV)", padding=10)
-        imp_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(imp_frame, text="CSV需包含列: title/标题, description/描述, location/位置, category/类别, priority/优先级", style="Info.TLabel").pack(anchor=tk.W)
-        ttk.Button(imp_frame, text=" 选择CSV文件并导入 ", command=self._import_csv).pack(pady=10)
-
-        exp_frame = ttk.LabelFrame(frame, text="导出工单", padding=10)
-        exp_frame.pack(fill=tk.X)
-        cfg = self.store.get_config()
-        ttk.Label(exp_frame, text=f"当前导出目录: {cfg.export_dir or '(使用默认 ./exports)'}", style="Info.TLabel").pack(anchor=tk.W, pady=5)
-        ttk.Button(exp_frame, text=" 设置导出目录... ", command=self._config_export_dir).pack(anchor=tk.W, pady=5)
-        ttk.Separator(exp_frame).pack(fill=tk.X, pady=10)
-        ttk.Button(exp_frame, text=" 导出全部工单为 JSON ", command=lambda: self._export("json", True)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(exp_frame, text=" 导出全部工单为 CSV ", command=lambda: self._export("csv", True)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(exp_frame, text=" 导出当前筛选结果为 JSON ", command=lambda: self._export("json", False)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(exp_frame, text=" 导出当前筛选结果为 CSV ", command=lambda: self._export("csv", False)).pack(side=tk.LEFT, padx=5)
-
-    # --- Data refresh helpers ---
-    def _update_status(self, text: str):
-        self.status_label.config(text=text)
-
-    def _refresh_order_tree(self):
-        for i in self.order_tree.get_children():
-            self.order_tree.delete(i)
-        status_s = self.f_status_var.get()
-        status = None if status_s == "全部" else Status(status_s)
-        location = self.f_location_var.get().strip() or None
-        cat_s = self.f_category_var.get()
-        category = None if cat_s == "全部" else cat_s
-        pr_s = self.f_priority_var.get()
-        priority = None if pr_s == "全部" else pr_s
-
-        orders = self.store.get_orders_by_filter(status=status, location=location, category=category, priority=priority)
-        for o in orders:
-            tags = ()
-            if o.priority == "高":
-                tags = ("high",)
-            if o.status == Status.COMPLETED:
-                tags = ("completed",)
-            self.order_tree.insert("", tk.END, iid=o.order_id, values=(
-                o.order_id, o.title, o.location, o.category, o.priority,
-                o.status.value, o.assignee_name or "", o.created_at
-            ), tags=tags)
-        self._update_status(f"共查询到 {len(orders)} 条工单")
-
-    def _refresh_dispatch_tree(self):
-        for i in self.dispatch_tree.get_children():
-            self.dispatch_tree.delete(i)
-        orders = self.store.get_orders_by_filter(status=Status.PENDING_DISPATCH)
-        for o in orders:
-            tags = ("high",) if o.priority == "高" else ()
-            self.dispatch_tree.insert("", tk.END, iid=o.order_id, values=(
-                o.order_id, o.title, o.location, o.category, o.priority, o.created_at
-            ), tags=tags)
-
-    def _refresh_technician_trees(self):
-        for i in self.accept_tree.get_children():
-            self.accept_tree.delete(i)
-        for i in self.progress_tree.get_children():
-            self.progress_tree.delete(i)
-
-        dispatched = self.store.get_orders_by_filter(status=Status.DISPATCHED)
-        for o in dispatched:
-            tags = ("high",) if o.priority == "高" else ()
-            self.accept_tree.insert("", tk.END, iid=o.order_id, values=(
-                o.order_id, o.title, o.location, o.category, o.priority,
-                o.assignee_name or "未指派", o.created_at
-            ), tags=tags)
-
-        in_progress = self.store.get_orders_by_filter(status=Status.IN_PROGRESS, assignee_id=self.current_user.user_id)
-        for o in in_progress:
-            tags = ("high",) if o.priority == "高" else ()
-            self.progress_tree.insert("", tk.END, iid=o.order_id, values=(
-                o.order_id, o.title, o.location, o.category, o.priority, o.created_at
-            ), tags=tags)
-
-    def _refresh_inspect_tree(self):
-        for i in self.inspect_tree.get_children():
-            self.inspect_tree.delete(i)
-        orders = self.store.get_orders_by_filter(status=Status.PENDING_INSPECTION)
-        for o in orders:
-            tags = ("high",) if o.priority == "高" else ()
-            self.inspect_tree.insert("", tk.END, iid=o.order_id, values=(
-                o.order_id, o.title, o.location, o.category, o.priority,
-                o.assignee_name or "", o.created_at
-            ), tags=tags)
-
-    def _refresh_all_trees(self):
-        self._refresh_order_tree()
-        if hasattr(self, "dispatch_tree"):
-            self._refresh_dispatch_tree()
-        if hasattr(self, "accept_tree"):
-            self._refresh_technician_trees()
-        if hasattr(self, "inspect_tree"):
-            self._refresh_inspect_tree()
-
-    # --- Selection & detail ---
-    def _get_selected_order(self) -> WorkOrder:
-        for tree_attr in ["order_tree", "dispatch_tree", "accept_tree", "progress_tree", "inspect_tree"]:
-            tree = getattr(self, tree_attr, None)
-            if tree and tree.selection():
-                oid = tree.selection()[0]
-                return self.store.get_order(oid)
-        return None
-
-    def _on_order_select(self, _event=None):
-        order = self._get_selected_order()
-        if not order:
-            return
-        self.history_order_label.config(text=f"工单: {order.order_id} - {order.title}")
-        for i in self.history_tree.get_children():
-            self.history_tree.delete(i)
-        for h in order.history:
-            self.history_tree.insert("", tk.END, values=(h.timestamp, h.status.value, h.user_name, h.note))
-
-        self.exception_text.config(state=tk.NORMAL)
-        self.exception_text.delete(1.0, tk.END)
-        if order.exception_notes:
-            self.exception_text.insert(tk.END, "\n".join(order.exception_notes))
-        else:
-            self.exception_text.insert(tk.END, "(无异常备注)")
-        self.exception_text.config(state=tk.DISABLED)
-
-    def _show_order_detail(self):
-        order = self._get_selected_order()
-        if not order:
-            messagebox.showinfo("提示", "请先选择一个工单")
-            return
-        self._on_order_select()
         try:
-            self.notebook.select(1)
-        except tk.TclError:
-            pass
+            orders = self.store.get_orders_by_filter(status=status, location=location,
+                                                      category=category, priority=priority,
+                                                      assignee_id=assignee_id)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
 
-    # --- Actions ---
-    def _create_order(self):
-        title = self.c_title_var.get().strip()
-        location = self.c_location_var.get().strip()
-        category = self.c_category_var.get()
-        priority = self.c_priority_var.get()
-        description = self.c_desc_text.get(1.0, tk.END).strip()
-        if not title:
-            messagebox.showwarning("提示", "标题不能为空")
-            return
-        if not location:
-            messagebox.showwarning("提示", "位置不能为空")
-            return
-        try:
-            order = self.store.create_order(title, description, location, category, priority, self.current_user)
-        except (PermissionError, WorkOrderError) as e:
-            messagebox.showerror("登记失败", str(e))
-            return
-        messagebox.showinfo("成功", f"工单创建成功！\n编号: {order.order_id}")
-        self.c_title_var.set("")
-        self.c_location_var.set("")
-        self.c_desc_text.delete(1.0, tk.END)
-        self._refresh_all_trees()
+        for o in orders:
+            tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            self.orders_tree.insert("", tk.END, iid=o.order_id, values=(
+                o.order_id, o.title, o.location, o.category, o.priority,
+                o.status.value, o.assignee_name or "未指派", o.creator_name, o.created_at,
+            ), tags=(tag,))
 
-    def _dispatch_order(self):
-        sel = self.dispatch_tree.selection()
+    def _on_reassign(self):
+        sel = self.orders_tree.selection()
         if not sel:
-            messagebox.showinfo("提示", "请先选择待派单工单")
-            return
-        tech_name = self.dispatch_tech_var.get()
-        if not tech_name:
-            messagebox.showwarning("提示", "请选择维修员")
-            return
-        techs = self.store.get_users_by_role(Role.TECHNICIAN)
-        assignee = next((t for t in techs if t.name == tech_name), None)
-        if not assignee:
-            messagebox.showerror("错误", "未找到维修员")
+            messagebox.showwarning("提示", "请选择要改派的工单")
             return
         order_id = sel[0]
         try:
-            self.store.dispatch_order(order_id, assignee, self.current_user)
-        except (PermissionError, StatusTransitionError, WorkOrderError) as e:
-            self.store.add_exception_note(order_id, f"派工失败: {str(e)}")
-            messagebox.showerror("派工失败", str(e) + "\n已保存异常备注，已保存记录未被修改。")
-            return
-        messagebox.showinfo("成功", f"已派工给 {assignee.name}")
-        self._refresh_all_trees()
+            order = self.store.get_order(order_id)
+            if not order:
+                messagebox.showerror("错误", "工单不存在")
+                return
+            allowed, msg = self.store.can_reassign(order, self.current_user)
+            if not allowed:
+                messagebox.showwarning("无法改派", msg)
+                return
+            dlg = ReassignDialog(self.root, self.store, self.current_user, order)
+            self.root.wait_window(dlg)
+            if dlg.result:
+                self._refresh_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _accept_order(self):
-        sel = self.accept_tree.selection()
+    # ==================== 历史记录 Tab ====================
+    def _build_history_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="历史记录")
+
+        top_frame = tk.Frame(frame, bg="#f5f6fa")
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
+        tk.Label(top_frame, text="选择工单:", font=("Microsoft YaHei", 10), bg="#f5f6fa").pack(side=tk.LEFT, padx=5)
+        self.history_order_combo = ttk.Combobox(top_frame, state="readonly", width=40, font=("Microsoft YaHei", 10))
+        self.history_order_combo.pack(side=tk.LEFT, padx=5)
+        self.history_order_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_history())
+        tk.Button(top_frame, text="刷新工单列表", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=12, command=self._refresh_history_order_list).pack(side=tk.LEFT, padx=10)
+
+        content = tk.Frame(frame, bg="#f5f6fa")
+        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        tk.Label(content, text="状态变更历史", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").grid(row=0, column=0, sticky="w", pady=(0, 5))
+        h_frame = tk.Frame(content, bg="#f5f6fa")
+        h_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        h_cols = ("status", "user", "timestamp", "note")
+        self.history_tree = ttk.Treeview(h_frame, columns=h_cols, show="headings", height=12)
+        self.history_tree.heading("status", text="状态")
+        self.history_tree.heading("user", text="操作人")
+        self.history_tree.heading("timestamp", text="时间")
+        self.history_tree.heading("note", text="备注")
+        self.history_tree.column("status", width=100, anchor="center")
+        self.history_tree.column("user", width=100, anchor="center")
+        self.history_tree.column("timestamp", width=150, anchor="center")
+        self.history_tree.column("note", width=280, anchor="w")
+        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        h_sb = ttk.Scrollbar(h_frame, orient="vertical", command=self.history_tree.yview)
+        h_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_tree.configure(yscrollcommand=h_sb.set)
+
+        tk.Label(content, text="改派记录", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").grid(row=0, column=1, sticky="w", pady=(0, 5))
+        r_frame = tk.Frame(content, bg="#f5f6fa")
+        r_frame.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        r_cols = ("from_user", "to_user", "reason", "dispatcher", "timestamp")
+        self.reassign_tree = ttk.Treeview(r_frame, columns=r_cols, show="headings", height=12)
+        self.reassign_tree.heading("from_user", text="原维修员")
+        self.reassign_tree.heading("to_user", text="新维修员")
+        self.reassign_tree.heading("reason", text="原因")
+        self.reassign_tree.heading("dispatcher", text="调度员")
+        self.reassign_tree.heading("timestamp", text="时间")
+        self.reassign_tree.column("from_user", width=90, anchor="center")
+        self.reassign_tree.column("to_user", width=90, anchor="center")
+        self.reassign_tree.column("reason", width=140, anchor="w")
+        self.reassign_tree.column("dispatcher", width=80, anchor="center")
+        self.reassign_tree.column("timestamp", width=140, anchor="center")
+        self.reassign_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        r_sb = ttk.Scrollbar(r_frame, orient="vertical", command=self.reassign_tree.yview)
+        r_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.reassign_tree.configure(yscrollcommand=r_sb.set)
+
+        note_frame = tk.Frame(frame, bg="#f5f6fa")
+        note_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        tk.Label(note_frame, text="异常备注", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", pady=(0, 5))
+        note_text_frame = tk.Frame(note_frame, bg="#f5f6fa")
+        note_text_frame.pack(fill=tk.BOTH, expand=True)
+        self.exception_notes_text = tk.Text(note_text_frame, height=8, font=("Microsoft YaHei", 10),
+                                            state=tk.DISABLED, wrap=tk.WORD)
+        self.exception_notes_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        n_sb = ttk.Scrollbar(note_text_frame, orient="vertical", command=self.exception_notes_text.yview)
+        n_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.exception_notes_text.configure(yscrollcommand=n_sb.set)
+
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(1, weight=1)
+
+        self._refresh_history_order_list()
+
+    def _refresh_history_order_list(self):
+        try:
+            orders = self.store.get_all_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        values = [f"{o.order_id} - {o.title}" for o in orders]
+        self.history_order_combo["values"] = values
+        if values:
+            self.history_order_combo.current(0)
+            self._refresh_history()
+
+    def _refresh_history(self):
+        for i in self.history_tree.get_children():
+            self.history_tree.delete(i)
+        for i in self.reassign_tree.get_children():
+            self.reassign_tree.delete(i)
+        self.exception_notes_text.configure(state=tk.NORMAL)
+        self.exception_notes_text.delete("1.0", tk.END)
+
+        sel = self.history_order_combo.get()
         if not sel:
-            messagebox.showinfo("提示", "请先选择要接的工单")
+            self.exception_notes_text.configure(state=tk.DISABLED)
+            return
+        order_id = sel.split(" - ")[0]
+        try:
+            order = self.store.get_order(order_id)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        if not order:
+            self.exception_notes_text.configure(state=tk.DISABLED)
+            return
+
+        for h in order.history:
+            self.history_tree.insert("", tk.END, values=(h.status.value, h.user_name, h.timestamp, h.note))
+
+        for r in order.reassignment_logs:
+            self.reassign_tree.insert("", tk.END, values=(
+                r.from_user_name, r.to_user_name, r.reason, r.dispatcher_name, r.timestamp
+            ))
+
+        for note in order.exception_notes:
+            self.exception_notes_text.insert(tk.END, note + "\n\n")
+        self.exception_notes_text.configure(state=tk.DISABLED)
+
+    # ==================== 调度员 Tab ====================
+    def _build_dispatcher_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="调度派工")
+
+        left = tk.Frame(frame, bg="#f5f6fa")
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=10, pady=10)
+
+        tk.Label(left, text="创建新工单", font=("Microsoft YaHei", 13, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", pady=(0, 10))
+
+        form = tk.Frame(left, bg="#f5f6fa")
+        form.pack(anchor="w")
+        fields = [
+            ("标题*", "entry"), ("描述", "text"), ("位置*", "entry"),
+            ("类别*", "combo"), ("优先级*", "combo"),
+        ]
+        self.create_vars = {}
+        for i, (label, ftype) in enumerate(fields):
+            tk.Label(form, text=label, font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=i, column=0, sticky="e", pady=6, padx=5)
+            if ftype == "entry":
+                var = tk.StringVar()
+                self.create_vars[label] = var
+                tk.Entry(form, width=28, textvariable=var, font=("Microsoft YaHei", 10)).grid(row=i, column=1, pady=6)
+            elif ftype == "text":
+                self.create_vars[label] = None
+                txt = tk.Text(form, width=28, height=4, font=("Microsoft YaHei", 10))
+                txt.grid(row=i, column=1, pady=6)
+                self.create_vars["描述_widget"] = txt
+            elif ftype == "combo":
+                var = tk.StringVar()
+                self.create_vars[label] = var
+                vals = CATEGORY_OPTIONS if label.startswith("类别") else PRIORITY_OPTIONS
+                cb = ttk.Combobox(form, values=vals, textvariable=var, state="readonly", width=26, font=("Microsoft YaHei", 10))
+                cb.grid(row=i, column=1, pady=6)
+                if label.startswith("优先级"):
+                    var.set("中")
+
+        tk.Button(left, text="创建工单", font=("Microsoft YaHei", 11, "bold"), bg="#27ae60", fg="white",
+                  width=25, command=self._on_create_order).pack(anchor="w", pady=15)
+
+        right = tk.Frame(frame, bg="#f5f6fa")
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        tk.Label(right, text="待派工单列表（选择后查看匹配度并派工）", font=("Microsoft YaHei", 13, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", pady=(0, 8))
+
+        order_list_frame = tk.Frame(right, bg="#f5f6fa")
+        order_list_frame.pack(fill=tk.X, pady=(0, 8))
+        d_cols = ("order_id", "title", "category", "priority", "location")
+        self.dispatch_order_tree = ttk.Treeview(order_list_frame, columns=d_cols, show="headings", height=8)
+        for c, text, w in [("order_id", "工单编号", 150), ("title", "标题", 200),
+                            ("category", "类别", 90), ("priority", "优先级", 70), ("location", "位置", 120)]:
+            self.dispatch_order_tree.heading(c, text=text)
+            self.dispatch_order_tree.column(c, width=w, anchor="center")
+        self.dispatch_order_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        d_sb = ttk.Scrollbar(order_list_frame, orient="vertical", command=self.dispatch_order_tree.yview)
+        d_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.dispatch_order_tree.configure(yscrollcommand=d_sb.set)
+        self.dispatch_order_tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_dispatch_matches())
+        self._configure_tree_tags(self.dispatch_order_tree)
+
+        tk.Label(right, text="维修员匹配度（按分数排序）", font=("Microsoft YaHei", 12, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", pady=(10, 5))
+        match_frame = tk.Frame(right, bg="#f5f6fa")
+        match_frame.pack(fill=tk.BOTH, expand=True)
+        m_cols = ("tech_id", "name", "score", "skill", "available", "capacity", "warnings")
+        self.match_tree = ttk.Treeview(match_frame, columns=m_cols, show="headings")
+        for c, text, w in [("tech_id", "工号", 60), ("name", "姓名", 70), ("score", "匹配分", 65),
+                            ("skill", "技能", 55), ("available", "时间", 55), ("capacity", "负载", 70),
+                            ("warnings", "备注", 250)]:
+            self.match_tree.heading(c, text=text)
+            self.match_tree.column(c, width=w, anchor="center")
+        self.match_tree.column("warnings", anchor="w")
+        self.match_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        m_sb = ttk.Scrollbar(match_frame, orient="vertical", command=self.match_tree.yview)
+        m_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.match_tree.configure(yscrollcommand=m_sb.set)
+        self._configure_tree_tags(self.match_tree)
+
+        btn_frame = tk.Frame(right, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, pady=10)
+        tk.Button(btn_frame, text="派工给选中维修员", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#3498db", fg="white", width=18, command=self._on_dispatch).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="刷新列表", font=("Microsoft YaHei", 10),
+                  bg="#95a5a6", fg="white", width=12, command=self._refresh_dispatch_orders).pack(side=tk.LEFT, padx=5)
+
+        self._refresh_dispatch_orders()
+
+    def _refresh_dispatch_orders(self):
+        for i in self.dispatch_order_tree.get_children():
+            self.dispatch_order_tree.delete(i)
+        try:
+            orders = self.store.get_orders_by_filter(status=Status.PENDING_DISPATCH)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        for o in orders:
+            tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            self.dispatch_order_tree.insert("", tk.END, iid=o.order_id, values=(
+                o.order_id, o.title, o.category, o.priority, o.location
+            ), tags=(tag,))
+        self._refresh_dispatch_matches()
+
+    def _refresh_dispatch_matches(self):
+        for i in self.match_tree.get_children():
+            self.match_tree.delete(i)
+        sel = self.dispatch_order_tree.selection()
+        if not sel:
+            return
+        order_id = sel[0]
+        try:
+            order = self.store.get_order(order_id)
+            if not order:
+                return
+            ranked = self.store.rank_technicians_for_order(order)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        for tech, match in ranked:
+            score = match.score
+            if score >= 80:
+                tag = "good"
+            elif score >= 50:
+                tag = "partial"
+            else:
+                tag = "bad"
+            self.match_tree.insert("", tk.END, iid=tech.user_id, values=(
+                tech.user_id, tech.name, score,
+                "是" if match.skill_match else "否",
+                "是" if match.available_now else "否",
+                f"{match.current_load}/{match.max_parallel}",
+                "; ".join(match.warnings) if match.warnings else "推荐",
+            ), tags=(tag,))
+
+    def _on_create_order(self):
+        title = self.create_vars["标题*"].get().strip()
+        desc_widget = self.create_vars["描述_widget"]
+        description = desc_widget.get("1.0", tk.END).strip()
+        location = self.create_vars["位置*"].get().strip()
+        category = self.create_vars["类别*"].get()
+        priority = self.create_vars["优先级*"].get()
+
+        if not title:
+            messagebox.showwarning("提示", "请填写标题")
+            return
+        if not location:
+            messagebox.showwarning("提示", "请填写位置")
+            return
+        if not category:
+            messagebox.showwarning("提示", "请选择类别")
+            return
+        if not priority:
+            messagebox.showwarning("提示", "请选择优先级")
+            return
+
+        try:
+            self.store.create_order(title, description, location, category, priority, self.current_user)
+            messagebox.showinfo("成功", "工单创建成功")
+            self.create_vars["标题*"].set("")
+            desc_widget.delete("1.0", tk.END)
+            self.create_vars["位置*"].set("")
+            self.create_vars["类别*"].set("")
+            self.create_vars["优先级*"].set("中")
+            self._refresh_dispatch_orders()
+            self._refresh_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_dispatch(self):
+        order_sel = self.dispatch_order_tree.selection()
+        if not order_sel:
+            messagebox.showwarning("提示", "请选择待派工单")
+            return
+        tech_sel = self.match_tree.selection()
+        if not tech_sel:
+            messagebox.showwarning("提示", "请选择维修员")
+            return
+        order_id = order_sel[0]
+        tech_id = tech_sel[0]
+        try:
+            order = self.store.get_order(order_id)
+            tech = self.store.get_user(tech_id)
+            if not order or not tech:
+                messagebox.showerror("错误", "工单或维修员不存在")
+                return
+            self.store.dispatch_order(order_id, tech, self.current_user)
+            messagebox.showinfo("成功", f"已派工给 {tech.name}")
+            self._refresh_dispatch_orders()
+            self._refresh_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    # ==================== 排班管理 Tab ====================
+    def _build_schedule_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="排班管理")
+
+        top = tk.Frame(frame, bg="#f5f6fa")
+        top.pack(fill=tk.X, padx=10, pady=10)
+        tk.Label(top, text="选择维修员:", font=("Microsoft YaHei", 11), bg="#f5f6fa").pack(side=tk.LEFT, padx=5)
+        self.schedule_tech_combo = ttk.Combobox(top, state="readonly", width=30, font=("Microsoft YaHei", 10))
+        self.schedule_tech_combo.pack(side=tk.LEFT, padx=5)
+        self.schedule_tech_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_schedule())
+        tk.Button(top, text="刷新", font=("Microsoft YaHei", 10), bg="#3498db", fg="white",
+                  width=10, command=self._refresh_schedule_tech_list).pack(side=tk.LEFT, padx=10)
+
+        content = tk.Frame(frame, bg="#f5f6fa")
+        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        info_frame = tk.LabelFrame(content, text="维修员信息", font=("Microsoft YaHei", 11, "bold"),
+                                    bg="#f5f6fa", fg="#2c3e50")
+        info_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.schedule_info_label = tk.Label(info_frame, text="", font=("Microsoft YaHei", 10),
+                                             bg="#f5f6fa", justify=tk.LEFT)
+        self.schedule_info_label.pack(anchor="w", padx=10, pady=10)
+
+        skills_frame = tk.LabelFrame(content, text="技能管理", font=("Microsoft YaHei", 11, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        skills_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        sk_top = tk.Frame(skills_frame, bg="#f5f6fa")
+        sk_top.pack(fill=tk.X, padx=8, pady=8)
+        self.skills_listbox = tk.Listbox(sk_top, height=8, font=("Microsoft YaHei", 10))
+        self.skills_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sk_btns = tk.Frame(sk_top, bg="#f5f6fa")
+        sk_btns.pack(side=tk.LEFT, padx=8, fill=tk.Y)
+        tk.Label(sk_btns, text="添加技能:", font=("Microsoft YaHei", 9), bg="#f5f6fa").pack(anchor="w")
+        self.new_skill_combo = ttk.Combobox(sk_btns, values=SKILL_OPTIONS, width=10, font=("Microsoft YaHei", 9))
+        self.new_skill_combo.pack(anchor="w", pady=2)
+        tk.Button(sk_btns, text="添加", font=("Microsoft YaHei", 9), bg="#27ae60", fg="white",
+                  width=10, command=self._on_add_skill).pack(anchor="w", pady=2)
+        tk.Button(sk_btns, text="移除选中", font=("Microsoft YaHei", 9), bg="#e74c3c", fg="white",
+                  width=10, command=self._on_remove_skill).pack(anchor="w", pady=2)
+        tk.Button(sk_btns, text="保存技能", font=("Microsoft YaHei", 9, "bold"), bg="#3498db", fg="white",
+                  width=10, command=self._on_save_skills).pack(anchor="w", pady=8)
+
+        parallel_frame = tk.LabelFrame(content, text="最大并行工单", font=("Microsoft YaHei", 11, "bold"),
+                                        bg="#f5f6fa", fg="#2c3e50")
+        parallel_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+        p_frame = tk.Frame(parallel_frame, bg="#f5f6fa")
+        p_frame.pack(fill=tk.X, padx=10, pady=10)
+        tk.Label(p_frame, text="最大并行数:", font=("Microsoft YaHei", 10), bg="#f5f6fa").pack(side=tk.LEFT, padx=5)
+        self.max_parallel_spin = tk.Spinbox(p_frame, from_=1, to=20, width=6, font=("Microsoft YaHei", 11))
+        self.max_parallel_spin.pack(side=tk.LEFT, padx=5)
+        tk.Button(p_frame, text="保存设置", font=("Microsoft YaHei", 10, "bold"), bg="#3498db", fg="white",
+                  width=12, command=self._on_save_max_parallel).pack(side=tk.LEFT, padx=15)
+
+        slots_frame = tk.LabelFrame(content, text="工作时段管理", font=("Microsoft YaHei", 11, "bold"),
+                                     bg="#f5f6fa", fg="#2c3e50")
+        slots_frame.grid(row=0, column=1, rowspan=3, sticky="nsew", padx=5, pady=5)
+
+        sl_top = tk.Frame(slots_frame, bg="#f5f6fa")
+        sl_top.pack(fill=tk.X, padx=8, pady=8)
+        self.slots_listbox = tk.Listbox(sl_top, height=12, font=("Microsoft YaHei", 10))
+        self.slots_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        add_frame = tk.Frame(slots_frame, bg="#f5f6fa")
+        add_frame.pack(fill=tk.X, padx=8, pady=5)
+        tk.Label(add_frame, text="星期:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=0, padx=3, pady=4, sticky="e")
+        self.slot_day = ttk.Combobox(add_frame, values=DAY_OPTIONS, state="readonly", width=8, font=("Microsoft YaHei", 9))
+        self.slot_day.grid(row=0, column=1, padx=3, pady=4)
+        tk.Label(add_frame, text="开始:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=2, padx=3, pady=4, sticky="e")
+        self.slot_start = tk.Entry(add_frame, width=6, font=("Microsoft YaHei", 10))
+        self.slot_start.insert(0, "09:00")
+        self.slot_start.grid(row=0, column=3, padx=3, pady=4)
+        tk.Label(add_frame, text="结束:", font=("Microsoft YaHei", 10), bg="#f5f6fa").grid(row=0, column=4, padx=3, pady=4, sticky="e")
+        self.slot_end = tk.Entry(add_frame, width=6, font=("Microsoft YaHei", 10))
+        self.slot_end.insert(0, "18:00")
+        self.slot_end.grid(row=0, column=5, padx=3, pady=4)
+
+        sl_btn_frame = tk.Frame(slots_frame, bg="#f5f6fa")
+        sl_btn_frame.pack(fill=tk.X, padx=8, pady=8)
+        tk.Button(sl_btn_frame, text="添加时段", font=("Microsoft YaHei", 9), bg="#27ae60", fg="white",
+                  width=10, command=self._on_add_slot).pack(side=tk.LEFT, padx=3)
+        tk.Button(sl_btn_frame, text="移除选中", font=("Microsoft YaHei", 9), bg="#e74c3c", fg="white",
+                  width=10, command=self._on_remove_slot).pack(side=tk.LEFT, padx=3)
+        tk.Button(sl_btn_frame, text="清空全部", font=("Microsoft YaHei", 9), bg="#95a5a6", fg="white",
+                  width=10, command=self._on_clear_slots).pack(side=tk.LEFT, padx=3)
+        tk.Button(sl_btn_frame, text="保存排班", font=("Microsoft YaHei", 9, "bold"), bg="#3498db", fg="white",
+                  width=10, command=self._on_save_slots).pack(side=tk.LEFT, padx=3)
+
+        self._temp_skills = []
+        self._temp_slots = []
+
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=2)
+        content.grid_rowconfigure(0, weight=0)
+        content.grid_rowconfigure(1, weight=1)
+        content.grid_rowconfigure(2, weight=0)
+
+        self._refresh_schedule_tech_list()
+
+    def _refresh_schedule_tech_list(self):
+        try:
+            techs = self.store.get_users_by_role(Role.TECHNICIAN)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        values = [f"{t.user_id} - {t.name}" for t in techs]
+        self.schedule_tech_combo["values"] = values
+        if values:
+            self.schedule_tech_combo.current(0)
+            self._refresh_schedule()
+
+    def _get_selected_tech(self):
+        sel = self.schedule_tech_combo.get()
+        if not sel:
+            return None
+        tech_id = sel.split(" - ")[0]
+        return self.store.get_user(tech_id)
+
+    def _refresh_schedule(self):
+        tech = self._get_selected_tech()
+        if not tech:
+            return
+        try:
+            sched = self.store.get_technician_schedule(tech.user_id)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        self.schedule_info_label.configure(
+            text=f"姓名: {tech.name}\n工号: {tech.user_id}\n"
+                 f"当前负载: {sched['current_load']} / {sched['max_parallel_orders']}"
+        )
+        self.max_parallel_spin.delete(0, tk.END)
+        self.max_parallel_spin.insert(0, str(sched["max_parallel_orders"]))
+
+        self._temp_skills = list(sched["skills"])
+        self._temp_slots = [TimeSlot.from_dict(d) for d in sched["time_slots"]]
+        self._refresh_skills_listbox()
+        self._refresh_slots_listbox()
+
+    def _refresh_skills_listbox(self):
+        self.skills_listbox.delete(0, tk.END)
+        for s in self._temp_skills:
+            self.skills_listbox.insert(tk.END, s)
+
+    def _refresh_slots_listbox(self):
+        self.slots_listbox.delete(0, tk.END)
+        for ts in self._temp_slots:
+            self.slots_listbox.insert(tk.END, repr(ts))
+
+    def _on_add_skill(self):
+        s = self.new_skill_combo.get().strip()
+        if not s:
+            messagebox.showwarning("提示", "请选择或输入技能")
+            return
+        if s in self._temp_skills:
+            messagebox.showwarning("提示", "该技能已存在")
+            return
+        self._temp_skills.append(s)
+        self._refresh_skills_listbox()
+        self.new_skill_combo.set("")
+
+    def _on_remove_skill(self):
+        sel = self.skills_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要移除的技能")
+            return
+        del self._temp_skills[sel[0]]
+        self._refresh_skills_listbox()
+
+    def _on_save_skills(self):
+        tech = self._get_selected_tech()
+        if not tech:
+            return
+        try:
+            self.store.set_technician_skills(tech.user_id, self._temp_skills, self.current_user)
+            messagebox.showinfo("成功", "技能已保存")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_save_max_parallel(self):
+        tech = self._get_selected_tech()
+        if not tech:
+            return
+        try:
+            val = int(self.max_parallel_spin.get())
+            self.store.set_technician_max_parallel(tech.user_id, val, self.current_user)
+            messagebox.showinfo("成功", "最大并行数已保存")
+            self._refresh_schedule()
+        except ValueError:
+            messagebox.showwarning("提示", "请输入有效数字")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_add_slot(self):
+        day_str = self.slot_day.get()
+        start = self.slot_start.get().strip()
+        end = self.slot_end.get().strip()
+        if not day_str:
+            messagebox.showwarning("提示", "请选择星期")
+            return
+        day_idx = DAY_MAP[day_str]
+        slot = TimeSlot(day_idx, start, end)
+        if not slot.is_valid():
+            messagebox.showwarning("提示", "时段无效，请检查时间格式（HH:MM）和先后顺序")
+            return
+        for s in self._temp_slots:
+            if s == slot:
+                messagebox.showwarning("提示", "该时段已存在")
+                return
+        self._temp_slots.append(slot)
+        self._refresh_slots_listbox()
+
+    def _on_remove_slot(self):
+        sel = self.slots_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要移除的时段")
+            return
+        del self._temp_slots[sel[0]]
+        self._refresh_slots_listbox()
+
+    def _on_clear_slots(self):
+        if messagebox.askyesno("确认", "确定清空所有时段？"):
+            self._temp_slots = []
+            self._refresh_slots_listbox()
+
+    def _on_save_slots(self):
+        tech = self._get_selected_tech()
+        if not tech:
+            return
+        try:
+            self.store.set_technician_time_slots(tech.user_id, self._temp_slots, self.current_user)
+            messagebox.showinfo("成功", "排班已保存")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    # ==================== 维修员 Tab ====================
+    def _build_technician_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="维修员工作台")
+
+        info_frame = tk.LabelFrame(frame, text="个人信息", font=("Microsoft YaHei", 11, "bold"),
+                                    bg="#f5f6fa", fg="#2c3e50")
+        info_frame.pack(fill=tk.X, padx=10, pady=10)
+        self.tech_info_label = tk.Label(info_frame, text="", font=("Microsoft YaHei", 10),
+                                         bg="#f5f6fa", justify=tk.LEFT)
+        self.tech_info_label.pack(anchor="w", padx=15, pady=10)
+
+        dispatched_frame = tk.LabelFrame(frame, text="待接单（已派工给我）", font=("Microsoft YaHei", 11, "bold"),
+                                          bg="#f5f6fa", fg="#2c3e50")
+        dispatched_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        d_cols = ("order_id", "title", "category", "priority", "location", "created_at")
+        self.tech_dispatched_tree = ttk.Treeview(dispatched_frame, columns=d_cols, show="headings", height=6)
+        for c, text, w in [("order_id", "工单编号", 150), ("title", "标题", 200), ("category", "类别", 90),
+                            ("priority", "优先级", 70), ("location", "位置", 140), ("created_at", "派工时间", 150)]:
+            self.tech_dispatched_tree.heading(c, text=text)
+            self.tech_dispatched_tree.column(c, width=w, anchor="center")
+        self.tech_dispatched_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        d_sb = ttk.Scrollbar(dispatched_frame, orient="vertical", command=self.tech_dispatched_tree.yview)
+        d_sb.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+        self.tech_dispatched_tree.configure(yscrollcommand=d_sb.set)
+        self._configure_tree_tags(self.tech_dispatched_tree)
+
+        dispatched_btn = tk.Frame(dispatched_frame, bg="#f5f6fa")
+        dispatched_btn.pack(fill=tk.X, padx=5, pady=5)
+        tk.Button(dispatched_btn, text="接单处理", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#27ae60", fg="white", width=15, command=self._on_tech_accept).pack(side=tk.LEFT, padx=5)
+        tk.Button(dispatched_btn, text="刷新", font=("Microsoft YaHei", 10),
+                  bg="#95a5a6", fg="white", width=10, command=self._refresh_tech_tab).pack(side=tk.LEFT, padx=5)
+
+        inprog_frame = tk.LabelFrame(frame, text="处理中（我的工单）", font=("Microsoft YaHei", 11, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        inprog_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        i_cols = ("order_id", "title", "category", "priority", "location", "started_at")
+        self.tech_inprog_tree = ttk.Treeview(inprog_frame, columns=i_cols, show="headings", height=6)
+        for c, text, w in [("order_id", "工单编号", 150), ("title", "标题", 200), ("category", "类别", 90),
+                            ("priority", "优先级", 70), ("location", "位置", 140), ("started_at", "开始时间", 150)]:
+            self.tech_inprog_tree.heading(c, text=text)
+            self.tech_inprog_tree.column(c, width=w, anchor="center")
+        self.tech_inprog_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        i_sb = ttk.Scrollbar(inprog_frame, orient="vertical", command=self.tech_inprog_tree.yview)
+        i_sb.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+        self.tech_inprog_tree.configure(yscrollcommand=i_sb.set)
+        self._configure_tree_tags(self.tech_inprog_tree)
+
+        inprog_btn = tk.Frame(inprog_frame, bg="#f5f6fa")
+        inprog_btn.pack(fill=tk.X, padx=5, pady=5)
+        tk.Button(inprog_btn, text="完工申请验收", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#3498db", fg="white", width=15, command=self._on_tech_complete).pack(side=tk.LEFT, padx=5)
+
+        self._refresh_tech_tab()
+
+    def _refresh_tech_tab(self):
+        try:
+            sched = self.store.get_technician_schedule(self.current_user.user_id)
+            tech = self.current_user
+            slots_str = "\n".join(repr(ts) for ts in tech.time_slots) if tech.time_slots else "(未设置，全天可接单)"
+            self.tech_info_label.configure(
+                text=f"姓名: {tech.name}    工号: {tech.user_id}\n"
+                     f"技能: {', '.join(sched['skills']) if sched['skills'] else '(无)'}\n"
+                     f"当前负载: {sched['current_load']} / {sched['max_parallel_orders']}\n"
+                     f"工作时段:\n{slots_str}"
+            )
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+        for i in self.tech_dispatched_tree.get_children():
+            self.tech_dispatched_tree.delete(i)
+        for i in self.tech_inprog_tree.get_children():
+            self.tech_inprog_tree.delete(i)
+
+        try:
+            dispatched = self.store.get_orders_by_filter(status=Status.DISPATCHED,
+                                                          assignee_id=self.current_user.user_id)
+            inprog = self.store.get_orders_by_filter(status=Status.IN_PROGRESS,
+                                                      assignee_id=self.current_user.user_id)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+
+        for o in dispatched:
+            tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            started = ""
+            for h in o.history:
+                if h.status == Status.DISPATCHED:
+                    started = h.timestamp
+                    break
+            self.tech_dispatched_tree.insert("", tk.END, iid=o.order_id, values=(
+                o.order_id, o.title, o.category, o.priority, o.location, started
+            ), tags=(tag,))
+
+        for o in inprog:
+            tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            started = ""
+            for h in o.history:
+                if h.status == Status.IN_PROGRESS:
+                    started = h.timestamp
+                    break
+            self.tech_inprog_tree.insert("", tk.END, iid=o.order_id, values=(
+                o.order_id, o.title, o.category, o.priority, o.location, started
+            ), tags=(tag,))
+
+    def _on_tech_accept(self):
+        sel = self.tech_dispatched_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要接单的工单")
             return
         order_id = sel[0]
         try:
             self.store.accept_order(order_id, self.current_user)
+            messagebox.showinfo("成功", "已接单")
+            self._refresh_tech_tab()
+            self._refresh_orders()
         except ConcurrentOperationError as e:
-            self.store.add_exception_note(order_id, f"抢单失败[{self.current_user.name}]: {str(e)}")
-            messagebox.showerror("抢单失败", str(e) + "\n已保存异常备注，已保存记录未被修改。")
-            return
-        except (PermissionError, StatusTransitionError, WorkOrderError) as e:
-            self.store.add_exception_note(order_id, f"接单失败: {str(e)}")
-            messagebox.showerror("接单失败", str(e) + "\n已保存异常备注，已保存记录未被修改。")
-            return
-        messagebox.showinfo("成功", "接单成功，开始处理")
-        self._refresh_all_trees()
+            messagebox.showerror("抢单失败", str(e))
+            self._refresh_tech_tab()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _complete_order(self):
-        sel = self.progress_tree.selection()
+    def _on_tech_complete(self):
+        sel = self.tech_inprog_tree.selection()
         if not sel:
-            messagebox.showinfo("提示", "请先选择处理中的工单")
+            messagebox.showwarning("提示", "请选择要完工的工单")
             return
         order_id = sel[0]
         try:
             self.store.complete_order(order_id, self.current_user)
-        except (PermissionError, StatusTransitionError, WorkOrderError) as e:
-            self.store.add_exception_note(order_id, f"完工失败: {str(e)}")
-            messagebox.showerror("完工失败", str(e) + "\n已保存异常备注，已保存记录未被修改。")
-            return
-        messagebox.showinfo("成功", "已提交完工，等待验收")
-        self._refresh_all_trees()
+            messagebox.showinfo("成功", "已提交验收")
+            self._refresh_tech_tab()
+            self._refresh_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _approve_order(self):
-        sel = self.inspect_tree.selection()
+    # ==================== 验收员 Tab ====================
+    def _build_inspector_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="验收工作台")
+
+        tk.Label(frame, text="待验收工单列表", font=("Microsoft YaHei", 13, "bold"),
+                 bg="#f5f6fa").pack(anchor="w", padx=10, pady=(10, 5))
+
+        tree_frame = tk.Frame(frame, bg="#f5f6fa")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        i_cols = ("order_id", "title", "category", "priority", "location",
+                   "assignee", "completed_at")
+        self.inspector_tree = ttk.Treeview(tree_frame, columns=i_cols, show="headings")
+        for c, text, w in [("order_id", "工单编号", 160), ("title", "标题", 220),
+                            ("category", "类别", 90), ("priority", "优先级", 70),
+                            ("location", "位置", 130), ("assignee", "维修员", 90),
+                            ("completed_at", "完工时间", 150)]:
+            self.inspector_tree.heading(c, text=text)
+            self.inspector_tree.column(c, width=w, anchor="center")
+        self.inspector_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.inspector_tree.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.inspector_tree.configure(yscrollcommand=sb.set)
+        self._configure_tree_tags(self.inspector_tree)
+
+        detail_frame = tk.LabelFrame(frame, text="工单详情", font=("Microsoft YaHei", 11, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        detail_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.inspector_detail = tk.Label(detail_frame, text="", font=("Microsoft YaHei", 10),
+                                          bg="#f5f6fa", justify=tk.LEFT, wraplength=1100)
+        self.inspector_detail.pack(anchor="w", padx=10, pady=8)
+        self.inspector_tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_inspector_detail())
+
+        btn_frame = tk.Frame(frame, bg="#f5f6fa")
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        tk.Button(btn_frame, text="验收通过", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#27ae60", fg="white", width=15, command=self._on_approve).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="退回（需原因）", font=("Microsoft YaHei", 11, "bold"),
+                  bg="#e74c3c", fg="white", width=15, command=self._on_reject).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="刷新", font=("Microsoft YaHei", 10),
+                  bg="#95a5a6", fg="white", width=12, command=self._refresh_inspector_tab).pack(side=tk.LEFT, padx=10)
+
+        self._refresh_inspector_tab()
+
+    def _refresh_inspector_tab(self):
+        for i in self.inspector_tree.get_children():
+            self.inspector_tree.delete(i)
+        try:
+            orders = self.store.get_orders_by_filter(status=Status.PENDING_INSPECTION)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        for o in orders:
+            tag = f"priority_{'high' if o.priority == '高' else 'mid' if o.priority == '中' else 'low'}"
+            completed_at = ""
+            for h in reversed(o.history):
+                if h.status == Status.PENDING_INSPECTION:
+                    completed_at = h.timestamp
+                    break
+            self.inspector_tree.insert("", tk.END, iid=o.order_id, values=(
+                o.order_id, o.title, o.category, o.priority, o.location,
+                o.assignee_name or "未指派", completed_at
+            ), tags=(tag,))
+        self.inspector_detail.configure(text="")
+
+    def _refresh_inspector_detail(self):
+        sel = self.inspector_tree.selection()
         if not sel:
-            messagebox.showinfo("提示", "请先选择待验收工单")
+            self.inspector_detail.configure(text="")
             return
         order_id = sel[0]
-        order = self.store.get_order(order_id)
-        if order and order.status == Status.IN_PROGRESS:
-            self.store.add_exception_note(order_id, f"违规操作失败[{self.current_user.name}]: 试图从处理中直接完成(需走验收流程)")
-            messagebox.showerror("验收失败", "非法操作：不能从处理中直接完成，必须走【处理中→待验收→已完成】的完整路径。\n已保存异常备注，已保存记录未被修改。")
+        try:
+            order = self.store.get_order(order_id)
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        if not order:
+            return
+        self.inspector_detail.configure(
+            text=f"标题: {order.title}\n描述: {order.description}\n位置: {order.location}\n"
+                 f"类别: {order.category}    优先级: {order.priority}\n"
+                 f"维修员: {order.assignee_name or '未指派'}    创建人: {order.creator_name}"
+        )
+
+    def _on_approve(self):
+        sel = self.inspector_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请选择要验收的工单")
+            return
+        order_id = sel[0]
+        if not messagebox.askyesno("确认", "确认验收通过？"):
             return
         try:
             self.store.approve_order(order_id, self.current_user)
-        except (PermissionError, StatusTransitionError, WorkOrderError) as e:
-            self.store.add_exception_note(order_id, f"验收失败: {str(e)}")
-            messagebox.showerror("验收失败", str(e) + "\n已保存异常备注，已保存记录未被修改。")
-            return
-        messagebox.showinfo("成功", "验收通过，工单已完成")
-        self._refresh_all_trees()
+            messagebox.showinfo("成功", "验收通过，工单已完成")
+            self._refresh_inspector_tab()
+            self._refresh_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _reject_order(self):
-        sel = self.inspect_tree.selection()
+    def _on_reject(self):
+        sel = self.inspector_tree.selection()
         if not sel:
-            messagebox.showinfo("提示", "请先选择待验收工单")
+            messagebox.showwarning("提示", "请选择要退回的工单")
             return
-        reason = simpledialog.askstring("验收退回", "请输入退回原因：", parent=self.root)
+        order_id = sel[0]
+        reason = simpledialog.askstring("退回原因", "请填写退回原因（必填）:", parent=self.root)
         if not reason or not reason.strip():
             messagebox.showwarning("提示", "退回原因不能为空")
             return
-        order_id = sel[0]
         try:
-            self.store.reject_order(order_id, self.current_user, reason.strip())
-        except (PermissionError, StatusTransitionError, WorkOrderError) as e:
-            self.store.add_exception_note(order_id, f"退回失败: {str(e)}")
-            messagebox.showerror("退回失败", str(e) + "\n已保存异常备注，已保存记录未被修改。")
-            return
-        messagebox.showinfo("成功", f"已退回，维修员需重新处理。\n原因: {reason.strip()}")
-        self._refresh_all_trees()
+            self.store.reject_order(order_id, self.current_user, reason)
+            messagebox.showinfo("成功", "已退回给维修员")
+            self._refresh_inspector_tab()
+            self._refresh_orders()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _config_export_dir(self):
-        current = self.store.get_config().export_dir or os.getcwd()
-        path = filedialog.askdirectory(title="选择导出目录", initialdir=current)
+    # ==================== 导入导出 Tab ====================
+    def _build_import_export_tab(self):
+        frame = tk.Frame(self.notebook, bg="#f5f6fa")
+        self.notebook.add(frame, text="导入导出")
+
+        left = tk.Frame(frame, bg="#f5f6fa")
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        import_frame = tk.LabelFrame(left, text="数据导入（仅调度员）", font=("Microsoft YaHei", 12, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        import_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(import_frame, text="工单CSV导入:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=0, column=0, sticky="w", padx=10, pady=8)
+        tk.Button(import_frame, text="选择文件并导入", font=("Microsoft YaHei", 10),
+                  bg="#27ae60", fg="white", width=18, command=self._on_import_orders).grid(row=0, column=1, padx=5, pady=8)
+
+        tk.Label(import_frame, text="维修员排班CSV导入:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").grid(row=1, column=0, sticky="w", padx=10, pady=8)
+        tk.Button(import_frame, text="选择文件并导入", font=("Microsoft YaHei", 10),
+                  bg="#27ae60", fg="white", width=18, command=self._on_import_techs).grid(row=1, column=1, padx=5, pady=8)
+
+        if self.current_user.role != Role.DISPATCHER:
+            for w in import_frame.winfo_children():
+                try:
+                    w.configure(state=tk.DISABLED)
+                except tk.TclError:
+                    pass
+
+        dir_frame = tk.LabelFrame(left, text="导出目录设置", font=("Microsoft YaHei", 12, "bold"),
+                                   bg="#f5f6fa", fg="#2c3e50")
+        dir_frame.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(dir_frame, text="当前导出目录:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").pack(anchor="w", padx=10, pady=(8, 2))
+        self.export_dir_label = tk.Label(dir_frame, text="", font=("Microsoft YaHei", 9),
+                                          bg="#ffffff", fg="#2c3e50", anchor="w", relief=tk.SUNKEN)
+        self.export_dir_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+        tk.Button(dir_frame, text="选择导出目录", font=("Microsoft YaHei", 10),
+                  bg="#3498db", fg="white", width=18, command=self._on_set_export_dir).pack(anchor="w", padx=10, pady=(0, 10))
+        self._refresh_export_dir_label()
+
+        right = tk.Frame(frame, bg="#f5f6fa")
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        export_frame = tk.LabelFrame(right, text="数据导出", font=("Microsoft YaHei", 12, "bold"),
+                                      bg="#f5f6fa", fg="#2c3e50")
+        export_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.export_filtered_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(export_frame, text="仅导出当前工单列表筛选结果", variable=self.export_filtered_var,
+                       font=("Microsoft YaHei", 10), bg="#f5f6fa").pack(anchor="w", padx=10, pady=8)
+
+        row = 0
+        tk.Label(export_frame, text="工单数据:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=5, columnspan=2)
+        row += 1
+        tk.Button(export_frame, text="导出 JSON", font=("Microsoft YaHei", 10),
+                  bg="#3498db", fg="white", width=15, command=lambda: self._on_export_orders("json")).grid(row=row, column=0, padx=10, pady=4)
+        tk.Button(export_frame, text="导出 CSV", font=("Microsoft YaHei", 10),
+                  bg="#3498db", fg="white", width=15, command=lambda: self._on_export_orders("csv")).grid(row=row, column=1, padx=10, pady=4)
+        row += 1
+        tk.Label(export_frame, text="维修员数据:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=5, columnspan=2)
+        row += 1
+        tk.Button(export_frame, text="导出 JSON", font=("Microsoft YaHei", 10),
+                  bg="#9b59b6", fg="white", width=15, command=lambda: self._on_export_techs("json")).grid(row=row, column=0, padx=10, pady=4)
+        tk.Button(export_frame, text="导出 CSV", font=("Microsoft YaHei", 10),
+                  bg="#9b59b6", fg="white", width=15, command=lambda: self._on_export_techs("csv")).grid(row=row, column=1, padx=10, pady=4)
+        row += 1
+        tk.Label(export_frame, text="改派记录:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").grid(row=row, column=0, sticky="w", padx=10, pady=5, columnspan=2)
+        row += 1
+        tk.Button(export_frame, text="导出 JSON", font=("Microsoft YaHei", 10),
+                  bg="#e67e22", fg="white", width=15, command=lambda: self._on_export_reassign("json")).grid(row=row, column=0, padx=10, pady=4)
+        tk.Button(export_frame, text="导出 CSV", font=("Microsoft YaHei", 10),
+                  bg="#e67e22", fg="white", width=15, command=lambda: self._on_export_reassign("csv")).grid(row=row, column=1, padx=10, pady=4)
+
+        self.export_log = tk.Text(export_frame, height=8, font=("Microsoft YaHei", 9), state=tk.DISABLED,
+                                   bg="#ffffff", wrap=tk.WORD)
+        self.export_log.grid(row=row + 1, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        export_frame.grid_rowconfigure(row + 1, weight=1)
+        export_frame.grid_columnconfigure(0, weight=1)
+        export_frame.grid_columnconfigure(1, weight=1)
+
+    def _refresh_export_dir_label(self):
+        try:
+            cfg = self.store.get_config()
+            path = cfg.export_dir or "(未设置，默认: ./exports)"
+            self.export_dir_label.configure(text=path)
+        except WorkOrderError as e:
+            self.export_dir_label.configure(text=str(e))
+
+    def _append_export_log(self, msg):
+        self.export_log.configure(state=tk.NORMAL)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.export_log.insert(tk.END, f"[{ts}] {msg}\n")
+        self.export_log.see(tk.END)
+        self.export_log.configure(state=tk.DISABLED)
+
+    def _on_set_export_dir(self):
+        path = filedialog.askdirectory(title="选择导出目录")
         if not path:
             return
-        self.store.set_export_dir(path)
-        messagebox.showinfo("成功", f"导出目录已设置为:\n{path}")
-        self._update_status(f"就绪 | 导出目录: {path}")
+        try:
+            self.store.set_export_dir(path)
+            self._refresh_export_dir_label()
+            messagebox.showinfo("成功", f"导出目录已设置为:\n{path}")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _import_csv(self):
-        path = filedialog.askopenfilename(
-            title="选择CSV文件",
-            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")],
-        )
+    def _get_filtered_orders(self):
+        if not self.export_filtered_var.get():
+            return None
+        status_val = self.filter_status.get()
+        status = None
+        if status_val and status_val != "全部":
+            for s in Status:
+                if s.value == status_val:
+                    status = s
+                    break
+        location = self.filter_location.get().strip() or None
+        category_val = self.filter_category.get()
+        category = category_val if category_val and category_val != "全部" else None
+        priority_val = self.filter_priority.get()
+        priority = priority_val if priority_val and priority_val != "全部" else None
+        assignee_id = None
+        if self.current_user.role == Role.TECHNICIAN:
+            assignee_id = self.current_user.user_id
+        return self.store.get_orders_by_filter(status=status, location=location,
+                                                 category=category, priority=priority,
+                                                 assignee_id=assignee_id)
+
+    def _on_import_orders(self):
+        if self.current_user.role != Role.DISPATCHER:
+            messagebox.showwarning("提示", "仅调度员可导入工单")
+            return
+        path = filedialog.askopenfilename(title="选择工单CSV文件",
+                                            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")])
         if not path:
             return
         try:
             count, errors = self.store.import_orders_csv(path, self.current_user)
-        except (PermissionError, WorkOrderError) as e:
-            messagebox.showerror("导入失败", str(e))
-            return
-        msg = f"成功导入 {count} 条工单"
-        if errors:
-            msg += f"\n\n{len(errors)} 条失败:\n" + "\n".join(errors[:20])
-            if len(errors) > 20:
-                msg += f"\n... 共 {len(errors)} 条错误"
-        messagebox.showinfo("导入结果", msg)
-        self._refresh_all_trees()
+            msg = f"导入完成: 成功 {count} 条"
+            if errors:
+                msg += f"，失败 {len(errors)} 条:\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n... 还有 {len(errors) - 5} 条错误"
+            messagebox.showinfo("导入结果", msg)
+            self._append_export_log(f"工单CSV导入: 成功{count}条, 失败{len(errors)}条")
+            self._refresh_all_tabs()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
 
-    def _export(self, fmt: str, all_orders: bool):
-        if all_orders:
-            orders = None
-        else:
-            status_s = self.f_status_var.get()
-            status = None if status_s == "全部" else Status(status_s)
-            location = self.f_location_var.get().strip() or None
-            cat_s = self.f_category_var.get()
-            category = None if cat_s == "全部" else cat_s
-            pr_s = self.f_priority_var.get()
-            priority = None if pr_s == "全部" else pr_s
-            orders = self.store.get_orders_by_filter(status=status, location=location, category=category, priority=priority)
+    def _on_import_techs(self):
+        if self.current_user.role != Role.DISPATCHER:
+            messagebox.showwarning("提示", "仅调度员可导入维修员排班")
+            return
+        path = filedialog.askopenfilename(title="选择维修员排班CSV文件",
+                                            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
         try:
+            count, errors = self.store.import_technicians_csv(path, self.current_user)
+            msg = f"导入完成: 成功 {count} 条"
+            if errors:
+                msg += f"，失败 {len(errors)} 条:\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n... 还有 {len(errors) - 5} 条错误"
+            messagebox.showinfo("导入结果", msg)
+            self._append_export_log(f"维修员排班CSV导入: 成功{count}条, 失败{len(errors)}条")
+            self._refresh_all_tabs()
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_export_orders(self, fmt):
+        try:
+            orders = self._get_filtered_orders()
             if fmt == "json":
                 path = self.store.export_orders_json(orders)
             else:
                 path = self.store.export_orders_csv(orders)
+            scope = "筛选结果" if orders is not None else "全部"
+            msg = f"工单{scope}已导出到: {path}"
+            messagebox.showinfo("导出成功", msg)
+            self._append_export_log(msg)
         except ExportError as e:
-            messagebox.showerror("导出失败", str(e) + "\n已保存记录未被修改。")
-            return
-        except WorkOrderError as e:
             messagebox.showerror("导出失败", str(e))
-            return
-        messagebox.showinfo("导出成功", f"已导出到:\n{path}")
+            self._append_export_log(f"工单导出失败: {e}")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_export_techs(self, fmt):
+        try:
+            if fmt == "json":
+                path = self.store.export_technicians_json()
+            else:
+                path = self.store.export_technicians_csv()
+            msg = f"维修员数据已导出到: {path}"
+            messagebox.showinfo("导出成功", msg)
+            self._append_export_log(msg)
+        except ExportError as e:
+            messagebox.showerror("导出失败", str(e))
+            self._append_export_log(f"维修员导出失败: {e}")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _on_export_reassign(self, fmt):
+        try:
+            orders = self._get_filtered_orders()
+            if fmt == "json":
+                path = self.store.export_reassignment_logs_json(orders)
+            else:
+                path = self.store.export_reassignment_logs_csv(orders)
+            scope = "筛选结果" if orders is not None else "全部"
+            msg = f"改派记录{scope}已导出到: {path}"
+            messagebox.showinfo("导出成功", msg)
+            self._append_export_log(msg)
+        except ExportError as e:
+            messagebox.showerror("导出失败", str(e))
+            self._append_export_log(f"改派记录导出失败: {e}")
+        except WorkOrderError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _refresh_all_tabs(self):
+        try:
+            self._refresh_orders()
+        except Exception:
+            pass
+        try:
+            self._refresh_history_order_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_dispatch_orders()
+        except Exception:
+            pass
+        try:
+            self._refresh_schedule_tech_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_tech_tab()
+        except Exception:
+            pass
+        try:
+            self._refresh_inspector_tab()
+        except Exception:
+            pass
 
 
 def main():
     root = tk.Tk()
+    try:
+        root.iconbitmap(default="")
+    except tk.TclError:
+        pass
     app = MaintenanceApp(root)
     root.mainloop()
 

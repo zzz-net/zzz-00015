@@ -29,25 +29,265 @@ STATUS_FLOW = {
 }
 
 
+REASSIGNABLE_STATUSES = {
+    Status.PENDING_DISPATCH: {"reason": "待派单可直接改派", "note": "首次派单即生效"},
+    Status.DISPATCHED: {"reason": "已派单但未接单可改派", "note": "维修员尚未接单"},
+    Status.IN_PROGRESS: {"reason": "处理中改派需升级原因", "note": "需注明升级或请假原因"},
+    Status.PENDING_INSPECTION: {"reason": "待验收改派仅允许管理员权限", "note": "仅限紧急或特殊情况"},
+}
+
+
 ROLE_PERMISSIONS = {
-    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history"],
+    Role.DISPATCHER: ["create", "dispatch", "import", "export", "view_history", "reassign", "manage_schedule"],
     Role.TECHNICIAN: ["accept", "complete", "view_history"],
     Role.INSPECTOR: ["approve", "reject", "view_history", "export"],
 }
 
 
+CATEGORY_SKILL_MAP = {
+    "空调维修": "空调",
+    "电梯维修": "电梯",
+    "电路维修": "电路",
+    "照明维修": "电路",
+    "水管维修": "水管",
+    "门禁维修": "门禁",
+    "办公设备": "办公设备",
+    "网络维护": "网络",
+    "其他": "通用",
+}
+
+
+class TimeSlot:
+    def __init__(self, day_of_week: int, start_time: str, end_time: str):
+        self.day_of_week = day_of_week
+        self.start_time = start_time
+        self.end_time = end_time
+
+    def to_dict(self) -> Dict:
+        return {
+            "day_of_week": self.day_of_week,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "TimeSlot":
+        return cls(data["day_of_week"], data["start_time"], data["end_time"])
+
+    def is_valid(self) -> bool:
+        if self.day_of_week < 0 or self.day_of_week > 6:
+            return False
+        try:
+            sh, smin = [int(x) for x in self.start_time.split(":")]
+            eh, emin = [int(x) for x in self.end_time.split(":")]
+            if sh < 0 or sh > 23 or smin < 0 or smin > 59:
+                return False
+            if eh < 0 or eh > 23 or emin < 0 or emin > 59:
+                return False
+            start_min = sh * 60 + smin
+            end_min = eh * 60 + emin
+            return start_min < end_min
+        except (ValueError, AttributeError):
+            return False
+
+    def covers(self, dt: datetime) -> bool:
+        if dt.weekday() != self.day_of_week:
+            return False
+        try:
+            sh, smin = [int(x) for x in self.start_time.split(":")]
+            eh, emin = [int(x) for x in self.end_time.split(":")]
+            start_min = sh * 60 + smin
+            end_min = eh * 60 + emin
+            now_min = dt.hour * 60 + dt.minute
+            return start_min <= now_min <= end_min
+        except (ValueError, AttributeError):
+            return False
+
+    def __eq__(self, other):
+        if not isinstance(other, TimeSlot):
+            return False
+        return (self.day_of_week == other.day_of_week and
+                self.start_time == other.start_time and
+                self.end_time == other.end_time)
+
+    def __hash__(self):
+        return hash((self.day_of_week, self.start_time, self.end_time))
+
+    def __repr__(self):
+        days = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        return f"{days[self.day_of_week]} {self.start_time}-{self.end_time}"
+
+
+class ReassignmentLog:
+    def __init__(
+        self,
+        order_id: str,
+        from_user_id: str,
+        from_user_name: str,
+        to_user_id: str,
+        to_user_name: str,
+        reason: str,
+        dispatcher_id: str,
+        dispatcher_name: str,
+        timestamp: str,
+    ):
+        self.order_id = order_id
+        self.from_user_id = from_user_id
+        self.from_user_name = from_user_name
+        self.to_user_id = to_user_id
+        self.to_user_name = to_user_name
+        self.reason = reason
+        self.dispatcher_id = dispatcher_id
+        self.dispatcher_name = dispatcher_name
+        self.timestamp = timestamp
+
+    def to_dict(self) -> Dict:
+        return {
+            "order_id": self.order_id,
+            "from_user_id": self.from_user_id,
+            "from_user_name": self.from_user_name,
+            "to_user_id": self.to_user_id,
+            "to_user_name": self.to_user_name,
+            "reason": self.reason,
+            "dispatcher_id": self.dispatcher_id,
+            "dispatcher_name": self.dispatcher_name,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ReassignmentLog":
+        return cls(
+            data["order_id"],
+            data["from_user_id"],
+            data["from_user_name"],
+            data["to_user_id"],
+            data["to_user_name"],
+            data["reason"],
+            data["dispatcher_id"],
+            data["dispatcher_name"],
+            data["timestamp"],
+        )
+
+
+class MatchResult:
+    def __init__(
+        self,
+        skill_match: bool,
+        available_now: bool,
+        within_capacity: bool,
+        current_load: int,
+        max_parallel: int,
+        warnings: Optional[List[str]] = None,
+    ):
+        self.skill_match = skill_match
+        self.available_now = available_now
+        self.within_capacity = within_capacity
+        self.current_load = current_load
+        self.max_parallel = max_parallel
+        self.warnings = warnings or []
+
+    @property
+    def score(self) -> int:
+        s = 0
+        if self.skill_match:
+            s += 50
+        if self.available_now:
+            s += 30
+        if self.within_capacity:
+            s += 20
+        return s
+
+    @property
+    def is_recommended(self) -> bool:
+        return self.skill_match and self.available_now and self.within_capacity
+
+    def to_dict(self) -> Dict:
+        return {
+            "skill_match": self.skill_match,
+            "available_now": self.available_now,
+            "within_capacity": self.within_capacity,
+            "current_load": self.current_load,
+            "max_parallel": self.max_parallel,
+            "score": self.score,
+            "is_recommended": self.is_recommended,
+            "warnings": self.warnings,
+        }
+
+    def __repr__(self):
+        parts = []
+        if not self.skill_match:
+            parts.append("技能不匹配")
+        if not self.available_now:
+            parts.append("非上班时间")
+        if not self.within_capacity:
+            parts.append(f"超载({self.current_load}/{self.max_parallel})")
+        if not parts:
+            parts.append("推荐")
+        return f"匹配度{self.score}分: {', '.join(parts)}"
+
+
 class User:
-    def __init__(self, user_id: str, name: str, role: Role):
+    def __init__(
+        self,
+        user_id: str,
+        name: str,
+        role: Role,
+        skills: Optional[List[str]] = None,
+        max_parallel_orders: int = 3,
+        time_slots: Optional[List[TimeSlot]] = None,
+    ):
         self.user_id = user_id
         self.name = name
         self.role = role
+        self.skills = skills or []
+        self.max_parallel_orders = max_parallel_orders
+        self.time_slots = time_slots or []
 
     def to_dict(self) -> Dict:
-        return {"user_id": self.user_id, "name": self.name, "role": self.role.value}
+        return {
+            "user_id": self.user_id,
+            "name": self.name,
+            "role": self.role.value,
+            "skills": self.skills,
+            "max_parallel_orders": self.max_parallel_orders,
+            "time_slots": [ts.to_dict() for ts in self.time_slots],
+        }
 
     @classmethod
     def from_dict(cls, data: Dict) -> "User":
-        return cls(data["user_id"], data["name"], Role(data["role"]))
+        role = Role(data["role"])
+        skills = data.get("skills", [])
+        max_parallel_orders = data.get("max_parallel_orders", 3)
+        time_slots = [TimeSlot.from_dict(ts) for ts in data.get("time_slots", [])]
+        return cls(data["user_id"], data["name"], role, skills, max_parallel_orders, time_slots)
+
+    def has_skill_for_category(self, category: str) -> bool:
+        required = CATEGORY_SKILL_MAP.get(category, "通用")
+        if required == "通用":
+            return True
+        return required in self.skills or "通用" in self.skills
+
+    def is_available_at(self, dt: Optional[datetime] = None) -> bool:
+        if not self.time_slots:
+            return True
+        dt = dt or datetime.now()
+        return any(ts.covers(dt) for ts in self.time_slots)
+
+    def add_skill(self, skill: str):
+        skill = skill.strip()
+        if skill and skill not in self.skills:
+            self.skills.append(skill)
+
+    def remove_skill(self, skill: str):
+        if skill in self.skills:
+            self.skills.remove(skill)
+
+    def add_time_slot(self, slot: TimeSlot):
+        if slot.is_valid() and slot not in self.time_slots:
+            self.time_slots.append(slot)
+
+    def clear_time_slots(self):
+        self.time_slots = []
 
 
 class StatusHistory:
@@ -95,6 +335,8 @@ class WorkOrder:
         assignee_name: Optional[str] = None,
         history: Optional[List[StatusHistory]] = None,
         exception_notes: Optional[List[str]] = None,
+        reassignment_logs: Optional[List[ReassignmentLog]] = None,
+        version: int = 0,
     ):
         self.order_id = order_id
         self.title = title
@@ -110,6 +352,8 @@ class WorkOrder:
         self.assignee_name = assignee_name
         self.history = history or []
         self.exception_notes = exception_notes or []
+        self.reassignment_logs = reassignment_logs or []
+        self.version = version
         self._lock = threading.Lock()
 
         if not self.history:
@@ -139,6 +383,8 @@ class WorkOrder:
             "assignee_name": self.assignee_name,
             "history": [h.to_dict() for h in self.history],
             "exception_notes": self.exception_notes,
+            "reassignment_logs": [r.to_dict() for r in self.reassignment_logs],
+            "version": self.version,
         }
 
     @classmethod
@@ -158,12 +404,21 @@ class WorkOrder:
         order.assignee_name = data.get("assignee_name")
         order.history = [StatusHistory.from_dict(h) for h in data.get("history", [])]
         order.exception_notes = data.get("exception_notes", [])
+        order.reassignment_logs = [ReassignmentLog.from_dict(r) for r in data.get("reassignment_logs", [])]
+        order.version = data.get("version", 0)
         order._lock = threading.Lock()
         return order
 
     def add_exception_note(self, note: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.exception_notes.append(f"[{timestamp}] {note}")
+
+    def add_reassignment_log(self, log: ReassignmentLog):
+        self.reassignment_logs.append(log)
+
+    def bump_version(self) -> int:
+        self.version += 1
+        return self.version
 
 
 class AppConfig:
