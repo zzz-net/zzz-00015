@@ -298,12 +298,15 @@ class BatchReassignDialog(tk.Toplevel):
         self.draft_items: List[BatchDraftItem] = []
         self.conflicts: Dict[str, List[ConflictType]] = {}
         self.last_result: Optional[BatchReassignmentResult] = None
+        self.result_filter_status: str = "all"
+        self.result_filter_conflict: str = "all"
         self.title("批量改派预案")
-        self.geometry("1180x760")
+        self.geometry("1280x880")
         self.configure(bg="#f5f6fa")
         self.grab_set()
         self.transient(parent)
         self._build_ui()
+        self._try_load_latest_result()
         if existing_draft:
             self._load_existing_draft(existing_draft)
 
@@ -473,12 +476,108 @@ class BatchReassignDialog(tk.Toplevel):
                   bg="#27ae60", fg="white", width=13,
                   command=self._on_submit_batch).pack(side=tk.RIGHT, padx=5)
 
-        result_frame = tk.LabelFrame(self, text="执行结果", font=("Microsoft YaHei", 11, "bold"),
+        result_frame = tk.LabelFrame(self, text="第3步：执行结果明细（可筛选、可定位原草稿）",
+                                      font=("Microsoft YaHei", 11, "bold"),
                                       bg="#f5f6fa", fg="#2c3e50")
-        result_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self.result_text = tk.Text(result_frame, height=5, font=("Microsoft YaHei", 9),
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        result_toolbar = tk.Frame(result_frame, bg="#f5f6fa")
+        result_toolbar.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Label(result_toolbar, text="结果编号:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f6fa").pack(side=tk.LEFT, padx=(0, 3))
+        self.result_id_label = tk.Label(result_toolbar, text="(暂无)", font=("Microsoft YaHei", 9),
+                                         bg="#f5f6fa", fg="#7f8c8d")
+        self.result_id_label.pack(side=tk.LEFT, padx=(0, 15))
+
+        tk.Label(result_toolbar, text="状态筛选:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").pack(side=tk.LEFT, padx=(10, 3))
+        self.result_status_combo = ttk.Combobox(
+            result_toolbar,
+            values=["全部", "仅成功", "仅跳过", "仅失败"],
+            state="readonly", width=10, font=("Microsoft YaHei", 10),
+        )
+        self.result_status_combo.set("全部")
+        self.result_status_combo.pack(side=tk.LEFT, padx=3)
+        self.result_status_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_result_detail_view())
+
+        tk.Label(result_toolbar, text="冲突类型:", font=("Microsoft YaHei", 10),
+                 bg="#f5f6fa").pack(side=tk.LEFT, padx=(15, 3))
+        self.result_conflict_combo = ttk.Combobox(
+            result_toolbar,
+            values=["全部"],
+            state="readonly", width=16, font=("Microsoft YaHei", 10),
+        )
+        self.result_conflict_combo.set("全部")
+        self.result_conflict_combo.pack(side=tk.LEFT, padx=3)
+        self.result_conflict_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_result_detail_view())
+
+        tk.Button(result_toolbar, text="刷新结果", font=("Microsoft YaHei", 10),
+                  bg="#3498db", fg="white", width=10,
+                  command=self._refresh_result_detail_view).pack(side=tk.LEFT, padx=(15, 3))
+        tk.Button(result_toolbar, text="定位原草稿", font=("Microsoft YaHei", 10),
+                  bg="#e67e22", fg="white", width=12,
+                  command=self._locate_original_draft).pack(side=tk.LEFT, padx=3)
+        tk.Button(result_toolbar, text="恢复最近一次结果", font=("Microsoft YaHei", 10),
+                  bg="#8e44ad", fg="white", width=16,
+                  command=self._restore_latest_result).pack(side=tk.LEFT, padx=3)
+
+        self.result_summary_label = tk.Label(result_toolbar, text="", font=("Microsoft YaHei", 10),
+                                              bg="#f5f6fa", fg="#2980b9")
+        self.result_summary_label.pack(side=tk.RIGHT, padx=10)
+
+        result_tree_frame = tk.Frame(result_frame, bg="#f5f6fa")
+        result_tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        r_cols = (
+            "status", "order_id", "order_title",
+            "orig_assignee", "target_assignee",
+            "version", "permission", "skill", "capacity", "schedule",
+            "log_written", "conflict_types", "reason", "error",
+            "item_timestamp",
+        )
+        self.result_detail_tree = ttk.Treeview(
+            result_tree_frame, columns=r_cols, show="headings", style="Batch.Treeview",
+        )
+        col_config = [
+            ("status", "结果", 60),
+            ("order_id", "工单编号", 140),
+            ("order_title", "工单标题", 150),
+            ("orig_assignee", "原维修员", 80),
+            ("target_assignee", "新维修员", 80),
+            ("version", "版本", 55),
+            ("permission", "权限", 55),
+            ("skill", "技能", 55),
+            ("capacity", "容量", 55),
+            ("schedule", "排班", 55),
+            ("log_written", "日志", 55),
+            ("conflict_types", "冲突类型", 170),
+            ("reason", "改派原因", 160),
+            ("error", "错误/跳过原因", 230),
+            ("item_timestamp", "处理时间", 140),
+        ]
+        for c, text, w in col_config:
+            self.result_detail_tree.heading(c, text=text)
+            self.result_detail_tree.column(c, width=w, anchor="center")
+        self.result_detail_tree.column("order_title", anchor="w")
+        self.result_detail_tree.column("conflict_types", anchor="w")
+        self.result_detail_tree.column("reason", anchor="w")
+        self.result_detail_tree.column("error", anchor="w")
+        self.result_detail_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        r_sb = ttk.Scrollbar(result_tree_frame, orient="vertical", command=self.result_detail_tree.yview)
+        r_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_detail_tree.configure(yscrollcommand=r_sb.set)
+        self.result_detail_tree.tag_configure("success", background="#eafaf1")
+        self.result_detail_tree.tag_configure("skipped", background="#fef9e7")
+        self.result_detail_tree.tag_configure("failed", background="#fdedec")
+        self.result_detail_tree.tag_configure("log_fail", background="#fdecea")
+        self.result_detail_tree.bind("<Double-1>", self._on_result_double_click)
+
+        result_text_frame = tk.Frame(result_frame, bg="#f5f6fa")
+        result_text_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.result_text = tk.Text(result_text_frame, height=4, font=("Microsoft YaHei", 9),
                                     state=tk.DISABLED, bg="#ffffff", wrap=tk.WORD)
-        self.result_text.pack(fill=tk.X, padx=8, pady=6)
+        self.result_text.pack(fill=tk.X)
 
     def _configure_tree_tags(self, tree):
         tree.tag_configure("good", background="#eafaf1")
@@ -779,18 +878,215 @@ class BatchReassignDialog(tk.Toplevel):
         self.result_text.configure(state=tk.NORMAL)
         self.result_text.delete("1.0", tk.END)
         lines = [
-            f"批量改派执行完成  提交人: {result.dispatcher_name}  时间: {result.timestamp}",
-            f"  成功: {result.success_count} 条    跳过: {result.skipped_count} 条    失败: {result.failed_count} 条",
+            f"批量改派执行完成  结果编号: {result.result_id}  提交人: {result.dispatcher_name}  时间: {result.timestamp}",
+            f"  总计: {result.total_count} 条  成功: {result.success_count} 条    跳过: {result.skipped_count} 条    失败: {result.failed_count} 条",
         ]
         for r in result.results:
-            status = "✓成功" if r.success else ("⊘跳过" if r.skipped else "✗失败")
-            info = f"  [{status}] {r.order_id} -> {r.target_technician_name or '?'}"
+            status_label = r.status_label
+            info = f"  [{status_label}] {r.order_id} -> {r.target_technician_name or '?'}"
             if r.error_message:
                 info += f"  原因: {r.error_message}"
             lines.append(info)
-        lines.append("提示：可使用下方导出按钮导出 CSV/JSON 结果文件")
+        lines.append("提示：上方明细表格可筛选结果，双击或点击“定位原草稿”回到预案")
         self.result_text.insert(tk.END, "\n".join(lines))
         self.result_text.configure(state=tk.DISABLED)
+
+        if result.result_id:
+            self.result_id_label.configure(text=result.result_id, fg="#2c3e50")
+        self._refresh_result_detail_view()
+
+    def _try_load_latest_result(self):
+        try:
+            latest = self.store.get_latest_batch_result(self.dispatcher)
+            if latest is not None:
+                self.last_result = latest
+                self._show_result(latest)
+        except Exception:
+            pass
+
+    def _restore_latest_result(self):
+        try:
+            latest = self.store.get_latest_batch_result(self.dispatcher)
+        except Exception as e:
+            messagebox.showerror("错误", f"读取最近结果失败: {e}", parent=self)
+            return
+        if latest is None:
+            messagebox.showinfo("提示", "当前没有可恢复的历史改派结果", parent=self)
+            return
+        self.last_result = latest
+        self._show_result(latest)
+        messagebox.showinfo(
+            "已恢复",
+            f"已恢复最近一次结果：{latest.result_id}\n时间：{latest.timestamp}\n"
+            f"共 {latest.total_count} 条（成功 {latest.success_count} / 跳过 {latest.skipped_count} / 失败 {latest.failed_count}）",
+            parent=self,
+        )
+
+    def _apply_status_filter(self, item: BatchItemResult) -> bool:
+        selected = self.result_status_combo.get()
+        if selected == "仅成功":
+            return item.success
+        elif selected == "仅跳过":
+            return item.skipped
+        elif selected == "仅失败":
+            return (not item.success) and (not item.skipped)
+        return True
+
+    def _apply_conflict_filter(self, item: BatchItemResult) -> bool:
+        selected = self.result_conflict_combo.get()
+        if selected == "全部":
+            return True
+        if not item.conflict_types:
+            return False
+        conflict_labels = {
+            ConflictType.VERSION_MISMATCH: "版本变更",
+            ConflictType.STATUS_CHANGED: "状态变更",
+            ConflictType.TECHNICIAN_REMOVED: "维修员已删除",
+            ConflictType.TECHNICIAN_ROLE_CHANGED: "维修员角色变更",
+            ConflictType.TECHNICIAN_SKILLS_CHANGED: "技能变更",
+            ConflictType.TECHNICIAN_SCHEDULE_CHANGED: "排班变更",
+            ConflictType.TECHNICIAN_CAPACITY_CHANGED: "容量变更",
+            ConflictType.ORDER_REMOVED: "工单已删除",
+        }
+        return selected in {conflict_labels.get(c, c) for c in item.conflict_types}
+
+    def _refresh_result_detail_view(self):
+        for i in self.result_detail_tree.get_children():
+            self.result_detail_tree.delete(i)
+        result = self.last_result
+        if result is None:
+            self.result_summary_label.configure(text="")
+            self.result_conflict_combo["values"] = ["全部"]
+            self.result_conflict_combo.set("全部")
+            return
+
+        conflict_labels = {
+            ConflictType.VERSION_MISMATCH: "版本变更",
+            ConflictType.STATUS_CHANGED: "状态变更",
+            ConflictType.TECHNICIAN_REMOVED: "维修员已删除",
+            ConflictType.TECHNICIAN_ROLE_CHANGED: "维修员角色变更",
+            ConflictType.TECHNICIAN_SKILLS_CHANGED: "技能变更",
+            ConflictType.TECHNICIAN_SCHEDULE_CHANGED: "排班变更",
+            ConflictType.TECHNICIAN_CAPACITY_CHANGED: "容量变更",
+            ConflictType.ORDER_REMOVED: "工单已删除",
+        }
+
+        all_conflicts = sorted(result.all_conflict_types)
+        combo_values = ["全部"] + [conflict_labels.get(c, c) for c in all_conflicts]
+        self.result_conflict_combo["values"] = combo_values
+        current = self.result_conflict_combo.get()
+        if current not in combo_values:
+            self.result_conflict_combo.set("全部")
+
+        def _flag(passed):
+            if passed is True:
+                return "✓"
+            elif passed is False:
+                return "✗"
+            return "-"
+
+        shown = 0
+        for idx, r in enumerate(result.results):
+            if not self._apply_status_filter(r):
+                continue
+            if not self._apply_conflict_filter(r):
+                continue
+            shown += 1
+            if r.success:
+                tag = "success"
+            elif r.skipped:
+                tag = "skipped"
+            else:
+                tag = "failed"
+            tags = [tag]
+            if not r.log_written:
+                tags.append("log_fail")
+            ctypes_display = ",".join(conflict_labels.get(c, c) for c in (r.conflict_types or []))
+            self.result_detail_tree.insert("", tk.END, iid=str(idx), values=(
+                r.status_label,
+                r.order_id,
+                r.order_title or "",
+                r.original_assignee_name or "(未指派)",
+                r.target_technician_name or "",
+                _flag(r.version_passed),
+                _flag(r.permission_passed),
+                _flag(r.skill_passed),
+                _flag(r.capacity_passed),
+                _flag(r.schedule_passed),
+                "✓" if r.log_written else ("✗:" + (r.log_write_error or "")[:16]),
+                ctypes_display,
+                r.reason or "",
+                r.error_message or "",
+                r.item_timestamp or "",
+            ), tags=tuple(tags))
+        self.result_summary_label.configure(
+            text=f"显示 {shown} / {result.total_count} 条  "
+                 f"(成功 {result.success_count} / 跳过 {result.skipped_count} / 失败 {result.failed_count})",
+        )
+
+    def _on_result_double_click(self, event):
+        self._locate_original_draft()
+
+    def _locate_original_draft(self):
+        sel = self.result_detail_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先在下方结果明细中选中一条记录", parent=self)
+            return
+        if self.last_result is None:
+            return
+        idx = int(sel[0])
+        if idx >= len(self.last_result.results):
+            return
+        item_result = self.last_result.results[idx]
+        order_id = item_result.order_id
+
+        for di, draft_item in enumerate(self.draft_items):
+            if draft_item.order_id == order_id:
+                iid = str(di)
+                if iid in self.detail_tree.get_children():
+                    self.detail_tree.selection_set(iid)
+                    self.detail_tree.see(iid)
+                    self.detail_tree.focus(iid)
+                messagebox.showinfo(
+                    "已定位",
+                    f"工单 {order_id} 已定位到预案第 {di + 1} 条\n"
+                    f"结果: {item_result.status_label}\n"
+                    f"原因: {item_result.error_message or '(无)'}",
+                    parent=self,
+                )
+                return
+
+        draft_id = item_result.draft_id or (self.last_result.draft_id)
+        if draft_id:
+            try:
+                draft = self.store.get_batch_reassignment_draft(draft_id, self.dispatcher)
+                if draft is not None:
+                    if messagebox.askyesno(
+                        "定位草稿",
+                        f"当前预案中未找到工单 {order_id}，\n但存在关联草稿 {draft_id}，是否载入该草稿？",
+                        parent=self,
+                    ):
+                        self._load_existing_draft(draft)
+                        self.current_draft = draft
+                        for di, draft_item in enumerate(self.draft_items):
+                            if draft_item.order_id == order_id:
+                                iid = str(di)
+                                if iid in self.detail_tree.get_children():
+                                    self.detail_tree.selection_set(iid)
+                                    self.detail_tree.see(iid)
+                                break
+                        return
+            except Exception:
+                pass
+
+        messagebox.showinfo(
+            "提示",
+            f"工单 {order_id} 未在当前预案中（可能已成功改派或草稿被清理）。\n"
+            f"结果: {item_result.status_label}\n"
+            f"处理时间: {item_result.item_timestamp}\n"
+            f"原因: {item_result.error_message or '(无)'}",
+            parent=self,
+        )
 
     def _export_result(self, fmt: str):
         if self.last_result is None:

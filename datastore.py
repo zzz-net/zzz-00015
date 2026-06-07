@@ -57,12 +57,14 @@ class DataStore:
         self.config_file = os.path.join(data_dir, "config.json")
         self.drafts_file = os.path.join(data_dir, "reassignment_drafts.json")
         self.batch_drafts_file = os.path.join(data_dir, "batch_reassignment_drafts.json")
+        self.batch_results_file = os.path.join(data_dir, "batch_reassignment_results.json")
         self._lock = threading.RLock()
         self._orders: Dict[str, WorkOrder] = {}
         self._users: Dict[str, User] = {}
         self._config: AppConfig = AppConfig()
         self._reassignment_drafts: Dict[str, ReassignmentDraft] = {}
         self._batch_reassignment_drafts: Dict[str, BatchReassignmentDraft] = {}
+        self._batch_reassignment_results: Dict[str, BatchReassignmentResult] = {}
         self._ensure_data_dir()
         self._load_all()
 
@@ -76,6 +78,7 @@ class DataStore:
         self._load_config()
         self._load_reassignment_drafts()
         self._load_batch_reassignment_drafts()
+        self._load_batch_reassignment_results()
         if not self._users:
             self._init_default_users()
             self._save_users()
@@ -149,6 +152,54 @@ class DataStore:
                 [d.to_dict() for d in self._batch_reassignment_drafts.values()],
                 f, ensure_ascii=False, indent=2,
             )
+
+    def _load_batch_reassignment_results(self):
+        if os.path.exists(self.batch_results_file):
+            try:
+                with open(self.batch_results_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._batch_reassignment_results = {
+                        r["result_id"]: BatchReassignmentResult.from_dict(r) for r in data
+                    }
+            except (json.JSONDecodeError, KeyError):
+                self._batch_reassignment_results = {}
+
+    def _save_batch_reassignment_results(self):
+        with open(self.batch_results_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [r.to_dict() for r in self._batch_reassignment_results.values()],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    def save_batch_result(self, result: BatchReassignmentResult) -> BatchReassignmentResult:
+        with self._lock:
+            self._batch_reassignment_results[result.result_id] = result
+            self._save_batch_reassignment_results()
+            return result
+
+    def get_batch_result(self, result_id: str) -> Optional[BatchReassignmentResult]:
+        return self._batch_reassignment_results.get(result_id)
+
+    def get_batch_results_by_dispatcher(
+        self, dispatcher: User
+    ) -> List[BatchReassignmentResult]:
+        results = [
+            r for r in self._batch_reassignment_results.values()
+            if r.dispatcher_id == dispatcher.user_id
+        ]
+        results.sort(key=lambda r: (r.timestamp, r.result_id), reverse=True)
+        return results
+
+    def get_latest_batch_result(
+        self, dispatcher: Optional[User] = None
+    ) -> Optional[BatchReassignmentResult]:
+        results = list(self._batch_reassignment_results.values())
+        if dispatcher is not None:
+            results = [r for r in results if r.dispatcher_id == dispatcher.user_id]
+        if not results:
+            return None
+        results.sort(key=lambda r: (r.timestamp, r.result_id), reverse=True)
+        return results[0]
 
     def _init_default_users(self):
         default_users = [
@@ -1114,6 +1165,7 @@ class DataStore:
         result = BatchReassignmentResult(
             dispatcher_id=dispatcher.user_id,
             dispatcher_name=dispatcher.name,
+            draft_id=draft.draft_id if draft.draft_id and not draft.draft_id.startswith("_") else None,
         )
         with self._lock:
             for item in draft.items:
@@ -1121,121 +1173,166 @@ class DataStore:
                 conflict_types: List[str] = []
                 order = self._orders.get(item.order_id)
 
+                common_fields = dict(
+                    order_id=item.order_id,
+                    draft_id=result.draft_id,
+                    operator_id=dispatcher.user_id,
+                    operator_name=dispatcher.name,
+                    reason=item.reason,
+                    target_technician_id=tech.user_id if tech else item.target_technician_id,
+                    target_technician_name=tech.name if tech else None,
+                    order_title=order.title if order else None,
+                    original_assignee_id=(
+                        order.assignee_id if order else item.original_assignee_id
+                    ),
+                    original_assignee_name=(
+                        order.assignee_name if order else None
+                    ),
+                )
+
                 if order is None:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
                         error_message="工单不存在或已被删除",
                         conflict_types=[ConflictType.ORDER_REMOVED.value],
+                        permission_checked=False,
+                        version_checked=False,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
                 if tech is None:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
                         error_message="目标维修员不存在",
                         conflict_types=[ConflictType.TECHNICIAN_REMOVED.value],
+                        permission_checked=False,
+                        version_checked=False,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
-                if order.version != item.order_version:
+                version_ok = order.version == item.order_version
+                if not version_ok:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         error_message=f"版本冲突：草稿v{item.order_version} vs 当前v{order.version}",
                         conflict_types=[ConflictType.VERSION_MISMATCH.value],
+                        version_passed=False,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
-                if order.status.value != item.order_status:
+                status_ok = order.status.value == item.order_status
+                if not status_ok:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         error_message=f"状态变更：草稿【{item.order_status}】 vs 当前【{order.status.value}】",
                         conflict_types=[ConflictType.STATUS_CHANGED.value],
+                        version_passed=True,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
                 if tech.role != Role.TECHNICIAN:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         error_message=f"目标用户【{tech.name}】已不是维修员",
                         conflict_types=[ConflictType.TECHNICIAN_ROLE_CHANGED.value],
+                        version_passed=True,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
                 allowed, msg = self.can_reassign(order, dispatcher)
                 if not allowed:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         error_message=msg,
+                        version_passed=True,
+                        permission_passed=False,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
                 if order.assignee_id == tech.user_id:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         error_message="新维修员与当前维修员相同，无需改派",
+                        version_passed=True,
+                        permission_passed=True,
+                        skill_checked=False,
+                        capacity_checked=False,
+                        schedule_checked=False,
+                        **common_fields,
                     ))
                     continue
 
                 current_match = self.calculate_match(order, tech)
                 realtime_conflicts: List[str] = []
                 skip_reasons: List[str] = []
-                if not current_match.skill_match:
+                skill_ok = current_match.skill_match
+                capacity_ok = current_match.within_capacity
+                schedule_ok = current_match.available_now
+
+                if not skill_ok:
                     realtime_conflicts.append(ConflictType.TECHNICIAN_SKILLS_CHANGED.value)
                     required = CATEGORY_SKILL_MAP.get(order.category, "通用")
                     skip_reasons.append(f"目标维修员【{tech.name}】缺少所需技能: {required}")
-                if not current_match.within_capacity:
+                if not capacity_ok:
                     realtime_conflicts.append(ConflictType.TECHNICIAN_CAPACITY_CHANGED.value)
                     skip_reasons.append(
                         f"目标维修员【{tech.name}】已达负载上限 {current_match.current_load}/{current_match.max_parallel}"
                     )
-                if not current_match.available_now:
+                if not schedule_ok:
                     realtime_conflicts.append(ConflictType.TECHNICIAN_SCHEDULE_CHANGED.value)
 
                 if skip_reasons:
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         error_message="；".join(skip_reasons),
                         conflict_types=realtime_conflicts,
+                        version_passed=True,
+                        permission_passed=True,
+                        skill_passed=skill_ok,
+                        capacity_passed=capacity_ok,
+                        schedule_passed=schedule_ok,
+                        **common_fields,
                     ))
                     continue
 
                 conflict_types.extend(realtime_conflicts)
 
+                log_written = False
+                log_write_error = None
                 try:
+                    logs_before = len(order.reassignment_logs)
                     self.reassign_order(
                         order_id=item.order_id,
                         new_assignee=tech,
@@ -1243,24 +1340,40 @@ class DataStore:
                         reason=item.reason,
                         expected_version=item.order_version,
                     )
+                    fresh_order = self._orders.get(item.order_id)
+                    logs_after = len(fresh_order.reassignment_logs) if fresh_order else logs_before
+                    log_written = logs_after > logs_before
+                    if not log_written:
+                        log_write_error = "改派执行成功但改派日志未增加"
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
                         conflict_types=conflict_types,
+                        version_passed=True,
+                        permission_passed=True,
+                        skill_passed=skill_ok,
+                        capacity_passed=capacity_ok,
+                        schedule_passed=schedule_ok,
+                        log_written=log_written,
+                        log_write_error=log_write_error,
+                        **common_fields,
                     ))
                 except (PermissionError, ConcurrentOperationError, WorkOrderError) as e:
+                    err_msg = str(e)
+                    is_perm_err = isinstance(e, PermissionError)
+                    is_ver_err = isinstance(e, ConcurrentOperationError) or "版本" in err_msg or "并发" in err_msg
                     result.results.append(BatchItemResult(
-                        order_id=item.order_id,
                         success=False,
                         skipped=True,
-                        target_technician_id=tech.user_id,
-                        target_technician_name=tech.name,
-                        reason=item.reason,
-                        error_message=str(e),
+                        error_message=err_msg,
                         conflict_types=conflict_types,
+                        version_passed=(not is_ver_err),
+                        permission_passed=(not is_perm_err),
+                        skill_passed=skill_ok,
+                        capacity_passed=capacity_ok,
+                        schedule_passed=schedule_ok,
+                        log_written=False,
+                        log_write_error=f"改派异常: {err_msg}",
+                        **common_fields,
                     ))
 
             if result.success_count > 0:
@@ -1275,6 +1388,7 @@ class DataStore:
                         del self._batch_reassignment_drafts[draft.draft_id]
                 self._save_batch_reassignment_drafts()
 
+            self.save_batch_result(result)
             return result
 
     def export_batch_result_json(self, result: BatchReassignmentResult) -> str:
@@ -1292,30 +1406,51 @@ class DataStore:
             with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "工单编号", "执行结果", "是否跳过", "原维修员", "新维修员",
-                    "改派原因", "提交人", "提交时间", "错误/跳过原因", "冲突类型"
+                    "结果编号", "草稿编号", "工单编号", "工单标题",
+                    "原维修员ID", "原维修员姓名", "新维修员ID", "新维修员姓名",
+                    "提交人ID", "提交人姓名", "处理时间",
+                    "执行结果", "权限校验", "版本校验", "技能校验", "容量校验", "排班校验",
+                    "日志已写入", "日志写入异常",
+                    "冲突类型", "改派原因", "错误/跳过原因",
+                    "成功标记", "跳过标记",
                 ])
                 for r in result.results:
                     order = self._orders.get(r.order_id)
-                    orig_assignee = ""
-                    if order:
-                        orig_assignee = order.assignee_name or "(未指派)"
+                    orig_assignee_id = r.original_assignee_id or (order.assignee_id if order else "")
+                    orig_assignee_name = r.original_assignee_name
+                    if not orig_assignee_name and order:
+                        orig_assignee_name = order.assignee_name or "(未指派)"
                         for log in reversed(order.reassignment_logs):
                             if log.to_user_id == r.target_technician_id:
-                                orig_assignee = log.from_user_name
+                                orig_assignee_name = log.from_user_name
+                                orig_assignee_id = log.from_user_id
                                 break
-                    status_label = "成功" if r.success else ("跳过" if r.skipped else "失败")
+                    status_label = r.status_label
                     writer.writerow([
+                        result.result_id,
+                        result.draft_id or "",
                         r.order_id,
-                        status_label,
-                        "是" if r.skipped else "否",
-                        orig_assignee,
+                        r.order_title or (order.title if order else ""),
+                        orig_assignee_id or "",
+                        orig_assignee_name or "",
+                        r.target_technician_id or "",
                         r.target_technician_name or "",
-                        r.reason or "",
-                        result.dispatcher_name,
-                        result.timestamp,
-                        r.error_message or "",
+                        r.operator_id or result.dispatcher_id,
+                        r.operator_name or result.dispatcher_name,
+                        r.item_timestamp or "",
+                        status_label,
+                        ("通过" if r.permission_passed else "不通过") if r.permission_checked and r.permission_passed is not None else ("未检查" if not r.permission_checked else ""),
+                        ("通过" if r.version_passed else "不通过") if r.version_checked and r.version_passed is not None else ("未检查" if not r.version_checked else ""),
+                        ("通过" if r.skill_passed else "不通过") if r.skill_checked and r.skill_passed is not None else ("未检查" if not r.skill_checked else ""),
+                        ("通过" if r.capacity_passed else "不通过") if r.capacity_checked and r.capacity_passed is not None else ("未检查" if not r.capacity_checked else ""),
+                        ("通过" if r.schedule_passed else "不通过") if r.schedule_checked and r.schedule_passed is not None else ("未检查" if not r.schedule_checked else ""),
+                        "是" if r.log_written else "否",
+                        r.log_write_error or "",
                         ",".join(r.conflict_types) if r.conflict_types else "",
+                        r.reason or "",
+                        r.error_message or "",
+                        "是" if r.success else "否",
+                        "是" if r.skipped else "否",
                     ])
         except OSError as e:
             raise ExportError(f"写入CSV文件失败: {str(e)}")

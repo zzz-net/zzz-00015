@@ -2,7 +2,7 @@ import json
 import os
 import threading
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from enum import Enum
 
 
@@ -585,6 +585,25 @@ class BatchItemResult:
         reason: Optional[str] = None,
         error_message: Optional[str] = None,
         conflict_types: Optional[List[str]] = None,
+        original_assignee_id: Optional[str] = None,
+        original_assignee_name: Optional[str] = None,
+        order_title: Optional[str] = None,
+        permission_checked: bool = True,
+        permission_passed: Optional[bool] = None,
+        version_checked: bool = True,
+        version_passed: Optional[bool] = None,
+        skill_checked: bool = True,
+        skill_passed: Optional[bool] = None,
+        capacity_checked: bool = True,
+        capacity_passed: Optional[bool] = None,
+        schedule_checked: bool = True,
+        schedule_passed: Optional[bool] = None,
+        log_written: bool = False,
+        log_write_error: Optional[str] = None,
+        item_timestamp: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        operator_name: Optional[str] = None,
+        draft_id: Optional[str] = None,
     ):
         self.order_id = order_id
         self.success = success
@@ -594,6 +613,60 @@ class BatchItemResult:
         self.reason = reason
         self.error_message = error_message
         self.conflict_types = conflict_types or []
+        self.original_assignee_id = original_assignee_id
+        self.original_assignee_name = original_assignee_name
+        self.order_title = order_title
+        self.permission_checked = permission_checked
+        self.permission_passed = permission_passed
+        self.version_checked = version_checked
+        self.version_passed = version_passed
+        self.skill_checked = skill_checked
+        self.skill_passed = skill_passed
+        self.capacity_checked = capacity_checked
+        self.capacity_passed = capacity_passed
+        self.schedule_checked = schedule_checked
+        self.schedule_passed = schedule_passed
+        self.log_written = log_written
+        self.log_write_error = log_write_error
+        self.item_timestamp = item_timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        self.operator_id = operator_id
+        self.operator_name = operator_name
+        self.draft_id = draft_id
+
+    @property
+    def status_label(self) -> str:
+        if self.success:
+            return "成功"
+        elif self.skipped:
+            return "跳过"
+        else:
+            return "失败"
+
+    @property
+    def summary(self) -> str:
+        parts = [f"工单 {self.order_id}"]
+        if self.success:
+            parts.append(f"改派成功至 {self.target_technician_name or self.target_technician_id or '?'}")
+            if self.log_written:
+                parts.append("日志已写入")
+            else:
+                parts.append(f"日志写入异常: {self.log_write_error or '未知原因'}")
+        else:
+            parts.append(self.status_label)
+            if self.error_message:
+                parts.append(f"原因: {self.error_message}")
+            details = []
+            if self.version_checked and self.version_passed is False:
+                details.append("版本校验失败")
+            if self.skill_checked and self.skill_passed is False:
+                details.append("技能冲突")
+            if self.capacity_checked and self.capacity_passed is False:
+                details.append("容量超载")
+            if self.schedule_checked and self.schedule_passed is False:
+                details.append("排班冲突")
+            if details:
+                parts.append(f"[{', '.join(details)}]")
+        return " - ".join(parts)
 
     def to_dict(self) -> Dict:
         return {
@@ -605,7 +678,59 @@ class BatchItemResult:
             "reason": self.reason,
             "error_message": self.error_message,
             "conflict_types": self.conflict_types,
+            "original_assignee_id": self.original_assignee_id,
+            "original_assignee_name": self.original_assignee_name,
+            "order_title": self.order_title,
+            "permission_checked": self.permission_checked,
+            "permission_passed": self.permission_passed,
+            "version_checked": self.version_checked,
+            "version_passed": self.version_passed,
+            "skill_checked": self.skill_checked,
+            "skill_passed": self.skill_passed,
+            "capacity_checked": self.capacity_checked,
+            "capacity_passed": self.capacity_passed,
+            "schedule_checked": self.schedule_checked,
+            "schedule_passed": self.schedule_passed,
+            "log_written": self.log_written,
+            "log_write_error": self.log_write_error,
+            "item_timestamp": self.item_timestamp,
+            "operator_id": self.operator_id,
+            "operator_name": self.operator_name,
+            "draft_id": self.draft_id,
+            "status_label": self.status_label,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "BatchItemResult":
+        return cls(
+            order_id=data["order_id"],
+            success=data["success"],
+            skipped=data.get("skipped", False),
+            target_technician_id=data.get("target_technician_id"),
+            target_technician_name=data.get("target_technician_name"),
+            reason=data.get("reason"),
+            error_message=data.get("error_message"),
+            conflict_types=data.get("conflict_types", []),
+            original_assignee_id=data.get("original_assignee_id"),
+            original_assignee_name=data.get("original_assignee_name"),
+            order_title=data.get("order_title"),
+            permission_checked=data.get("permission_checked", True),
+            permission_passed=data.get("permission_passed"),
+            version_checked=data.get("version_checked", True),
+            version_passed=data.get("version_passed"),
+            skill_checked=data.get("skill_checked", True),
+            skill_passed=data.get("skill_passed"),
+            capacity_checked=data.get("capacity_checked", True),
+            capacity_passed=data.get("capacity_passed"),
+            schedule_checked=data.get("schedule_checked", True),
+            schedule_passed=data.get("schedule_passed"),
+            log_written=data.get("log_written", False),
+            log_write_error=data.get("log_write_error"),
+            item_timestamp=data.get("item_timestamp"),
+            operator_id=data.get("operator_id"),
+            operator_name=data.get("operator_name"),
+            draft_id=data.get("draft_id"),
+        )
 
 
 class BatchReassignmentResult:
@@ -615,11 +740,21 @@ class BatchReassignmentResult:
         dispatcher_name: str,
         timestamp: Optional[str] = None,
         results: Optional[List[BatchItemResult]] = None,
+        result_id: Optional[str] = None,
+        draft_id: Optional[str] = None,
+        note: Optional[str] = None,
     ):
+        import uuid as _uuid
+        now = datetime.now()
+        self.result_id = result_id or (
+            "BRR" + now.strftime("%Y%m%d%H%M%S%f") + _uuid.uuid4().hex[:4].upper()
+        )
+        self.draft_id = draft_id
         self.dispatcher_id = dispatcher_id
         self.dispatcher_name = dispatcher_name
-        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.timestamp = timestamp or now.strftime("%Y-%m-%d %H:%M:%S.%f")
         self.results = results or []
+        self.note = note
 
     @property
     def success_count(self) -> int:
@@ -633,16 +768,65 @@ class BatchReassignmentResult:
     def failed_count(self) -> int:
         return sum(1 for r in self.results if not r.success and not r.skipped)
 
+    @property
+    def total_count(self) -> int:
+        return len(self.results)
+
+    @property
+    def all_conflict_types(self) -> Set[str]:
+        seen = set()
+        for r in self.results:
+            for ct in r.conflict_types:
+                seen.add(ct)
+        return seen
+
+    def filter_results(
+        self,
+        status: Optional[str] = None,
+        conflict_type: Optional[str] = None,
+    ) -> List[BatchItemResult]:
+        filtered = []
+        for r in self.results:
+            if status and status != "all":
+                if status == "success" and not r.success:
+                    continue
+                if status == "skipped" and not r.skipped:
+                    continue
+                if status == "failed" and (r.success or r.skipped):
+                    continue
+            if conflict_type and conflict_type != "all" and conflict_type not in r.conflict_types:
+                continue
+            filtered.append(r)
+        return filtered
+
     def to_dict(self) -> Dict:
         return {
+            "result_id": self.result_id,
+            "draft_id": self.draft_id,
             "dispatcher_id": self.dispatcher_id,
             "dispatcher_name": self.dispatcher_name,
             "timestamp": self.timestamp,
             "success_count": self.success_count,
             "skipped_count": self.skipped_count,
             "failed_count": self.failed_count,
+            "total_count": self.total_count,
+            "all_conflict_types": sorted(self.all_conflict_types),
+            "note": self.note,
             "results": [r.to_dict() for r in self.results],
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "BatchReassignmentResult":
+        results = [BatchItemResult.from_dict(r) for r in data.get("results", [])]
+        return cls(
+            dispatcher_id=data["dispatcher_id"],
+            dispatcher_name=data["dispatcher_name"],
+            timestamp=data.get("timestamp"),
+            results=results,
+            result_id=data.get("result_id"),
+            draft_id=data.get("draft_id"),
+            note=data.get("note"),
+        )
 
 
 class AppConfig:

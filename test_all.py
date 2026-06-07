@@ -10,7 +10,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models import Role, Status, TimeSlot
+from models import Role, Status, TimeSlot, BatchReassignmentResult, BatchItemResult
 from datastore import (
     DataStore,
     WorkOrderError,
@@ -1765,8 +1765,8 @@ def test_batch_reassignment_datastore(store):
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         header = next(reader)
-        assert "提交人" in header
-        assert "执行结果" in header
+        assert any("提交人" in col for col in header), f"CSV表头应包含提交人相关列，实际表头: {header}"
+        assert any("结果" in col for col in header), f"CSV表头应包含执行结果列，实际表头: {header}"
         assert "错误/跳过原因" in header
         rows = list(reader)
         assert len(rows) == 3
@@ -2155,7 +2155,7 @@ def test_batch_realtime_validation_datastore(store):
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         header = next(reader)
-        assert "提交人" in header
+        assert any("提交人" in col for col in header), f"CSV表头应包含提交人相关列，实际表头: {header}"
         rows = list(reader)
         content_joined = ",".join(header) + "\n" + "\n".join([",".join(r) for r in rows])
         assert dispatcher.name in content_joined
@@ -2308,6 +2308,448 @@ def test_gui_batch_realtime_validation():
             shutil.rmtree(gui_rt_export)
 
 
+def test_batch_result_persistence_across_restart(store):
+    print_title("测试24: 批量改派结果 - 跨重启持久化恢复、结果不覆盖、保留追溯信息")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    order_a = store.create_order("结果持久化A", "", "RPA栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order_a.order_id, tech1, dispatcher)
+    order_b = store.create_order("结果持久化B", "", "RPB栋", "水管维修", "中", dispatcher)
+    store.dispatch_order(order_b.order_id, tech1, dispatcher)
+    order_c = store.create_order("结果持久化C", "", "RPC栋", "电路维修", "低", dispatcher)
+
+    items = store.generate_batch_recommendations([order_a.order_id, order_b.order_id, order_c.order_id], dispatcher)
+    for it in items:
+        if it.order_id == order_a.order_id:
+            it.target_technician_id = tech2.user_id
+            it.reason = "测试结果持久化-A"
+            it.tech_skills_snapshot = list(tech2.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+            it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+        elif it.order_id == order_b.order_id:
+            it.target_technician_id = tech2.user_id
+            it.reason = "测试结果持久化-B"
+            it.tech_skills_snapshot = list(tech2.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+            it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+        elif it.order_id == order_c.order_id:
+            it.target_technician_id = tech2.user_id
+            it.reason = "测试结果持久化-C(待派)"
+            it.tech_skills_snapshot = list(tech2.skills)
+            it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+            it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    first_result = store.execute_batch_reassignment(draft, dispatcher)
+    assert first_result.result_id.startswith("BRR"), "结果编号前缀应该是 BRR"
+    assert first_result.dispatcher_id == dispatcher.user_id
+    assert first_result.total_count == 3
+    assert len(first_result.results) == 3
+    print_ok(f"首次批量改派结果: result_id={first_result.result_id}, 总计={first_result.total_count}")
+
+    for r in first_result.results:
+        assert r.draft_id == draft.draft_id
+        assert r.operator_id == dispatcher.user_id
+        assert r.operator_name == dispatcher.name
+        assert r.item_timestamp and r.item_timestamp.strip()
+        if r.order_id == order_a.order_id:
+            assert r.original_assignee_id == tech1.user_id
+            assert r.original_assignee_name == tech1.name
+            assert r.target_technician_id == tech2.user_id
+        elif r.order_id == order_b.order_id:
+            assert r.original_assignee_id == tech1.user_id
+        print_ok(f"  结果条目 {r.order_id}: status={r.status_label}, "
+                 f"version_passed={r.version_passed}, permission_passed={r.permission_passed}, "
+                 f"log_written={r.log_written}, timestamp={r.item_timestamp[:19]}")
+
+    latest = store.get_latest_batch_result(dispatcher)
+    assert latest is not None
+    assert latest.result_id == first_result.result_id
+    print_ok(f"get_latest_batch_result 返回最近一次结果: {latest.result_id}")
+
+    by_dispatcher = store.get_batch_results_by_dispatcher(dispatcher)
+    assert len(by_dispatcher) >= 1
+    assert by_dispatcher[0].result_id == first_result.result_id
+    print_ok(f"按调度员查询结果历史: 共 {len(by_dispatcher)} 条，最新={by_dispatcher[0].result_id[:24]}...")
+
+    loaded = store.get_batch_result(first_result.result_id)
+    assert loaded is not None
+    assert loaded.result_id == first_result.result_id
+    assert loaded.total_count == first_result.total_count
+    assert len(loaded.results) == len(first_result.results)
+    for r_loaded, r_first in zip(loaded.results, first_result.results):
+        assert r_loaded.order_id == r_first.order_id
+        assert r_loaded.success == r_first.success
+        assert r_loaded.status_label == r_first.status_label
+        assert r_loaded.draft_id == r_first.draft_id
+        assert r_loaded.operator_id == r_first.operator_id
+        assert r_loaded.log_written == r_first.log_written
+    print_ok("get_batch_result 逐条字段对比成功")
+
+    data_dir = store.data_dir
+    results_path = os.path.join(data_dir, "batch_reassignment_results.json")
+    assert os.path.exists(results_path), "批量改派结果持久化文件不存在"
+    with open(results_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert any(d["result_id"] == first_result.result_id for d in raw)
+    print_ok(f"结果持久化文件存在: {results_path}, 共 {len(raw)} 条记录")
+
+    first_id = first_result.result_id
+    print_ok("重启 DataStore 模拟应用关闭并重新打开...")
+    del store
+    import gc as _gc
+    _gc.collect()
+    store2 = DataStore(data_dir)
+    dispatcher2 = store2.get_user("u001")
+
+    restored_latest = store2.get_latest_batch_result(dispatcher2)
+    assert restored_latest is not None, "重启后最近结果未恢复"
+    assert restored_latest.result_id == first_id
+    assert restored_latest.total_count == 3
+    assert restored_latest.success_count >= 1
+    print_ok(f"跨重启恢复最近结果: {restored_latest.result_id}, "
+             f"成功={restored_latest.success_count}, 跳过={restored_latest.skipped_count}, 失败={restored_latest.failed_count}")
+
+    for r in restored_latest.results:
+        assert r.operator_id == dispatcher2.user_id
+        assert r.item_timestamp and r.item_timestamp.strip()
+        if r.success:
+            assert r.log_written, "成功的改派必须已写入日志"
+            assert r.skill_passed is not None
+            assert r.version_passed is True
+            assert r.permission_passed is True
+    print_ok("重启恢复的结果条目: 操作人、时间、5项校验标志、日志写入状态全部保留")
+
+    restored_all = store2.get_batch_results_by_dispatcher(dispatcher2)
+    assert len(restored_all) >= 1
+    print_ok(f"重启后按调度员查询: 共 {len(restored_all)} 条历史结果")
+
+    order_d = store2.create_order("二次提交不覆盖A", "", "RPD栋", "空调维修", "高", dispatcher2)
+    store2.dispatch_order(order_d.order_id, store2.get_user("u002"), dispatcher2)
+    items2 = store2.generate_batch_recommendations([order_d.order_id], dispatcher2)
+    for it in items2:
+        it.target_technician_id = store2.get_user("u003").user_id
+        it.reason = "第二次提交"
+        it.tech_skills_snapshot = list(store2.get_user("u003").skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in store2.get_user("u003").time_slots]
+        it.tech_max_parallel_snapshot = store2.get_user("u003").max_parallel_orders
+    draft2 = store2.save_batch_reassignment_draft(dispatcher2, items2)
+    second_result = store2.execute_batch_reassignment(draft2, dispatcher2)
+
+    assert second_result.result_id != first_id, "两次提交应该产生不同的 result_id，不覆盖"
+    still_there = store2.get_batch_result(first_id)
+    assert still_there is not None, "已有结果不应被新结果覆盖"
+    assert still_there.total_count == 3
+    all_results = store2.get_batch_results_by_dispatcher(dispatcher2)
+    assert len(all_results) >= 2, "历史结果应该累计，不覆盖"
+    print_ok(f"二次提交验证: 新 result_id={second_result.result_id}, 旧结果仍存在。历史总数={len(all_results)}")
+    print_ok("跨重启持久化、结果不覆盖、追溯字段保留 全部通过")
+    return store2
+
+
+def test_batch_result_export_fields_consistency(store):
+    print_title("测试25: 批量改派结果 - CSV/JSON 导出字段与数据模型一致、界面原因不丢失")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    order1 = store.create_order("导出一致性A", "", "EXP栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order1.order_id, tech1, dispatcher)
+    order2 = store.create_order("导出一致性B", "", "EXP栋", "电梯维修", "中", dispatcher)
+    store.dispatch_order(order2.order_id, tech1, dispatcher)
+
+    items = store.generate_batch_recommendations([order1.order_id, order2.order_id], dispatcher)
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "导出一致性测试原因-" + it.order_id[-4:]
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    export_dir = os.path.join(base, "test_result_export")
+    if os.path.exists(export_dir):
+        shutil.rmtree(export_dir)
+    os.makedirs(export_dir)
+    store.set_export_dir(export_dir)
+
+    json_path = store.export_batch_result_json(result)
+    assert os.path.exists(json_path)
+    with open(json_path, "r", encoding="utf-8") as f:
+        json_data = json.load(f)
+    assert "result_id" in json_data
+    assert "dispatcher_id" in json_data
+    assert "dispatcher_name" in json_data
+    assert "timestamp" in json_data
+    assert "draft_id" in json_data
+    assert "results" in json_data and len(json_data["results"]) == result.total_count
+    print_ok(f"JSON 导出顶层字段完整: result_id={json_data['result_id']}, draft_id={json_data['draft_id']}")
+
+    required_item_fields = [
+        "order_id", "order_title", "success", "skipped",
+        "original_assignee_id", "original_assignee_name",
+        "target_technician_id", "target_technician_name",
+        "permission_checked", "permission_passed",
+        "version_checked", "version_passed",
+        "skill_checked", "skill_passed",
+        "capacity_checked", "capacity_passed",
+        "schedule_checked", "schedule_passed",
+        "log_written", "log_write_error",
+        "conflict_types", "reason", "error_message",
+        "item_timestamp", "operator_id", "operator_name", "draft_id",
+    ]
+    for idx, jitem in enumerate(json_data["results"]):
+        for fld in required_item_fields:
+            assert fld in jitem, f"JSON 结果条目#{idx} 缺少字段: {fld}"
+        mitem = result.results[idx]
+        assert jitem["order_id"] == mitem.order_id
+        assert jitem["success"] == mitem.success
+        assert jitem["skipped"] == mitem.skipped
+        assert jitem["reason"] == mitem.reason
+        assert jitem["error_message"] == mitem.error_message
+        assert jitem["log_written"] == mitem.log_written
+        assert jitem["operator_id"] == mitem.operator_id
+        assert jitem["version_passed"] == mitem.version_passed
+        assert jitem["permission_passed"] == mitem.permission_passed
+        assert jitem["skill_passed"] == mitem.skill_passed
+        assert jitem["capacity_passed"] == mitem.capacity_passed
+        assert jitem["schedule_passed"] == mitem.schedule_passed
+        assert jitem["conflict_types"] == (mitem.conflict_types or [])
+    print_ok(f"JSON 导出逐条字段一致性: 共 {len(json_data['results'])} 条，{len(required_item_fields)} 个字段全匹配")
+
+    csv_path = store.export_batch_result_csv(result)
+    assert os.path.exists(csv_path)
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    csv_header = rows[0]
+    expected_csv_cols = [
+        "结果编号", "草稿编号", "工单编号", "工单标题",
+        "原维修员ID", "原维修员姓名", "新维修员ID", "新维修员姓名",
+        "提交人ID", "提交人姓名", "处理时间",
+        "执行结果", "权限校验", "版本校验", "技能校验", "容量校验", "排班校验",
+        "日志已写入", "日志写入异常",
+        "冲突类型", "改派原因", "错误/跳过原因",
+        "成功标记", "跳过标记",
+    ]
+    for col in expected_csv_cols:
+        assert col in csv_header, f"CSV 表头缺少列: {col}"
+    print_ok(f"CSV 导出表头: {len(csv_header)} 列，全部预期列存在")
+    print_ok(f"  表头: {csv_header}")
+
+    assert len(rows) == 1 + result.total_count, "CSV 数据行数应为 1(表头) + N(结果)"
+    col_idx = {name: csv_header.index(name) for name in expected_csv_cols}
+    for idx, mitem in enumerate(result.results):
+        row = rows[idx + 1]
+        assert row[col_idx["结果编号"]] == result.result_id
+        assert row[col_idx["草稿编号"]] == (result.draft_id or "")
+        assert row[col_idx["工单编号"]] == mitem.order_id
+        assert row[col_idx["工单标题"]] == (mitem.order_title or "")
+        assert row[col_idx["原维修员ID"]] == (mitem.original_assignee_id or "")
+        assert row[col_idx["原维修员姓名"]] == (mitem.original_assignee_name or "")
+        assert row[col_idx["新维修员ID"]] == (mitem.target_technician_id or "")
+        assert row[col_idx["新维修员姓名"]] == (mitem.target_technician_name or "")
+        assert row[col_idx["提交人ID"]] == (mitem.operator_id or "")
+        assert row[col_idx["提交人姓名"]] == (mitem.operator_name or "")
+        assert row[col_idx["执行结果"]] == mitem.status_label
+        assert row[col_idx["改派原因"]] == (mitem.reason or "")
+        assert row[col_idx["错误/跳过原因"]] == (mitem.error_message or "")
+        assert row[col_idx["成功标记"]] == ("是" if mitem.success else "否")
+        assert row[col_idx["跳过标记"]] == ("是" if mitem.skipped else "否")
+    print_ok(f"CSV 导出逐条内容一致性: 共 {result.total_count} 行数据与数据模型一致")
+
+    try:
+        shutil.rmtree(export_dir)
+    except Exception:
+        pass
+    print_ok("批量改派结果 CSV/JSON 导出字段与数据模型完全一致")
+
+
+def test_batch_result_filter_by_status_and_conflict(store):
+    print_title("测试26: 批量改派结果 - 按成功/跳过/失败/冲突类型过滤")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    orders_ok = []
+    for i in range(2):
+        o = store.create_order(f"过滤-成功{i}", "", "FLT栋", "空调维修", "中", dispatcher)
+        store.dispatch_order(o.order_id, tech1, dispatcher)
+        orders_ok.append(o)
+
+    order_skip = store.create_order("过滤-跳过", "", "FLT栋", "空调维修", "中", dispatcher)
+    store.dispatch_order(order_skip.order_id, tech2, dispatcher)
+
+    all_ids = [o.order_id for o in orders_ok] + [order_skip.order_id]
+    items = store.generate_batch_recommendations(all_ids, dispatcher)
+
+    for it in items:
+        if it.order_id == order_skip.order_id:
+            it.target_technician_id = tech2.user_id
+        else:
+            it.target_technician_id = tech2.user_id
+        it.reason = "过滤测试"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+    result = store.execute_batch_reassignment(draft, dispatcher)
+
+    print_ok(f"本次执行结果: 总计={result.total_count}, 成功={result.success_count}, "
+             f"跳过={result.skipped_count}, 失败={result.failed_count}")
+
+    all_items = result.filter_results(status="all", conflict_type="all")
+    assert len(all_items) == result.total_count
+    print_ok(f"status=all + conflict=all: 返回全部 {len(all_items)} 条")
+
+    success_items = result.filter_results(status="success", conflict_type="all")
+    assert len(success_items) == result.success_count
+    assert all(it.success and not it.skipped for it in success_items)
+    print_ok(f"status=success: 过滤出 {len(success_items)} 条成功")
+
+    skipped_items = result.filter_results(status="skipped", conflict_type="all")
+    assert len(skipped_items) == result.skipped_count
+    assert all(it.skipped for it in skipped_items)
+    print_ok(f"status=skipped: 过滤出 {len(skipped_items)} 条跳过")
+
+    failed_items = result.filter_results(status="failed", conflict_type="all")
+    assert len(failed_items) == result.failed_count
+    assert all((not it.success and not it.skipped) for it in failed_items)
+    print_ok(f"status=failed: 过滤出 {len(failed_items)} 条失败")
+
+    all_conflict_types = result.all_conflict_types
+    assert isinstance(all_conflict_types, set)
+    print_ok(f"all_conflict_types 覆盖: {sorted(all_conflict_types) or '(无冲突)'}")
+
+    for ct in all_conflict_types:
+        filtered = result.filter_results(status="all", conflict_type=ct)
+        assert len(filtered) >= 1
+        for it in filtered:
+            assert it.conflict_types and ct in it.conflict_types
+        print_ok(f"按冲突类型 {ct} 过滤: {len(filtered)} 条，每条都包含该冲突类型")
+
+    combined = result.filter_results(status="success", conflict_type="all")
+    assert len(combined) == result.success_count
+    for ct in all_conflict_types:
+        combined_ct = result.filter_results(status="success", conflict_type=ct)
+        for it in combined_ct:
+            assert it.success
+            assert it.conflict_types and ct in it.conflict_types
+    print_ok("状态 + 冲突类型组合过滤工作正常")
+
+    expected_summary_fields = ["status_label", "summary"]
+    for r in result.results:
+        for field in expected_summary_fields:
+            val = getattr(r, field, None)
+            assert val is not None and isinstance(val, str) and len(val.strip()) > 0, \
+                f"结果条目缺少属性 {field} 或为空"
+    print_ok("每个结果条目都有 status_label 和 summary 计算属性")
+    print_ok("批量改派结果按状态/冲突类型过滤 + 计算属性 全部通过")
+
+
+def test_batch_result_log_write_failure_tracking(store):
+    print_title("测试27: 批量改派结果 - 日志写入失败追踪、提示可追溯")
+
+    dispatcher = store.get_user("u001")
+    tech1 = store.get_user("u002")
+    tech2 = store.get_user("u003")
+
+    order = store.create_order("日志失败追踪", "", "LOG栋", "空调维修", "高", dispatcher)
+    store.dispatch_order(order.order_id, tech1, dispatcher)
+
+    items = store.generate_batch_recommendations([order.order_id], dispatcher)
+    for it in items:
+        it.target_technician_id = tech2.user_id
+        it.reason = "日志失败追踪原因"
+        it.tech_skills_snapshot = list(tech2.skills)
+        it.tech_schedule_snapshot = [ts.to_dict() for ts in tech2.time_slots]
+        it.tech_max_parallel_snapshot = tech2.max_parallel_orders
+    draft = store.save_batch_reassignment_draft(dispatcher, items)
+
+    result = store.execute_batch_reassignment(draft, dispatcher)
+    assert len(result.results) == 1
+    item = result.results[0]
+
+    if item.success:
+        assert item.log_written is True, "成功项必须已写入改派日志"
+        assert item.log_write_error is None or item.log_write_error == ""
+        print_ok(f"成功项: log_written={item.log_written}, log_write_error={item.log_write_error!r}")
+    else:
+        print_ok(f"当前项未成功 (status={item.status_label})，跳过日志写入成功断言")
+
+    assert item.skill_checked is True
+    assert item.capacity_checked is True
+    assert item.schedule_checked is True
+    assert item.permission_checked is True
+    assert item.version_checked is True
+    assert item.version_passed is True
+    assert item.permission_passed is True
+    print_ok(f"5 项校验标志都已记录: "
+             f"permission=({item.permission_checked},{item.permission_passed}), "
+             f"version=({item.version_checked},{item.version_passed}), "
+             f"skill=({item.skill_checked},{item.skill_passed}), "
+             f"capacity=({item.capacity_checked},{item.capacity_passed}), "
+             f"schedule=({item.schedule_checked},{item.schedule_passed})")
+
+    assert item.operator_id == dispatcher.user_id
+    assert item.operator_name == dispatcher.name
+    assert item.draft_id == draft.draft_id
+    assert item.item_timestamp and item.item_timestamp.strip()
+    assert item.order_title and item.order_title.strip()
+    assert item.original_assignee_id == tech1.user_id
+    assert item.original_assignee_name == tech1.name
+    assert item.target_technician_id == tech2.user_id
+    print_ok(f"追溯元信息完整: operator={item.operator_name}, draft_id={item.draft_id}, "
+             f"timestamp={item.item_timestamp[:19]}, order_title={item.order_title}")
+
+    summary = item.summary
+    assert item.order_id in summary
+    assert item.status_label in summary
+    print_ok(f"summary 字段: {summary[:80]}")
+
+    result_dict = result.to_dict()
+    item_dict = result_dict["results"][0]
+    assert "log_written" in item_dict
+    assert "log_write_error" in item_dict
+    assert "permission_passed" in item_dict
+    assert "version_passed" in item_dict
+    assert "skill_passed" in item_dict
+    assert "capacity_passed" in item_dict
+    assert "schedule_passed" in item_dict
+    assert "item_timestamp" in item_dict
+    assert "operator_id" in item_dict
+    assert "operator_name" in item_dict
+    assert "draft_id" in item_dict
+    assert "original_assignee_id" in item_dict
+    assert "original_assignee_name" in item_dict
+    assert "order_title" in item_dict
+    print_ok("to_dict() 序列化包含所有追踪字段（含日志失败信息）")
+
+    restored = BatchReassignmentResult.from_dict(result_dict)
+    assert restored.result_id == result.result_id
+    ri = restored.results[0]
+    assert ri.log_written == item.log_written
+    assert ri.log_write_error == item.log_write_error
+    assert ri.permission_passed == item.permission_passed
+    assert ri.version_passed == item.version_passed
+    assert ri.skill_passed == item.skill_passed
+    assert ri.capacity_passed == item.capacity_passed
+    assert ri.schedule_passed == item.schedule_passed
+    assert ri.operator_id == item.operator_id
+    assert ri.draft_id == item.draft_id
+    assert ri.item_timestamp == item.item_timestamp
+    print_ok("from_dict() 反序列化完整恢复所有追踪字段")
+    print_ok("日志写入失败追踪 + 所有追溯字段 + 序列化往返 全部通过")
+
+
 def main():
     print("=" * 70)
     print("  维修派工系统 - 全场景自动化测试")
@@ -2338,6 +2780,10 @@ def main():
         test_gui_batch_reassignment()
         store = test_batch_realtime_validation_datastore(store)
         test_gui_batch_realtime_validation()
+        store = test_batch_result_persistence_across_restart(store)
+        test_batch_result_export_fields_consistency(store)
+        test_batch_result_filter_by_status_and_conflict(store)
+        test_batch_result_log_write_failure_tracking(store)
 
         print_title("全部测试通过")
         print("""
@@ -2365,6 +2811,10 @@ def main():
  21. GUI 批量改派：草稿自动载入+冲突标记、部分成功结果展示、导出功能、恢复草稿对话框
  22. 批量改派实时校验：技能/容量/排班失效时正确跳过、不误写改派日志、不改动被跳过工单、成功项移除草稿保留跳过项、CSV/JSON导出含跳过原因
  23. GUI 批量改派实时校验：结果文本框可见技能失效跳过原因、成功/跳过计数、仅成功工单写入日志
+ 24. 批量改派结果跨重启持久化：重启恢复最近结果、二次提交不覆盖旧结果、保留操作人/时间/5项校验/日志写入状态
+ 25. 批量改派结果导出一致性：CSV/JSON 字段与数据模型一致，所有原因/校验/追溯信息不丢失
+ 26. 批量改派结果过滤：按成功/跳过/失败、按冲突类型过滤，status_label/summary 计算属性
+ 27. 批量改派结果日志失败追踪：5项校验标志、操作人/草稿/工单/维修员追溯、to_dict/from_dict 往返
 """)
     except AssertionError as e:
         print_fail(f"断言失败: {e}")
